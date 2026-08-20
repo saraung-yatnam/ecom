@@ -152,3 +152,5 @@ class ProductVariant(SQLModel, table=True):
     cart_items: list["CartItem"] = Relationship(
         back_populates="variant"
     )
+    # In ProductVariant class, add:
+    order_items: list["OrderItem"] = Relationship(back_populates="variant")

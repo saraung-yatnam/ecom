@@ -3,8 +3,10 @@ from app.models.product import Product, ProductVariant
 from app.models.product_image import ProductImage
 from app.models.refresh_token import RefreshToken
 from app.models.category import Category
-from app.models.cart import Cart, CartItem  # 👈 Add these imports
-
+from app.models.cart import Cart, CartItem
+from app.models.address import Address
+from app.models.order import Order, OrderItem, OrderStatus
+from app.models.payment import Payment, PaymentStatus, PaymentProvider
 __all__ = [
     "User",
     "Product",
@@ -12,6 +14,13 @@ __all__ = [
     "ProductImage",
     "RefreshToken",
     "Category",
-    "Cart",        # 👈 Add this
-    "CartItem",    # 👈 Add this
+    "Cart",
+    "CartItem",
+    "Address",
+    "Order",
+    "OrderItem",
+    "OrderStatus",
+    "Payment",
+    "PaymentStatus",
+    "PaymentProvider"
 ]

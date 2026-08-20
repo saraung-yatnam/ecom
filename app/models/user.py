@@ -36,3 +36,6 @@ class User(SQLModel, table=True):
         back_populates="user", 
         sa_relationship_kwargs={"uselist": False}
     )
+    # In app/models/user.py
+    addresses: list["Address"] = Relationship(back_populates="user")
+    orders: list["Order"] = Relationship(back_populates="user")

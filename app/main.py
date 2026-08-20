@@ -9,7 +9,7 @@ app=FastAPI(title=settings.PROJECT_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -17,9 +17,11 @@ app.add_middleware(
 
 app.include_router(api_router)
 
-@app.get("/",tags=["Health"])
-def ping_server():
-    return {"status":"ok"}
-
-
+@app.get("/")
+def root():
+    return {
+        "message": "E-Commerce API",
+        "environment": settings.ENVIRONMENT,
+        "payment_provider": settings.PAYMENT_PROVIDER,
+    }
 
