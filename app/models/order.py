@@ -55,6 +55,8 @@ class Order(SQLModel, table=True):
     items: list["OrderItem"] = Relationship(back_populates="order")
     # In Order class
     payments: list["Payment"] = Relationship(back_populates="order")
+    # app/models/order.py - Add to Order class
+    reviews: list["Review"] = Relationship(back_populates="order")
 
 
 class OrderItem(SQLModel, table=True):

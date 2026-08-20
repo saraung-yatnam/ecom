@@ -39,3 +39,6 @@ class User(SQLModel, table=True):
     # In app/models/user.py
     addresses: list["Address"] = Relationship(back_populates="user")
     orders: list["Order"] = Relationship(back_populates="user")
+    # app/models/user.py - Add to User class
+    reviews: list["Review"] = Relationship(back_populates="user")
+    wishlist: list["Wishlist"] = Relationship(back_populates="user")

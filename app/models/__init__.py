@@ -7,6 +7,9 @@ from app.models.cart import Cart, CartItem
 from app.models.address import Address
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.payment import Payment, PaymentStatus, PaymentProvider
+from app.models.review import Review  # 👈 ADD THIS LINE
+from app.models.wishlist import Wishlist
+
 __all__ = [
     "User",
     "Product",
@@ -22,5 +25,7 @@ __all__ = [
     "OrderStatus",
     "Payment",
     "PaymentStatus",
-    "PaymentProvider"
+    "PaymentProvider",
+    "Review",  # 👈 ADD THIS
+    "Wishlist"
 ]

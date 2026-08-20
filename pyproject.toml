@@ -17,6 +17,7 @@ dependencies = [
     "pydantic[email]>=2.13.4",
     "python-jose[cryptography]>=3.5.0",
     "python-multipart>=0.0.32",
+    "sendgrid>=6.12.5",
     "slowapi>=0.1.10",
     "sqlmodel>=0.0.39",
     "uvicorn>=0.52.1",

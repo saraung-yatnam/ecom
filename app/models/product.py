@@ -86,6 +86,9 @@ class Product(SQLModel, table=True):
         back_populates="product"
     )
     images: list["ProductImage"] = Relationship(back_populates="product")
+    # app/models/product.py - Add to Product class
+    reviews: list["Review"] = Relationship(back_populates="product")
+    wishlist: list["Wishlist"] = Relationship(back_populates="product")
 
 
 class ProductVariant(SQLModel, table=True):
