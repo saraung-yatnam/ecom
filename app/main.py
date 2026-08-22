@@ -4,8 +4,11 @@ from app.core.config import settings
 from app.api.v1.router import api_router
 
 
+app = FastAPI(title=settings.PROJECT_NAME)
 
-app=FastAPI(title=settings.PROJECT_NAME)
+# Debug: Print CORS settings
+print(f"CORS_ORIGINS: {settings.CORS_ORIGINS}")
+print(f"CORS_ORIGINS_LIST: {settings.cors_origins_list}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(api_router)
+app.include_router(api_router, prefix="/api/v1")
 
 @app.get("/")
 def root():
@@ -24,4 +27,3 @@ def root():
         "environment": settings.ENVIRONMENT,
         "payment_provider": settings.PAYMENT_PROVIDER,
     }
-

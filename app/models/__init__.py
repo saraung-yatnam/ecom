@@ -9,6 +9,7 @@ from app.models.order import Order, OrderItem, OrderStatus
 from app.models.payment import Payment, PaymentStatus, PaymentProvider
 from app.models.review import Review  # 👈 ADD THIS LINE
 from app.models.wishlist import Wishlist
+from app.models.coupon import Coupon, DiscountType  # Add this
 
 __all__ = [
     "User",
@@ -27,5 +28,7 @@ __all__ = [
     "PaymentStatus",
     "PaymentProvider",
     "Review",  # 👈 ADD THIS
-    "Wishlist"
+    "Wishlist",
+    "Coupon",
+    "DiscountType"
 ]

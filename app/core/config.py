@@ -22,16 +22,33 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
-    # CORS - Use a string, parse it
-    CORS_ORIGINS: str = "http://localhost:5173"
+    # CORS
+    CORS_ORIGINS: str = "*"
 
-    # Payment
+    # 👇 PAYMENT - ADD THESE FIELDS
     PAYMENT_PROVIDER: str = "dummy"
+    RAZORPAY_KEY_ID: str | None = None
+    RAZORPAY_KEY_SECRET: str | None = None
+    RAZORPAY_WEBHOOK_SECRET: str | None = None
+
+    # Email (SendGrid)
+    SENDGRID_API_KEY: str | None = None
+    FROM_EMAIL: str = "noreply@yourstore.com"
+
+    # Google OAuth
+    GOOGLE_CLIENT_ID: str | None = None
+    GOOGLE_CLIENT_SECRET: str | None = None
 
     @property
     def cors_origins_list(self) -> List[str]:
-        """Convert CORS_ORIGINS string to list"""
+        if self.CORS_ORIGINS == "*":
+            return ["*"]
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
 
 settings = Settings()
+
+# 👇 Debug prints
+print(f"PAYMENT_PROVIDER: {settings.PAYMENT_PROVIDER}")
+print(f"RAZORPAY_KEY_ID: {settings.RAZORPAY_KEY_ID}")
+print(f"RAZORPAY_KEY_SECRET: {'***' if settings.RAZORPAY_KEY_SECRET else 'None'}")

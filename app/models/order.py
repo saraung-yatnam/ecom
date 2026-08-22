@@ -3,7 +3,7 @@ from decimal import Decimal
 from enum import Enum
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, JSON  # 👈 Add this import
+from sqlalchemy import Column, JSON
 from sqlmodel import Field, Relationship, SQLModel
 
 
@@ -35,6 +35,9 @@ class Order(SQLModel, table=True):
     shipping_total: Decimal = Field(default=0, max_digits=12, decimal_places=2)
     grand_total: Decimal = Field(max_digits=12, decimal_places=2)
     
+    # Coupon
+    coupon_code: str | None = None  # 👈 ADD THIS LINE
+    
     # Status
     status: OrderStatus = Field(default=OrderStatus.PENDING)
     payment_status: str = Field(default="pending")
@@ -53,9 +56,7 @@ class Order(SQLModel, table=True):
     # Relationships - use string references to avoid circular imports
     user: "User" = Relationship(back_populates="orders")
     items: list["OrderItem"] = Relationship(back_populates="order")
-    # In Order class
     payments: list["Payment"] = Relationship(back_populates="order")
-    # app/models/order.py - Add to Order class
     reviews: list["Review"] = Relationship(back_populates="order")
 
 
@@ -70,7 +71,7 @@ class OrderItem(SQLModel, table=True):
     product_name: str
     variant_sku: str
     
-    # 👇 Fix: Use sa_column=Column(JSON) for dict type
+    # Use sa_column=Column(JSON) for dict type
     variant_attributes: dict = Field(
         default_factory=dict,
         sa_column=Column(JSON, nullable=False)

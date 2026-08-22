@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import uuid
 
-from sqlmodel import SQLModel, Field, Relationship  # 👈 Add Relationship here
+from sqlmodel import SQLModel, Field, Relationship
 
 
 class UserRole(str, Enum):
@@ -18,12 +18,17 @@ class User(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     email: str = Field(unique=True, index=True, nullable=False)
     username: str = Field(unique=True, index=True, nullable=False)
-    password_hash: str
+    password_hash: str | None = Field(default=None, nullable=True)  # 👈 Made nullable
     role: UserRole = Field(default=UserRole.customer, index=True)
     full_name: str | None = None
     phone: str | None = None
     is_active: bool = Field(default=True)
     email_verified: bool = Field(default=False)
+    
+    # Google OAuth fields
+    google_id: str | None = Field(default=None, unique=True, index=True)
+    auth_provider: str = Field(default="email")  # email, google, both
+    
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -31,14 +36,13 @@ class User(SQLModel, table=True):
         default_factory=lambda: datetime.now(timezone.utc)
     )
     
-    # 👇 Relationship to cart (ONE user has ONE cart)
+    # Relationships
     cart: "Cart" = Relationship(
         back_populates="user", 
         sa_relationship_kwargs={"uselist": False}
     )
-    # In app/models/user.py
     addresses: list["Address"] = Relationship(back_populates="user")
     orders: list["Order"] = Relationship(back_populates="user")
-    # app/models/user.py - Add to User class
     reviews: list["Review"] = Relationship(back_populates="user")
     wishlist: list["Wishlist"] = Relationship(back_populates="user")
+    coupons: list["Coupon"] = Relationship(back_populates="creator")

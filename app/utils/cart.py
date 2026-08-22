@@ -37,20 +37,15 @@ def calculate_subtotal(cart: Cart) -> Decimal:
 def calculate_discount(cart: Cart) -> Decimal:
     """
     Calculate total discount from coupons.
-    
-    Args:
-        cart: Cart object with coupon_code
-        
-    Returns:
-        Decimal: Total discount amount
+    NOTE: This is a placeholder. Actual discount is calculated in API layer.
     """
-    # TODO: Implement coupon logic
+    # Return 0 - the API will override this with the actual discount
     return Decimal("0.00")
 
 
 def calculate_tax(cart: Cart, tax_rate: Decimal = Decimal("0.18")) -> Decimal:
     """
-    Calculate tax on cart total.
+    Calculate tax on cart total (after discount).
     
     Args:
         cart: Cart object
@@ -60,7 +55,7 @@ def calculate_tax(cart: Cart, tax_rate: Decimal = Decimal("0.18")) -> Decimal:
         Decimal: Tax amount
     """
     subtotal = calculate_subtotal(cart)
-    discount = calculate_discount(cart)
+    discount = calculate_discount(cart)  # Returns 0
     taxable_amount = subtotal - discount
     return taxable_amount * tax_rate
 
@@ -78,7 +73,6 @@ def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = Decimal("1
     """
     subtotal = calculate_subtotal(cart)
     
-    # 👇 Add this check
     if subtotal == Decimal("0.00"):
         return Decimal("0.00")  # Empty cart = no shipping
     
@@ -98,7 +92,7 @@ def calculate_cart_total(cart: Cart) -> dict:
         dict: All calculated totals
     """
     subtotal = calculate_subtotal(cart)
-    discount = calculate_discount(cart)
+    discount = calculate_discount(cart)  # Returns 0
     tax = calculate_tax(cart)
     shipping = calculate_shipping(cart)
     total = subtotal - discount + tax + shipping
@@ -118,7 +112,7 @@ def calculate_cart_total(cart: Cart) -> dict:
             "variant_id": item.variant_id,
             "quantity": item.quantity,
             "price_at_add": item.price_at_add,
-            "created_at": item.created_at,  # 👈 ADD THIS - include created_at
+            "created_at": item.created_at,
             "variant_sku": variant.sku if variant else None,
             "variant_attributes": variant_attributes,
             "product_name": product.name if product else None,
@@ -128,10 +122,10 @@ def calculate_cart_total(cart: Cart) -> dict:
     
     return {
         "subtotal": subtotal,
-        "discount_total": discount,
+        "discount_total": discount,  # Will be overridden in API
         "tax_total": tax,
         "shipping_total": shipping,
-        "total": total,
+        "total": total,  # Will be overridden in API
         "item_count": sum(item.quantity for item in cart.items),
         "items": enriched_items
     }

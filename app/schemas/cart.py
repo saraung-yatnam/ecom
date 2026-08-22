@@ -51,3 +51,6 @@ class CartRead(BaseModel):
     shipping_total: Decimal = Field(default=Decimal("0.00"))
     total: Decimal = Field(default=Decimal("0.00"))
     item_count: int = Field(default=0)
+
+class ApplyCouponRequest(BaseModel):
+    coupon_code: str = Field(min_length=1, max_length=50)

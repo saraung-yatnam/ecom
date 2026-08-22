@@ -8,12 +8,15 @@ from app.api.deps import SessionDep, get_current_user
 from app.models.cart import Cart, CartItem
 from app.models.user import User
 from app.repositories import cart as cart_repo
+from app.repositories import coupon as coupon_repo
 from app.schemas.cart import (
     AddToCartRequest,
+    ApplyCouponRequest,
     CartRead,
     UpdateCartItemRequest,
 )
 from app.utils.cart import calculate_cart_total
+from app.utils.coupon import calculate_discount as calc_discount
 
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
@@ -45,14 +48,24 @@ def get_cart(
     cart = cart_repo.get_or_create_cart(session, user_id, session_id)
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
     
-    # Calculate totals
+    # Calculate base totals
     totals = calculate_cart_total(cart_with_items)
+    
+    # Calculate discount if coupon is applied
+    if cart.coupon_code:
+        coupon = coupon_repo.get_coupon_by_code(session, cart.coupon_code)
+        if coupon:
+            subtotal = totals["subtotal"]
+            discount_amount, new_subtotal = calc_discount(coupon, subtotal)
+            totals["discount_total"] = discount_amount
+            totals["tax_total"] = new_subtotal * Decimal("0.18")
+            totals["total"] = new_subtotal + totals["tax_total"] + totals["shipping_total"]
     
     return CartRead(
         id=cart_with_items.id,
         items=totals["items"],
         subtotal=totals["subtotal"],
-        coupon_code=cart_with_items.coupon_code,
+        coupon_code=cart.coupon_code,
         discount_total=totals["discount_total"],
         tax_total=totals["tax_total"],
         shipping_total=totals["shipping_total"],
@@ -221,4 +234,111 @@ def clear_cart(
         shipping_total=Decimal("0.00"),
         total=Decimal("0.00"),
         item_count=0
+    )
+
+
+@router.post("/coupon", response_model=CartRead)
+def apply_coupon(
+    request: ApplyCouponRequest,
+    request_obj: Request,
+    session: SessionDep,
+    current_user: User | None = Depends(get_current_user),
+):
+    """
+    Apply coupon to cart.
+    """
+    session_id = get_session_id(request_obj)
+    user_id = current_user.id if current_user else None
+    
+    cart = cart_repo.get_or_create_cart(session, user_id, session_id)
+    
+    # If same coupon already applied, just return cart with discount
+    if cart.coupon_code == request.coupon_code:
+        cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
+        totals = calculate_cart_total(cart_with_items)
+        
+        if cart.coupon_code:
+            coupon = coupon_repo.get_coupon_by_code(session, cart.coupon_code)
+            if coupon:
+                subtotal = totals["subtotal"]
+                discount_amount, new_subtotal = calc_discount(coupon, subtotal)
+                totals["discount_total"] = discount_amount
+                totals["tax_total"] = new_subtotal * Decimal("0.18")
+                totals["total"] = new_subtotal + totals["tax_total"] + totals["shipping_total"]
+        
+        return CartRead(
+            id=cart_with_items.id,
+            items=totals["items"],
+            subtotal=totals["subtotal"],
+            coupon_code=cart.coupon_code,
+            discount_total=totals["discount_total"],
+            tax_total=totals["tax_total"],
+            shipping_total=totals["shipping_total"],
+            total=totals["total"],
+            item_count=totals["item_count"]
+        )
+    
+    try:
+        cart_repo.apply_coupon_to_cart(session, cart, request.coupon_code)
+    except ValueError as e:
+        # Return user-friendly error message
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    
+    cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
+    totals = calculate_cart_total(cart_with_items)
+    
+    # Calculate discount from coupon
+    if cart.coupon_code:
+        coupon = coupon_repo.get_coupon_by_code(session, cart.coupon_code)
+        if coupon:
+            subtotal = totals["subtotal"]
+            discount_amount, new_subtotal = calc_discount(coupon, subtotal)
+            totals["discount_total"] = discount_amount
+            totals["tax_total"] = new_subtotal * Decimal("0.18")
+            totals["total"] = new_subtotal + totals["tax_total"] + totals["shipping_total"]
+    
+    return CartRead(
+        id=cart_with_items.id,
+        items=totals["items"],
+        subtotal=totals["subtotal"],
+        coupon_code=cart.coupon_code,
+        discount_total=totals["discount_total"],
+        tax_total=totals["tax_total"],
+        shipping_total=totals["shipping_total"],
+        total=totals["total"],
+        item_count=totals["item_count"]
+    )
+
+
+@router.delete("/coupon", response_model=CartRead)
+def remove_coupon(
+    request_obj: Request,
+    session: SessionDep,
+    current_user: User | None = Depends(get_current_user),
+):
+    """
+    Remove coupon from cart.
+    """
+    session_id = get_session_id(request_obj)
+    user_id = current_user.id if current_user else None
+    
+    cart = cart_repo.get_or_create_cart(session, user_id, session_id)
+    cart = cart_repo.remove_coupon_from_cart(session, cart)
+    
+    cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
+    totals = calculate_cart_total(cart_with_items)
+    
+    return CartRead(
+        id=cart_with_items.id,
+        items=totals["items"],
+        subtotal=totals["subtotal"],
+        coupon_code=cart_with_items.coupon_code,
+        discount_total=totals["discount_total"],
+        tax_total=totals["tax_total"],
+        shipping_total=totals["shipping_total"],
+        total=totals["total"],
+        item_count=totals["item_count"]
     )

@@ -170,9 +170,79 @@ def remove_cart_item(session: Session, cart_item: CartItem) -> None:
 
 
 def clear_cart(session: Session, cart: Cart) -> None:
-    """Remove all items from cart."""
+    """Remove all items from cart and clear coupon."""
     statement = select(CartItem).where(CartItem.cart_id == cart.id)
     items = session.exec(statement).all()
     for item in items:
         session.delete(item)
+    
+    # Clear coupon code from cart
+    cart.coupon_code = None
+    session.add(cart)
     session.commit()
+
+
+def apply_coupon_to_cart(
+    session: Session,
+    cart: Cart,
+    coupon_code: str,
+) -> dict:
+    """Apply coupon to cart"""
+    from app.repositories import coupon as coupon_repo
+    from app.utils.coupon import validate_coupon, calculate_discount
+    
+    # Get coupon
+    coupon = coupon_repo.get_coupon_by_code(session, coupon_code)
+    if not coupon:
+        raise ValueError("Coupon not found")
+    
+    # Calculate cart subtotal
+    subtotal = sum(item.price_at_add * item.quantity for item in cart.items)
+    
+    # 👇 Check user usage before applying
+    user_usage_count = 0
+    if cart.user_id:
+        user_usage_count = coupon_repo.get_user_coupon_usage_count(
+            session, coupon_code, cart.user_id
+        )
+    
+    # Validate coupon (now checks max_uses_per_user)
+    is_valid, message = validate_coupon(
+        coupon, 
+        subtotal, 
+        cart.user_id,
+        user_usage_count
+    )
+    if not is_valid:
+        raise ValueError(message)
+    
+    # Calculate discount
+    discount_amount, new_subtotal = calculate_discount(coupon, subtotal)
+    
+    # Apply coupon to cart
+    cart.coupon_code = coupon_code
+    
+    # Increment coupon usage
+    coupon_repo.increment_coupon_usage(session, coupon)
+    
+    session.add(cart)
+    session.commit()
+    session.refresh(cart)
+    
+    return {
+        "subtotal": subtotal,
+        "discount_amount": discount_amount,
+        "new_subtotal": new_subtotal,
+    }
+
+
+def remove_coupon_from_cart(
+    session: Session,
+    cart: Cart,
+) -> Cart:
+    """Remove coupon from cart"""
+    cart.coupon_code = None
+    session.add(cart)
+    session.commit()
+    session.refresh(cart)
+    return cart

@@ -1,8 +1,9 @@
 from decimal import Decimal
 from uuid import UUID
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from app.models.product import Product, ProductVariant
 from app.schemas.product import (
@@ -29,31 +30,19 @@ def get_products(
         .where(Product.is_active == True)
         .options(
             selectinload(Product.variants),
-            selectinload(Product.images)  # 👈 Added images
+            selectinload(Product.images)
         )
     )
-
-    # ---------------------------------------------
-    # SEARCH
-    # ---------------------------------------------
 
     if search:
         statement = statement.where(
             Product.name.ilike(f"%{search}%")
         )
 
-    # ---------------------------------------------
-    # CATEGORY FILTER
-    # ---------------------------------------------
-
     if category_id:
         statement = statement.where(
             Product.category_id == category_id
         )
-
-    # ---------------------------------------------
-    # PRICE FILTERS
-    # ---------------------------------------------
 
     if min_price is not None:
         statement = statement.where(
@@ -65,53 +54,23 @@ def get_products(
             Product.price <= max_price
         )
 
-    # ---------------------------------------------
-    # SORTING
-    # ---------------------------------------------
-
     if sort == "price_asc":
-
-        statement = statement.order_by(
-            Product.price.asc()
-        )
-
+        statement = statement.order_by(Product.price.asc())
     elif sort == "price_desc":
-
-        statement = statement.order_by(
-            Product.price.desc()
-        )
-
+        statement = statement.order_by(Product.price.desc())
     elif sort == "name_asc":
-
-        statement = statement.order_by(
-            Product.name.asc()
-        )
-
+        statement = statement.order_by(Product.name.asc())
     elif sort == "name_desc":
-
-        statement = statement.order_by(
-            Product.name.desc()
-        )
-
+        statement = statement.order_by(Product.name.desc())
     elif sort == "oldest":
-
-        statement = statement.order_by(
-            Product.created_at.asc()
-        )
-
+        statement = statement.order_by(Product.created_at.asc())
     else:
-        # newest
-        statement = statement.order_by(
-            Product.created_at.desc()
-        )
-
-    # ---------------------------------------------
-    # PAGINATION
-    # ---------------------------------------------
+        statement = statement.order_by(Product.created_at.desc())
 
     statement = statement.offset(skip).limit(limit)
 
-    return session.exec(statement).all()
+    result = session.execute(statement)
+    return result.scalars().all()
 
 
 def get_product_by_id(
@@ -124,11 +83,12 @@ def get_product_by_id(
         .where(Product.id == product_id)
         .options(
             selectinload(Product.variants),
-            selectinload(Product.images)  # 👈 Added images
+            selectinload(Product.images)
         )
     )
 
-    return session.exec(statement).first()
+    result = session.execute(statement)
+    return result.scalar_one_or_none()
 
 
 def get_product_by_slug(
@@ -141,11 +101,12 @@ def get_product_by_slug(
         .where(Product.slug == slug)
         .options(
             selectinload(Product.variants),
-            selectinload(Product.images)  # 👈 Added images
+            selectinload(Product.images)
         )
     )
 
-    return session.exec(statement).first()
+    result = session.execute(statement)
+    return result.scalar_one_or_none()
 
 
 def create_product(
@@ -215,7 +176,8 @@ def get_variants(
         ProductVariant.product_id == product_id
     )
 
-    return session.exec(statement).all()
+    result = session.execute(statement)
+    return result.scalars().all()
 
 
 def get_variant_by_id(
@@ -238,7 +200,8 @@ def get_variant_by_sku(
         ProductVariant.sku == sku
     )
 
-    return session.exec(statement).first()
+    result = session.execute(statement)
+    return result.scalar_one_or_none()
 
 
 def create_variant(
@@ -281,3 +244,76 @@ def update_variant(
     session.refresh(variant)
 
     return variant
+
+
+# =========================================================
+# ADMIN FUNCTIONS
+# =========================================================
+
+def get_total_products(session: Session) -> int:
+    """Get total number of products"""
+    statement = select(func.count(Product.id))
+    result = session.execute(statement)
+    return result.scalar() or 0
+
+
+def get_all_products(session: Session) -> list[Product]:
+    """Get all products (for export)"""
+    statement = select(Product).order_by(Product.created_at.desc())
+    result = session.execute(statement)
+    return result.scalars().all()
+
+
+def bulk_delete_products(session: Session, product_ids: list[UUID]) -> int:
+    """Bulk delete products"""
+    if not product_ids:
+        return 0
+    
+    statement = select(Product).where(Product.id.in_(product_ids))
+    result = session.execute(statement)
+    products = result.scalars().all()
+    
+    count = len(products)
+    for product in products:
+        session.delete(product)
+    
+    session.commit()
+    return count
+
+
+def bulk_update_product_status(session: Session, product_ids: list[UUID], is_active: bool) -> int:
+    """Bulk update product status"""
+    if not product_ids:
+        return 0
+    
+    statement = select(Product).where(Product.id.in_(product_ids))
+    result = session.execute(statement)
+    products = result.scalars().all()
+    
+    count = len(products)
+    for product in products:
+        product.is_active = is_active
+    
+    session.commit()
+    return count
+
+
+def get_products_for_export(session: Session) -> list[dict]:
+    """Get products in export format"""
+    products = get_all_products(session)
+    
+    export_data = []
+    for product in products:
+        export_data.append({
+            "id": str(product.id),
+            "name": product.name,
+            "slug": product.slug,
+            "description": product.description,
+            "price": str(product.price),
+            "compare_at_price": str(product.compare_at_price) if product.compare_at_price else None,
+            "is_active": product.is_active,
+            "created_at": product.created_at.isoformat(),
+            "updated_at": product.updated_at.isoformat(),
+        })
+    
+    return export_data
