@@ -259,9 +259,49 @@ def get_total_products(session: Session) -> int:
 
 def get_all_products(session: Session) -> list[Product]:
     """Get all products (for export)"""
-    statement = select(Product).order_by(Product.created_at.desc())
+    statement = select(Product).options(
+        selectinload(Product.images),
+        selectinload(Product.variants)
+    ).order_by(Product.created_at.desc())
     result = session.execute(statement)
     return result.scalars().all()
+
+
+def get_all_products_admin(
+    session: Session,
+    skip: int = 0,
+    limit: int = 20,
+    search: str | None = None,
+    is_active: bool | None = None,
+) -> tuple[list[Product], int]:
+    """
+    Get all products with filters (Admin only).
+    Includes inactive products.
+    """
+    statement = select(Product).options(
+        selectinload(Product.variants),
+        selectinload(Product.images)
+    )
+    
+    if search:
+        statement = statement.where(
+            (Product.name.ilike(f"%{search}%")) |
+            (Product.slug.ilike(f"%{search}%"))
+        )
+    
+    if is_active is not None:
+        statement = statement.where(Product.is_active == is_active)
+    
+    # Get total count
+    count_statement = select(func.count()).select_from(statement.subquery())
+    result = session.execute(count_statement)
+    total = result.scalar() or 0
+    
+    statement = statement.order_by(Product.created_at.desc()).offset(skip).limit(limit)
+    result = session.execute(statement)
+    products = result.scalars().all()
+    
+    return products, total
 
 
 def bulk_delete_products(session: Session, product_ids: list[UUID]) -> int:
@@ -314,6 +354,27 @@ def get_products_for_export(session: Session) -> list[dict]:
             "is_active": product.is_active,
             "created_at": product.created_at.isoformat(),
             "updated_at": product.updated_at.isoformat(),
+            # 👇 Images
+            "images": [
+                {
+                    "id": str(img.id),
+                    "url": img.url,
+                    "alt_text": img.alt_text,
+                    "sort_order": img.sort_order,
+                }
+                for img in product.images
+            ],
+            # 👇 Variants
+            "variants": [
+                {
+                    "id": str(v.id),
+                    "sku": v.sku,
+                    "attributes": v.attributes,
+                    "price_override": str(v.price_override) if v.price_override else None,
+                    "stock": v.stock,
+                }
+                for v in product.variants
+            ],
         })
     
     return export_data
