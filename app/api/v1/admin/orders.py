@@ -1,6 +1,7 @@
+# app/api/v1/admin/orders.py
 from uuid import UUID
 from datetime import date
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlmodel import Session
@@ -45,8 +46,105 @@ def get_all_orders_admin(
         to_date=to_date,
     )
     
+    # Manually convert orders to dict with user data
+    orders_data = []
+    for order in orders:
+        # Get user data
+        user_data = None
+        if order.user:
+            user_data = {
+                "id": str(order.user.id),
+                "full_name": order.user.full_name,
+                "email": order.user.email,
+                "phone": order.user.phone
+            }
+        
+        # Get shipping address data
+        shipping_address_data = None
+        if order.shipping_address:
+            shipping_address_data = {
+                "id": str(order.shipping_address.id),
+                "label": order.shipping_address.label,
+                "line1": order.shipping_address.line1,
+                "line2": order.shipping_address.line2,
+                "city": order.shipping_address.city,
+                "state": order.shipping_address.state,
+                "postal_code": order.shipping_address.postal_code,
+                "country": order.shipping_address.country,
+                "is_default": order.shipping_address.is_default,
+                "full_name": order.user.full_name if order.user else None,
+                "phone": order.user.phone if order.user else None
+            }
+        
+        # Get billing address data
+        billing_address_data = None
+        if order.billing_address:
+            billing_address_data = {
+                "id": str(order.billing_address.id),
+                "label": order.billing_address.label,
+                "line1": order.billing_address.line1,
+                "line2": order.billing_address.line2,
+                "city": order.billing_address.city,
+                "state": order.billing_address.state,
+                "postal_code": order.billing_address.postal_code,
+                "country": order.billing_address.country,
+                "is_default": order.billing_address.is_default,
+                "full_name": order.user.full_name if order.user else None,
+                "phone": order.user.phone if order.user else None
+            }
+        
+        # Build order dictionary
+        order_dict = {
+            "id": str(order.id),
+            "order_number": order.order_number,
+            "user_id": str(order.user_id),
+            
+            # User data
+            "user": user_data,
+            
+            # Address data
+            "shipping_address": shipping_address_data,
+            "billing_address": billing_address_data,
+            "shipping_address_id": str(order.shipping_address_id),
+            "billing_address_id": str(order.billing_address_id),
+            
+            # Financials
+            "subtotal": float(order.subtotal) if order.subtotal else 0,
+            "discount_total": float(order.discount_total) if order.discount_total else 0,
+            "tax_total": float(order.tax_total) if order.tax_total else 0,
+            "shipping_total": float(order.shipping_total) if order.shipping_total else 0,
+            "grand_total": float(order.grand_total) if order.grand_total else 0,
+            
+            # Status
+            "status": order.status.value if hasattr(order.status, 'value') else str(order.status),
+            "payment_status": order.payment_status,
+            "coupon_code": order.coupon_code,
+            
+            # Timestamps
+            "placed_at": order.placed_at.isoformat() if order.placed_at else None,
+            "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            "shipped_at": order.shipped_at.isoformat() if order.shipped_at else None,
+            "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
+            
+            # Items
+            "items": [
+                {
+                    "id": str(item.id),
+                    "product_name": item.product_name,
+                    "variant_sku": item.variant_sku,
+                    "variant_attributes": item.variant_attributes,
+                    "quantity": item.quantity,
+                    "unit_price": float(item.unit_price) if item.unit_price else 0,
+                    "line_total": float(item.line_total) if item.line_total else 0,
+                    "created_at": item.created_at.isoformat() if item.created_at else None
+                }
+                for item in (order.items or [])
+            ]
+        }
+        orders_data.append(order_dict)
+    
     return {
-        "orders": orders,
+        "orders": orders_data,
         "pagination": {
             "page": page,
             "limit": limit,
@@ -71,7 +169,7 @@ def get_order_stats(
     return order_repo.get_order_statistics(session)
 
 
-@router.get("/{order_id}", response_model=OrderRead)
+@router.get("/{order_id}", response_model=dict)
 def get_order_detail(
     order_id: UUID,
     session: SessionDep,
@@ -91,7 +189,87 @@ def get_order_detail(
             detail="Order not found"
         )
     
-    return order
+    # Build response manually
+    return {
+        "id": str(order.id),
+        "order_number": order.order_number,
+        "user_id": str(order.user_id),
+        
+        # User data
+        "user": {
+            "id": str(order.user.id),
+            "full_name": order.user.full_name,
+            "email": order.user.email,
+            "phone": order.user.phone
+        } if order.user else None,
+        
+        # Shipping address
+        "shipping_address": {
+            "id": str(order.shipping_address.id),
+            "label": order.shipping_address.label,
+            "line1": order.shipping_address.line1,
+            "line2": order.shipping_address.line2,
+            "city": order.shipping_address.city,
+            "state": order.shipping_address.state,
+            "postal_code": order.shipping_address.postal_code,
+            "country": order.shipping_address.country,
+            "is_default": order.shipping_address.is_default,
+            "full_name": order.user.full_name if order.user else None,
+            "phone": order.user.phone if order.user else None
+        } if order.shipping_address else None,
+        
+        # Billing address
+        "billing_address": {
+            "id": str(order.billing_address.id),
+            "label": order.billing_address.label,
+            "line1": order.billing_address.line1,
+            "line2": order.billing_address.line2,
+            "city": order.billing_address.city,
+            "state": order.billing_address.state,
+            "postal_code": order.billing_address.postal_code,
+            "country": order.billing_address.country,
+            "is_default": order.billing_address.is_default,
+            "full_name": order.user.full_name if order.user else None,
+            "phone": order.user.phone if order.user else None
+        } if order.billing_address else None,
+        
+        "shipping_address_id": str(order.shipping_address_id),
+        "billing_address_id": str(order.billing_address_id),
+        
+        # Financials
+        "subtotal": float(order.subtotal),
+        "discount_total": float(order.discount_total),
+        "tax_total": float(order.tax_total),
+        "shipping_total": float(order.shipping_total),
+        "grand_total": float(order.grand_total),
+        
+        # Status
+        "status": order.status.value if hasattr(order.status, 'value') else str(order.status),
+        "payment_status": order.payment_status,
+        # ❌ REMOVED: "payment_method": order.payment_method,  # This field doesn't exist
+        "coupon_code": order.coupon_code,
+        
+        # Timestamps
+        "placed_at": order.placed_at.isoformat() if order.placed_at else None,
+        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+        "shipped_at": order.shipped_at.isoformat() if order.shipped_at else None,
+        "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
+        
+        # Items
+        "items": [
+            {
+                "id": str(item.id),
+                "product_name": item.product_name,
+                "variant_sku": item.variant_sku,
+                "variant_attributes": item.variant_attributes,
+                "quantity": item.quantity,
+                "unit_price": float(item.unit_price),
+                "line_total": float(item.line_total),
+                "created_at": item.created_at.isoformat() if item.created_at else None
+            }
+            for item in (order.items or [])
+        ]
+    }
 
 
 @router.put("/{order_id}/status", response_model=OrderRead)

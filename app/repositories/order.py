@@ -9,14 +9,20 @@ from sqlmodel import Session
 
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.user import User
+from app.models.address import Address  # Add this if you have address model
 
 
 def get_order_by_id(session: Session, order_id: UUID) -> Order | None:
-    """Get order by ID with items loaded"""
+    """Get order by ID with items and user loaded"""
     statement = (
         select(Order)
         .where(Order.id == order_id)
-        .options(selectinload(Order.items))
+        .options(
+            selectinload(Order.items),
+            selectinload(Order.user),  # 👈 Add this
+            selectinload(Order.shipping_address),  # 👈 Add this
+            selectinload(Order.billing_address),   # 👈 Add this
+        )
     )
     result = session.execute(statement)
     return result.scalar_one_or_none()
@@ -35,7 +41,10 @@ def get_orders_by_user(
         .order_by(Order.placed_at.desc())
         .offset(skip)
         .limit(limit)
-        .options(selectinload(Order.items))
+        .options(
+            selectinload(Order.items),
+            selectinload(Order.shipping_address),
+        )
     )
     result = session.execute(statement)
     return result.scalars().all()
@@ -46,7 +55,11 @@ def get_order_by_number(session: Session, order_number: str) -> Order | None:
     statement = (
         select(Order)
         .where(Order.order_number == order_number)
-        .options(selectinload(Order.items))
+        .options(
+            selectinload(Order.items),
+            selectinload(Order.user),
+            selectinload(Order.shipping_address),
+        )
     )
     result = session.execute(statement)
     return result.scalar_one_or_none()
@@ -59,7 +72,11 @@ def get_all_orders(
     status: str | None = None,
 ) -> list[Order]:
     """Get all orders (admin)"""
-    statement = select(Order).options(selectinload(Order.items))
+    statement = select(Order).options(
+        selectinload(Order.items),
+        selectinload(Order.user),  # 👈 Add this
+        selectinload(Order.shipping_address),  # 👈 Add this
+    )
     
     if status:
         statement = statement.where(Order.status == status)
@@ -92,7 +109,7 @@ def update_order_status(
 
 
 # =========================================================
-# NEW ADMIN FUNCTIONS
+# ADMIN FUNCTIONS
 # =========================================================
 
 def get_order_statistics(session: Session) -> dict:
@@ -135,8 +152,17 @@ def get_order_statistics(session: Session) -> dict:
 
 
 def get_recent_orders(session: Session, limit: int = 10) -> list[Order]:
-    """Get recent orders"""
-    statement = select(Order).order_by(Order.placed_at.desc()).limit(limit)
+    """Get recent orders with user data"""
+    statement = (
+        select(Order)
+        .order_by(Order.placed_at.desc())
+        .limit(limit)
+        .options(
+            selectinload(Order.user),  # 👈 Add this
+            selectinload(Order.shipping_address),  # 👈 Add this
+            selectinload(Order.items),  # 👈 Add this
+        )
+    )
     result = session.execute(statement)
     return result.scalars().all()
 
@@ -150,15 +176,24 @@ def get_all_orders_with_filters(
     from_date: date | None = None,
     to_date: date | None = None,
 ) -> tuple[list[Order], int]:
-    """Get all orders with filters"""
-    statement = select(Order).options(selectinload(Order.items))
+    """Get all orders with filters and user data"""
+    # Build base query with eager loading
+    statement = select(Order).options(
+        selectinload(Order.items),  # 👈 Keep this
+        selectinload(Order.user),  # 👈 ADD THIS - loads user data
+        selectinload(Order.shipping_address),  # 👈 ADD THIS - loads shipping address
+        selectinload(Order.billing_address),   # 👈 ADD THIS - loads billing address
+    )
     
+    # Apply filters
     if status:
         statement = statement.where(Order.status == status)
     
     if search:
+        # Search by order number or customer name/email
         statement = statement.where(
             (Order.order_number.ilike(f"%{search}%")) |
+            (Order.user.has(User.full_name.ilike(f"%{search}%"))) |
             (Order.user.has(User.email.ilike(f"%{search}%")))
         )
     

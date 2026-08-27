@@ -4,7 +4,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Column, DateTime, JSON, Numeric
-from sqlmodel import Field, Relationship, SQLModel  # Added Relationship
+from sqlmodel import Field, Relationship, SQLModel
 from app.models.product_image import ProductImage
 
 class Product(SQLModel, table=True):
@@ -33,6 +33,10 @@ class Product(SQLModel, table=True):
         default=None,
         foreign_key="categories.id",
         index=True
+    )
+
+    category: "Category" = Relationship(
+        back_populates="products"
     )
 
     # Base/default product price.

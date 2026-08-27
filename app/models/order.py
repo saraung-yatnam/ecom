@@ -1,3 +1,4 @@
+# app/models/order.py
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -28,6 +29,20 @@ class Order(SQLModel, table=True):
     shipping_address_id: UUID = Field(foreign_key="addresses.id")
     billing_address_id: UUID = Field(foreign_key="addresses.id")
     
+    # 👇 ADD THESE TWO RELATIONSHIPS
+    shipping_address: "Address" = Relationship(
+        sa_relationship_kwargs={
+            "foreign_keys": "[Order.shipping_address_id]",
+            "primaryjoin": "Order.shipping_address_id == Address.id",
+        }
+    )
+    billing_address: "Address" = Relationship(
+        sa_relationship_kwargs={
+            "foreign_keys": "[Order.billing_address_id]",
+            "primaryjoin": "Order.billing_address_id == Address.id",
+        }
+    )
+    
     # Financials
     subtotal: Decimal = Field(max_digits=12, decimal_places=2)
     discount_total: Decimal = Field(default=0, max_digits=12, decimal_places=2)
@@ -36,7 +51,7 @@ class Order(SQLModel, table=True):
     grand_total: Decimal = Field(max_digits=12, decimal_places=2)
     
     # Coupon
-    coupon_code: str | None = None  # 👈 ADD THIS LINE
+    coupon_code: str | None = None
     
     # Status
     status: OrderStatus = Field(default=OrderStatus.PENDING)
