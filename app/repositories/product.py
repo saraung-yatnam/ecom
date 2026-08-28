@@ -247,6 +247,21 @@ def update_variant(
 
 
 # =========================================================
+# VARIANTS - DELETE  ⬅️ NEW FUNCTION
+# =========================================================
+
+def delete_variant(
+    session: Session,
+    variant: ProductVariant,
+) -> None:
+    """
+    Delete a product variant (hard delete).
+    """
+    session.delete(variant)
+    session.commit()
+
+
+# =========================================================
 # ADMIN FUNCTIONS
 # =========================================================
 
@@ -354,7 +369,6 @@ def get_products_for_export(session: Session) -> list[dict]:
             "is_active": product.is_active,
             "created_at": product.created_at.isoformat(),
             "updated_at": product.updated_at.isoformat(),
-            # 👇 Images
             "images": [
                 {
                     "id": str(img.id),
@@ -364,7 +378,6 @@ def get_products_for_export(session: Session) -> list[dict]:
                 }
                 for img in product.images
             ],
-            # 👇 Variants
             "variants": [
                 {
                     "id": str(v.id),
@@ -378,3 +391,45 @@ def get_products_for_export(session: Session) -> list[dict]:
         })
     
     return export_data
+
+
+# =========================================================
+# VARIANT HELPER FUNCTIONS
+# =========================================================
+
+def get_variant_by_product_and_sku(
+    session: Session,
+    product_id: UUID,
+    sku: str,
+) -> ProductVariant | None:
+    """Get a variant by product ID and SKU"""
+    statement = select(ProductVariant).where(
+        ProductVariant.product_id == product_id,
+        ProductVariant.sku == sku
+    )
+    result = session.execute(statement)
+    return result.scalar_one_or_none()
+
+
+def get_variants_by_product_ids(
+    session: Session,
+    product_ids: list[UUID],
+) -> dict[UUID, list[ProductVariant]]:
+    """Get variants for multiple products at once"""
+    if not product_ids:
+        return {}
+    
+    statement = select(ProductVariant).where(
+        ProductVariant.product_id.in_(product_ids)
+    )
+    result = session.execute(statement)
+    variants = result.scalars().all()
+    
+    # Group by product_id
+    variants_by_product = {}
+    for variant in variants:
+        if variant.product_id not in variants_by_product:
+            variants_by_product[variant.product_id] = []
+        variants_by_product[variant.product_id].append(variant)
+    
+    return variants_by_product

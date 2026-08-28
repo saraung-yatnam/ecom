@@ -76,3 +76,4 @@ def require_role(*allowed: UserRole):
         return user
 
     return checker
+

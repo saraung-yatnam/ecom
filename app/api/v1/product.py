@@ -657,3 +657,67 @@ def update_product_variant(
     )
 
     return variant_read
+
+
+# =========================================================
+# PRODUCT VARIANTS - STAFF+ (DELETE)  ⬅️ NEW ENDPOINT
+# =========================================================
+
+@router.delete(
+    "/{product_id}/variants/{variant_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_product_variant(
+    product_id: UUID,
+    variant_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(
+        require_role(
+            UserRole.staff,
+            UserRole.manager,
+            UserRole.admin,
+        )
+    ),
+):
+    """
+    Delete a product variant.
+    """
+    
+    # Check if product exists
+    product = product_repo.get_product_by_id(
+        session,
+        product_id,
+    )
+    
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found",
+        )
+    
+    # Check if variant exists
+    variant = product_repo.get_variant_by_id(
+        session,
+        variant_id,
+    )
+    
+    if not variant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Variant not found",
+        )
+    
+    # Make sure the variant belongs to this product
+    if variant.product_id != product_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Variant does not belong to this product",
+        )
+    
+    # Delete the variant
+    product_repo.delete_variant(
+        session,
+        variant,
+    )
+    
+    return None

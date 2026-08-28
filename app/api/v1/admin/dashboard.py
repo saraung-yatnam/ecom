@@ -15,7 +15,7 @@ router = APIRouter(prefix="/admin/dashboard", tags=["Admin Dashboard"])
 @router.get("", response_model=dict)
 def get_admin_dashboard(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.admin)),
+    current_user: User = Depends(require_role(UserRole.admin,UserRole.manager)),
 ):
     """
     Get admin dashboard summary.
