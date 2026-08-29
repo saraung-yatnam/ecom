@@ -8,9 +8,11 @@ from sqlmodel import Session
 
 from app.api.deps import SessionDep, require_role
 from app.models.user import User, UserRole
+from app.models.order import OrderStatus
 from app.repositories import order as order_repo
 from app.schemas.order import OrderRead, OrderStatusUpdate, OrderListRead
 from app.services.email_service import email_service
+from app.services.refund_service import restore_stock
 from app.core.config import settings
 
 router = APIRouter(prefix="/admin/orders", tags=["Admin Orders"])
@@ -304,6 +306,30 @@ def update_order_status_admin(
     
     old_status = order.status
     new_status = status_data.status.value
+
+    # --- Status transition guards ---
+    # Cancelled / refunded orders are TERMINAL. Never allow flipping them back
+    # to an active status — that would re-enable the user-facing cancel flow
+    # and cause a DOUBLE stock restore.
+    if old_status in (OrderStatus.CANCELLED, OrderStatus.REFUNDED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Order is already {old_status.value} — its status cannot be changed",
+        )
+
+    # Cancelling from the admin panel must behave exactly like the user-facing
+    # cancel (POST /orders/{id}/cancel):
+    #   * only active orders (pending / confirmed / processing) are cancellable
+    #   * the reserved stock must be given back to the variants
+    if new_status == OrderStatus.CANCELLED.value:
+        if old_status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Order cannot be cancelled. Current status: {old_status.value}",
+            )
+        if old_status in (OrderStatus.PENDING, OrderStatus.CONFIRMED, OrderStatus.PROCESSING):
+            restore_stock(session, order)
+
     order = order_repo.update_order_status(session, order, new_status)
     
     # Send email notification on status change

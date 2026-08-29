@@ -1221,6 +1221,13 @@ All 🔒 **manager/admin**. Dates are `YYYY-MM-DD`.
 
 `status` ∈ `pending | confirmed | processing | shipped | delivered | cancelled | refunded`. **Response `200`:** `OrderRead` (§12 shape, money = strings). Shipped/delivered/cancelled/refunded transitions trigger customer emails automatically.
 
+**Business rules:**
+
+- **Cancelling** (`status=cancelled`) from the admin panel behaves like the user-facing cancel (`POST /orders/{id}/cancel`): it is allowed only from `pending | confirmed | processing` and **automatically restores variant stock** (`variant.stock += item.quantity` for every order item, same DB transaction).
+- **Terminal states:** an order already `cancelled` or `refunded` cannot have its status changed — **`400 Order is already cancelled/refunded — its status cannot be changed`** (this also prevents a double stock restore via a cancelled → active → cancelled cycle).
+- **`400 Order cannot be cancelled. Current status: shipped|delivered`** when trying to cancel an order that has shipped.
+- ⚠️ Setting `refunded` here only changes the label — no money moves. Use the user-cancel flow (`POST /orders/{id}/cancel`) for real Razorpay refunds.
+
 ### 20.3 Admin Users 🔒 **admin** — `/admin/users`
 
 **`AdminUserRead` shape** (same fields as `UserRead` in §5.5):
