@@ -15,6 +15,8 @@ from app.schemas.payment import (
     PaymentConfirmRequest,
 )
 from app.services.payment_service import get_payment_service
+from app.services.email_service import email_service
+from app.core.config import settings
 
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
@@ -40,6 +42,13 @@ def create_payment_intent(
     if order.user_id != current_user.id:
         raise HTTPException(403, "Not authorized")
     
+    # 🚫 COD orders are paid in cash on delivery — no online intent
+    if order.payment_method == "cod":
+        raise HTTPException(
+            400,
+            "This is a Cash on Delivery order. Payment will be collected on delivery.",
+        )
+    
     # Get payment service (dummy or real)
     payment_service = get_payment_service()
     
@@ -53,6 +62,7 @@ def create_payment_intent(
         provider="dummy" if result.get("is_dummy", False) else "razorpay",
         provider_payment_id=result["payment_intent_id"],
         amount=result["amount"],
+        payment_method=order.payment_method or request.payment_method,
     )
     
     return PaymentIntentResponse(
@@ -92,6 +102,13 @@ def confirm_payment(
     if order.user_id != current_user.id:
         raise HTTPException(403, "Not authorized")
     
+    # 🚫 COD orders can't be confirmed online — admin collects cash on delivery
+    if order.payment_method == "cod":
+        raise HTTPException(
+            400,
+            "Cash on Delivery orders cannot be confirmed online. Payment is collected on delivery.",
+        )
+    
     # Get payment service
     payment_service = get_payment_service()
     
@@ -99,9 +116,10 @@ def confirm_payment(
     result = payment_service.confirm_payment(request.payment_intent_id)
     
     if result["status"] == "succeeded":
-        # Update payment status
+        # Update payment status (payment_method = real instrument from Razorpay: upi/card/netbanking/...)
         payment = payment_repo.mark_payment_succeeded(
-            session, request.payment_intent_id
+            session, request.payment_intent_id,
+            payment_method=result.get("method"),
         )
         # Update order status
         order.status = "confirmed"
@@ -109,6 +127,16 @@ def confirm_payment(
         session.add(order)
         session.commit()
         session.refresh(order)
+        
+        # Send payment-received confirmation email (non-fatal)
+        if settings.SENDGRID_API_KEY:
+            try:
+                user = session.get(User, order.user_id)
+                if user:
+                    email_service.send_order_confirmation(order, user)
+                    print(f"Payment confirmation email sent to {user.email}")
+            except Exception as e:
+                print(f"Failed to send payment confirmation email: {str(e)}")
         
         return payment
     else:

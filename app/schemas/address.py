@@ -31,9 +31,9 @@ class AddressRead(BaseModel):
     
     id: UUID
     user_id: UUID
-    label: str | None
+    label: str | None = None  # ✅ THIS IS THE FIX - Added default None
     line1: str
-    line2: str | None
+    line2: str | None = None
     city: str
     state: str
     postal_code: str

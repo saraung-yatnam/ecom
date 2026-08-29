@@ -1,6 +1,7 @@
 from decimal import Decimal
 from typing import List
 
+from app.core.config import settings
 from app.models.cart import Cart, CartItem
 from app.models.product import ProductVariant
 
@@ -39,28 +40,30 @@ def calculate_discount(cart: Cart) -> Decimal:
     Calculate total discount from coupons.
     NOTE: This is a placeholder. Actual discount is calculated in API layer.
     """
-    # Return 0 - the API will override this with the actual discount
     return Decimal("0.00")
 
 
-def calculate_tax(cart: Cart, tax_rate: Decimal = Decimal("0.18")) -> Decimal:
+def calculate_tax(cart: Cart, tax_rate: Decimal = None) -> Decimal:
     """
     Calculate tax on cart total (after discount).
     
     Args:
         cart: Cart object
-        tax_rate: Tax rate (default 18%)
+        tax_rate: Tax rate (default from config)
         
     Returns:
         Decimal: Tax amount
     """
+    if tax_rate is None:
+        tax_rate = Decimal(str(settings.TAX_RATE)) if hasattr(settings, 'TAX_RATE') else Decimal("0.18")
+    
     subtotal = calculate_subtotal(cart)
-    discount = calculate_discount(cart)  # Returns 0
+    discount = calculate_discount(cart)
     taxable_amount = subtotal - discount
     return taxable_amount * tax_rate
 
 
-def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = Decimal("1000.00")) -> Decimal:
+def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = None) -> Decimal:
     """
     Calculate shipping cost.
     
@@ -71,14 +74,21 @@ def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = Decimal("1
     Returns:
         Decimal: Shipping cost
     """
+    if free_shipping_threshold is None:
+        threshold = Decimal(str(settings.FREE_SHIPPING_THRESHOLD)) if hasattr(settings, 'FREE_SHIPPING_THRESHOLD') else Decimal("1000.00")
+    else:
+        threshold = free_shipping_threshold
+    
     subtotal = calculate_subtotal(cart)
     
     if subtotal == Decimal("0.00"):
-        return Decimal("0.00")  # Empty cart = no shipping
-    
-    if subtotal >= free_shipping_threshold:
         return Decimal("0.00")
-    return Decimal("50.00")
+    
+    if subtotal >= threshold:
+        return Decimal("0.00")
+    
+    shipping_cost = Decimal(str(settings.SHIPPING_COST)) if hasattr(settings, 'SHIPPING_COST') else Decimal("50.00")
+    return shipping_cost
 
 
 def calculate_cart_total(cart: Cart) -> dict:
@@ -92,7 +102,7 @@ def calculate_cart_total(cart: Cart) -> dict:
         dict: All calculated totals
     """
     subtotal = calculate_subtotal(cart)
-    discount = calculate_discount(cart)  # Returns 0
+    discount = calculate_discount(cart)
     tax = calculate_tax(cart)
     shipping = calculate_shipping(cart)
     total = subtotal - discount + tax + shipping
@@ -104,7 +114,6 @@ def calculate_cart_total(cart: Cart) -> dict:
         product = variant.product if variant else None
         product_image = product.images[0].url if product and product.images else None
         
-        # Get variant attributes
         variant_attributes = variant.attributes if variant else None
         
         enriched_items.append({
@@ -122,10 +131,10 @@ def calculate_cart_total(cart: Cart) -> dict:
     
     return {
         "subtotal": subtotal,
-        "discount_total": discount,  # Will be overridden in API
+        "discount_total": discount,
         "tax_total": tax,
         "shipping_total": shipping,
-        "total": total,  # Will be overridden in API
+        "total": total,
         "item_count": sum(item.quantity for item in cart.items),
         "items": enriched_items
     }

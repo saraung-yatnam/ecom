@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: str = "*"
 
-    # 👇 PAYMENT - ADD THESE FIELDS
+    # Payment
     PAYMENT_PROVIDER: str = "dummy"
     RAZORPAY_KEY_ID: str | None = None
     RAZORPAY_KEY_SECRET: str | None = None
@@ -39,6 +39,26 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str | None = None
     GOOGLE_CLIENT_SECRET: str | None = None
 
+    # Password Reset Settings
+    FRONTEND_URL: str = "http://localhost:5173"
+    RESET_TOKEN_EXPIRE_HOURS: int = 1
+
+    # ========== NEW: Tax & Shipping Settings ==========
+    TAX_RATE: float = 0.18  # 18% GST
+    FREE_SHIPPING_THRESHOLD: float = 1000.00
+    SHIPPING_COST: float = 50.00
+
+    # ========== COD (Cash on Delivery) Settings ==========
+    COD_FEE: float = 50.00                 # flat fee added to COD orders
+    COD_MIN_ORDER_VALUE: float = 0.00      # grand_total must be >= this for COD
+    COD_MAX_ORDER_VALUE: float = 10000.00  # grand_total must be <= this for COD
+
+    # ========== Cancellation & Refund Settings ==========
+    REFUND_PROCESSING_DAYS: int = 5           # days for refund to reflect in account
+    RESTOCKING_FEE_PENDING: float = 0.0       # % fee when cancelling a PENDING order
+    RESTOCKING_FEE_CONFIRMED: float = 5.0     # % fee when cancelling a CONFIRMED order
+    RESTOCKING_FEE_PROCESSING: float = 15.0   # % fee when cancelling a PROCESSING order
+
     @property
     def cors_origins_list(self) -> List[str]:
         if self.CORS_ORIGINS == "*":
@@ -48,7 +68,12 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# 👇 Debug prints
+# Debug prints
 print(f"PAYMENT_PROVIDER: {settings.PAYMENT_PROVIDER}")
 print(f"RAZORPAY_KEY_ID: {settings.RAZORPAY_KEY_ID}")
 print(f"RAZORPAY_KEY_SECRET: {'***' if settings.RAZORPAY_KEY_SECRET else 'None'}")
+print(f"FRONTEND_URL: {settings.FRONTEND_URL}")
+print(f"RESET_TOKEN_EXPIRE_HOURS: {settings.RESET_TOKEN_EXPIRE_HOURS}")
+print(f"TAX_RATE: {settings.TAX_RATE}")
+print(f"FREE_SHIPPING_THRESHOLD: {settings.FREE_SHIPPING_THRESHOLD}")
+print(f"SHIPPING_COST: {settings.SHIPPING_COST}")

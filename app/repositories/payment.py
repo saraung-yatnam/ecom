@@ -15,6 +15,7 @@ def create_payment(
     amount: float,
     currency: str = "INR",
     metadata: dict = None,
+    payment_method: str | None = None,
 ) -> Payment:
     """Create a new payment record"""
     payment = Payment(
@@ -24,6 +25,7 @@ def create_payment(
         amount=amount,
         currency=currency,
         payment_metadata=metadata or {},
+        payment_method=payment_method,
         status=PaymentStatus.PENDING,
     )
     session.add(payment)
@@ -93,6 +95,7 @@ def mark_payment_succeeded(
     session: Session,
     provider_payment_id: str,
     provider_payment_intent: str | None = None,
+    payment_method: str | None = None,
 ) -> Payment | None:
     """Mark payment as succeeded"""
     payment = get_payment_by_provider_id(session, provider_payment_id)

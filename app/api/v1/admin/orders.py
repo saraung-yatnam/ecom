@@ -120,6 +120,10 @@ def get_all_orders_admin(
             "payment_status": order.payment_status,
             "coupon_code": order.coupon_code,
             
+            # Cancellation
+            "cancellation_reason": order.cancellation_reason,
+            "cancelled_at": order.cancelled_at.isoformat() if order.cancelled_at else None,
+            
             # Timestamps
             "placed_at": order.placed_at.isoformat() if order.placed_at else None,
             "updated_at": order.updated_at.isoformat() if order.updated_at else None,
@@ -246,8 +250,13 @@ def get_order_detail(
         # Status
         "status": order.status.value if hasattr(order.status, 'value') else str(order.status),
         "payment_status": order.payment_status,
-        # ❌ REMOVED: "payment_method": order.payment_method,  # This field doesn't exist
+        "payment_method": order.payment_method,
+        "cod_fee": float(order.cod_fee) if order.cod_fee is not None else 0.0,
         "coupon_code": order.coupon_code,
+        
+        # Cancellation
+        "cancellation_reason": order.cancellation_reason,
+        "cancelled_at": order.cancelled_at.isoformat() if order.cancelled_at else None,
         
         # Timestamps
         "placed_at": order.placed_at.isoformat() if order.placed_at else None,

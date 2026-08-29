@@ -10,6 +10,7 @@ from app.models.payment import Payment, PaymentStatus, PaymentProvider
 from app.models.review import Review  # 👈 ADD THIS LINE
 from app.models.wishlist import Wishlist
 from app.models.coupon import Coupon, DiscountType  # Add this
+from app.models.password_reset import PasswordResetToken  # Add this
 
 __all__ = [
     "User",
@@ -30,5 +31,6 @@ __all__ = [
     "Review",  # 👈 ADD THIS
     "Wishlist",
     "Coupon",
-    "DiscountType"
+    "DiscountType",
+    "PasswordResetToken",  # Add this
 ]

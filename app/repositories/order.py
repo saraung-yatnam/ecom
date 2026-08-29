@@ -50,6 +50,26 @@ def get_orders_by_user(
     return result.scalars().all()
 
 
+def get_order_by_refund_id(session: Session, refund_id: str) -> Order | None:
+    """Get order by the stored Razorpay refund ID (rfnd_xxx).
+
+    Uses .first() (most recent order) instead of scalar_one_or_none() so a
+    duplicate refund_id in the DB can never crash the webhook handler.
+    """
+    statement = (
+        select(Order)
+        .where(Order.refund_id == refund_id)
+        .order_by(Order.placed_at.desc())
+        .options(
+            selectinload(Order.items),
+            selectinload(Order.user),
+            selectinload(Order.shipping_address),
+        )
+    )
+    result = session.execute(statement)
+    return result.scalars().first()
+
+
 def get_order_by_number(session: Session, order_number: str) -> Order | None:
     """Get order by order number"""
     statement = (

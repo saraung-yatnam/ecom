@@ -86,7 +86,19 @@ class RazorpayPaymentService(PaymentService):
         try:
             order = self.client.order.fetch(payment_intent_id)
             if order["status"] == "paid":
-                return {"status": "succeeded", "payment_intent_id": payment_intent_id, "is_dummy": False}
+                # The real instrument (card/upi/netbanking/wallet) was chosen
+                # inside Razorpay's modal — read it back from the payment
+                method = None
+                try:
+                    pays = self.client.order.payments(payment_intent_id)
+                    items = pays.get("items", []) if isinstance(pays, dict) else (pays or [])
+                    for p in items:
+                        if p.get("status") in ("captured", "authorized"):
+                            method = p.get("method")
+                            break
+                except Exception as pe:
+                    print(f"⚠️ Could not read payment method from Razorpay: {pe}")
+                return {"status": "succeeded", "payment_intent_id": payment_intent_id, "is_dummy": False, "method": method}
             elif order["status"] == "created":
                 return {"status": "pending", "payment_intent_id": payment_intent_id, "is_dummy": False}
             else:
@@ -96,31 +108,114 @@ class RazorpayPaymentService(PaymentService):
             return {"status": "failed", "payment_intent_id": payment_intent_id, "is_dummy": False, "error": str(e)}
     
     def handle_webhook(self, payload, signature):
-        """Handle Razorpay webhook"""
+        """Handle Razorpay webhook. `payload` must be the RAW request body (str)."""
         if not self.is_configured:
             from app.services.payment_service import DummyPaymentService
             return DummyPaymentService().handle_webhook(payload, signature)
         
+        # Razorpay signs the raw body with HMAC-SHA256 -> sent in X-Razorpay-Signature
+        if self.webhook_secret:
+            if not signature:
+                print("❌ Webhook rejected: missing X-Razorpay-Signature header")
+                return {"event_type": "invalid_signature", "data": {}, "is_dummy": False}
+            try:
+                self.client.utility.verify_webhook_signature(payload, signature, self.webhook_secret)
+            except Exception as e:
+                print(f"❌ Razorpay webhook signature verification failed: {str(e)}")
+                return {"event_type": "invalid_signature", "data": {}, "is_dummy": False, "error": str(e)}
+        else:
+            print("⚠️ RAZORPAY_WEBHOOK_SECRET not set — webhook signature NOT verified!")
+        
         try:
             import json
-            if self.webhook_secret:
-                self.client.utility.verify_webhook_signature(payload, signature, self.webhook_secret)
-            
             event = json.loads(payload)
             return {"event_type": event.get("event"), "data": event.get("payload", {}), "is_dummy": False}
         except Exception as e:
-            print(f"❌ Razorpay webhook verification failed: {str(e)}")
-            return {"event_type": "unknown", "data": {}, "is_dummy": False, "error": str(e)}
+            print(f"❌ Razorpay webhook payload parse failed: {str(e)}")
+            return {"event_type": "invalid", "data": {}, "is_dummy": False, "error": str(e)}
     
     def refund_payment(self, payment_id):
         """Refund Razorpay payment"""
         if not self.is_configured:
             from app.services.payment_service import DummyPaymentService
             return DummyPaymentService().refund_payment(payment_id)
-        
+
         try:
             refund = self.client.payment.refund(payment_id)
             return {"status": "refunded", "refund_id": refund["id"], "payment_id": payment_id, "is_dummy": False}
         except Exception as e:
             print(f"❌ Razorpay refund failed: {str(e)}")
             return {"status": "failed", "payment_id": payment_id, "is_dummy": False, "error": str(e)}
+
+    def create_refund(self, payment_id, amount=None, notes=None):
+        """
+        Create a full or partial refund for a Razorpay payment.
+
+        - payment_id: the Razorpay payment ID (pay_xxx) — NOT the order ID
+        - amount:     amount in INR (rupees). None = full refund
+        - notes:      dict of notes stored against the refund
+        """
+        if not self.is_configured:
+            from app.services.payment_service import DummyPaymentService
+            print("⚠️ Using dummy refund (Razorpay not configured)")
+            return DummyPaymentService().create_refund(payment_id, amount, notes)
+
+        try:
+            payload = {}
+            if amount is not None:
+                # Razorpay expects the amount in paise
+                payload["amount"] = int(float(amount) * 100)
+            if notes:
+                payload["notes"] = {k: str(v) for k, v in notes.items()}
+
+            refund = self.client.payment.refund(payment_id, payload)
+            print(f"✅ Razorpay refund created: {refund['id']} (status: {refund.get('status')})")
+
+            return {
+                "status": refund.get("status"),  # processed | pending | failed
+                "refund_id": refund["id"],
+                "payment_id": payment_id,
+                "amount": (refund.get("amount") or 0) / 100,
+                "is_dummy": False,
+            }
+        except Exception as e:
+            print(f"❌ Razorpay refund failed: {str(e)}")
+            return {"status": "failed", "payment_id": payment_id, "is_dummy": False, "error": str(e)}
+
+    def get_refund_status(self, refund_id):
+        """Fetch a refund from Razorpay by its refund ID (rfnd_xxx)."""
+        if not self.is_configured:
+            from app.services.payment_service import DummyPaymentService
+            return DummyPaymentService().get_refund_status(refund_id)
+
+        try:
+            refund = self.client.refund.fetch(refund_id)
+            return {
+                "refund_id": refund["id"],
+                "payment_id": refund.get("payment_id"),
+                "amount": (refund.get("amount") or 0) / 100,
+                "status": refund.get("status"),  # processed | pending | failed
+                "is_dummy": False,
+            }
+        except Exception as e:
+            print(f"❌ Razorpay refund fetch failed: {str(e)}")
+            return {"status": "failed", "refund_id": refund_id, "is_dummy": False, "error": str(e)}
+
+    def get_payment_id_for_order(self, razorpay_order_id):
+        """
+        Resolve the actual payment ID (pay_xxx) for a Razorpay order ID
+        (order_xxx) by listing the order's payments. Returns None if the
+        order has no captured/authorized payment.
+        """
+        if not self.is_configured:
+            return None
+
+        try:
+            pays = self.client.order.payments(razorpay_order_id)
+            items = pays.get("items", []) if isinstance(pays, dict) else (pays or [])
+            for p in items:
+                if p.get("status") in ("captured", "authorized"):
+                    return p.get("id")
+        except Exception as e:
+            print(f"⚠️ Could not fetch payments for Razorpay order {razorpay_order_id}: {e}")
+        return None

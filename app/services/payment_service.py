@@ -24,6 +24,21 @@ class PaymentService(ABC):
     def refund_payment(self, payment_id: str) -> dict:
         pass
 
+    @abstractmethod
+    def create_refund(
+        self,
+        payment_id: str,
+        amount: float | None = None,
+        notes: dict | None = None,
+    ) -> dict:
+        """Create a full or partial refund for a payment."""
+        pass
+
+    @abstractmethod
+    def get_refund_status(self, refund_id: str) -> dict:
+        """Fetch the status of a refund."""
+        pass
+
 
 class DummyPaymentService(PaymentService):
     """Dummy payment service for testing"""
@@ -49,11 +64,29 @@ class DummyPaymentService(PaymentService):
             "message": "Dummy payment confirmed"
         }
     
-    def handle_webhook(self, payload: dict, signature: str) -> dict:
+    def handle_webhook(self, payload, signature: str) -> dict:
+        """Dummy webhook handler.
+
+        Reads the event type from the JSON body so local testing can simulate
+        any event (payment.succeeded, refund.processed, refund.failed, ...).
+        Falls back to ``payment.succeeded`` when no event is provided.
+        """
+        import json
+
+        body = {}
+        if isinstance(payload, str):
+            try:
+                body = json.loads(payload or "{}")
+            except json.JSONDecodeError:
+                body = {}
+        elif isinstance(payload, dict):
+            body = payload
+
+        event_type = body.get("event") or body.get("event_type") or "payment.succeeded"
         return {
-            "event_type": "payment.succeeded",
-            "data": payload,
-            "is_dummy": True
+            "event_type": event_type,
+            "data": body,
+            "is_dummy": True,
         }
     
     def refund_payment(self, payment_id: str) -> dict:
@@ -61,6 +94,30 @@ class DummyPaymentService(PaymentService):
             "status": "refunded",
             "payment_id": payment_id,
             "is_dummy": True
+        }
+
+    def create_refund(
+        self,
+        payment_id: str,
+        amount: float | None = None,
+        notes: dict | None = None,
+    ) -> dict:
+        refund_id = f"dummy_rfnd_{uuid.uuid4().hex[:12]}"
+        return {
+            "status": "processed",
+            "refund_id": refund_id,
+            "payment_id": payment_id,
+            "amount": float(amount or 0),
+            "is_dummy": True,
+            "message": "Dummy refund - no real money involved",
+        }
+
+    def get_refund_status(self, refund_id: str) -> dict:
+        return {
+            "refund_id": refund_id,
+            "status": "processed",
+            "is_dummy": True,
+            "message": "Dummy refund status",
         }
 
 

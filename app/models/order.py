@@ -53,10 +53,29 @@ class Order(SQLModel, table=True):
     # Coupon
     coupon_code: str | None = None
     
+    # Coupon
+    coupon_code: str | None = None
+    
+    # Payment
+    payment_method: str | None = None  # 'cod' or 'online' (choice made at checkout)
+    cod_fee: Decimal = Field(default=0, max_digits=12, decimal_places=2)
+    
+    # Status
     # Status
     status: OrderStatus = Field(default=OrderStatus.PENDING)
     payment_status: str = Field(default="pending")
-    
+
+    # Cancellation
+    cancellation_reason: str | None = None
+    cancelled_at: datetime | None = None
+
+    # Refund
+    refund_amount: Decimal = Field(default=0, max_digits=12, decimal_places=2)
+    refund_id: str | None = None           # Razorpay refund ID (rfnd_xxx)
+    refund_reason: str | None = None
+    restocking_fee: Decimal = Field(default=0, max_digits=12, decimal_places=2)
+    refunded_at: datetime | None = None
+
     # Timestamps
     placed_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
@@ -67,12 +86,43 @@ class Order(SQLModel, table=True):
     )
     shipped_at: datetime | None = None
     delivered_at: datetime | None = None
-    
+
     # Relationships - use string references to avoid circular imports
     user: "User" = Relationship(back_populates="orders")
     items: list["OrderItem"] = Relationship(back_populates="order")
     payments: list["Payment"] = Relationship(back_populates="order")
     reviews: list["Review"] = Relationship(back_populates="order")
+
+    # ---------------------------------------------------------
+    # Computed helpers (not DB columns)
+    # ---------------------------------------------------------
+    @property
+    def can_cancel(self) -> bool:
+        """Orders can be cancelled while PENDING, CONFIRMED or PROCESSING."""
+        return self.status in (
+            OrderStatus.PENDING,
+            OrderStatus.CONFIRMED,
+            OrderStatus.PROCESSING,
+        )
+
+    @property
+    def can_refund(self) -> bool:
+        """Refund is possible only for paid online orders not fully refunded."""
+        if self.payment_method == "cod" or self.payment_status != "paid":
+            return False
+        already_refunded = self.refund_amount or Decimal(0)
+        return already_refunded < self.grand_total
+
+    @property
+    def restocking_fee_percentage(self) -> float:
+        """Restocking fee % based on the order status at cancellation time."""
+        from app.core.config import settings
+
+        if self.status == OrderStatus.PROCESSING:
+            return settings.RESTOCKING_FEE_PROCESSING
+        if self.status == OrderStatus.CONFIRMED:
+            return settings.RESTOCKING_FEE_CONFIRMED
+        return settings.RESTOCKING_FEE_PENDING
 
 
 class OrderItem(SQLModel, table=True):

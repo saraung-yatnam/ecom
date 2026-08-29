@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 import uuid
+import secrets
 
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -39,5 +40,54 @@ def decode_access_token(token: str) -> dict[str, Any] | None:
         if payload.get("type") != "access":
             return None
         return payload
+    except JWTError:
+        return None
+
+
+# ========== Password Reset Token Functions ==========
+
+def generate_reset_token() -> str:
+    """
+    Generate a secure random token for password reset.
+    Uses secrets.token_urlsafe for cryptographically secure random tokens.
+    Returns a 32-byte (256-bit) URL-safe token.
+    """
+    return secrets.token_urlsafe(32)
+
+
+def create_reset_jwt_token(email: str) -> str:
+    """
+    Create JWT token for password reset.
+    Alternative to random token if you prefer JWT-based tokens.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(hours=settings.RESET_TOKEN_EXPIRE_HOURS)
+    payload = {"sub": email, "exp": expire, "type": "reset"}
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def verify_reset_jwt_token(token: str) -> str | None:
+    """
+    Verify JWT reset token and return email.
+    Returns email if valid, None otherwise.
+    """
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("type") != "reset":
+            return None
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+def verify_reset_token(token: str) -> dict[str, Any] | None:
+    """
+    Verify a reset token (JWT-based).
+    Returns user data if valid, None otherwise.
+    """
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("type") != "reset":
+            return None
+        return {"email": payload.get("sub")}
     except JWTError:
         return None

@@ -18,6 +18,7 @@ class PaymentProvider(str, Enum):
     DUMMY = "dummy"
     RAZORPAY = "razorpay"
     STRIPE = "stripe"
+    COD = "cod"  # Cash on Delivery (cash collected offline on delivery)
 
 
 class Payment(SQLModel, table=True):

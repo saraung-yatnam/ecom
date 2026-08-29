@@ -80,6 +80,15 @@ class OrderStatusUpdate(BaseModel):
     status: OrderStatusEnum
 
 
+class CancelOrderRequest(BaseModel):
+    """Cancel order request body — reason is optional"""
+    reason: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        description="Why the order is being cancelled",
+    )
+
+
 # =========================================================
 # RESPONSE SCHEMAS
 # =========================================================
@@ -115,6 +124,17 @@ class OrderRead(BaseModel):
     payment_method: Optional[str] = None
     coupon_code: Optional[str] = None
     
+    # Cancellation
+    cancellation_reason: Optional[str] = None
+    cancelled_at: Optional[datetime] = None
+
+    # Refund
+    refund_amount: Decimal = Decimal(0)
+    refund_id: Optional[str] = None
+    refund_reason: Optional[str] = None
+    restocking_fee: Decimal = Decimal(0)
+    refunded_at: Optional[datetime] = None
+
     # Timestamps
     placed_at: datetime
     updated_at: datetime
@@ -157,3 +177,42 @@ class OrderUpdate(BaseModel):
     payment_status: Optional[str] = None
     shipping_address_id: Optional[UUID] = None
     billing_address_id: Optional[UUID] = None
+
+
+# =========================================================
+# REFUND / CANCELLATION RESPONSE SCHEMAS
+# =========================================================
+
+class RefundInfo(BaseModel):
+    """Refund details returned alongside a cancellation"""
+    processed: bool = False
+    amount: Decimal = Decimal(0)
+    restocking_fee: Decimal = Decimal(0)
+    fee_percentage: Decimal = Decimal(0)
+    refund_id: Optional[str] = None
+    status: Optional[str] = None
+    message: Optional[str] = None
+
+
+class CancelOrderResponse(BaseModel):
+    """Response returned after cancelling an order"""
+    order_id: UUID
+    order_number: str
+    status: str
+    message: str
+    refund: RefundInfo
+
+
+class RefundStatusResponse(BaseModel):
+    """Response returned by the refund-status endpoint"""
+    order_id: UUID
+    order_number: str
+    refund_id: Optional[str] = None
+    refund_amount: Decimal = Decimal(0)
+    restocking_fee: Decimal = Decimal(0)
+    fee_percentage: Decimal = Decimal(0)
+    # Our stored, user-facing refund phase: refund_initiated | refund_completed | refund_failed
+    payment_status: Optional[str] = None
+    # Live provider status: processed | pending | failed
+    status: str
+    message: str

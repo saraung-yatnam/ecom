@@ -1,8 +1,9 @@
 import uuid
+from datetime import datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks
 from sqlmodel import Session
-from fastapi import Depends
+from pydantic import BaseModel, EmailStr
 
 from app.api.deps import SessionDep, CurrentUser, get_current_user
 from app.schemas.google_auth import GoogleAuthRequest
@@ -10,14 +11,33 @@ from app.schemas.user import UserCreate, UserRead, UserLogin, SetPasswordRequest
 from app.schemas.token import TokenPair, RefreshRequest
 from app.repositories import user as user_repo
 from app.repositories import token as token_repo
-from app.core.security import verify_password, create_access_token, hash_password
+from app.core.security import verify_password, create_access_token, hash_password, generate_reset_token
 from app.services.email_service import email_service
 from app.services.google_auth_service import google_auth_service
 from app.core.config import settings
 from app.models.user import User
+from app.models.password_reset import PasswordResetToken
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+
+# ========== Request Schemas ==========
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+# ========== Authentication Endpoints ==========
 
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def register(data: UserCreate, session: SessionDep):
@@ -32,9 +52,9 @@ def register(data: UserCreate, session: SessionDep):
     if settings.SENDGRID_API_KEY:
         try:
             email_service.send_welcome_email(user)
-            print(f"Welcome email sent to {user.email}")
+            print(f"✅ Welcome email sent to {user.email}")
         except Exception as e:
-            print(f"Failed to send welcome email: {str(e)}")
+            print(f"❌ Failed to send welcome email: {str(e)}")
     
     return user
 
@@ -170,9 +190,9 @@ def google_auth(
         if settings.SENDGRID_API_KEY:
             try:
                 email_service.send_welcome_email(user)
-                print(f"Welcome email sent to {user.email}")
+                print(f"✅ Welcome email sent to {user.email}")
             except Exception as e:
-                print(f"Failed to send welcome email: {str(e)}")
+                print(f"❌ Failed to send welcome email: {str(e)}")
     
     else:
         # User exists - link Google account if not already
@@ -225,3 +245,137 @@ def set_password(
     session.commit()
     
     return {"message": "Password set successfully. You can now login with email/password."}
+
+
+# ========== Password Reset Endpoints ==========
+
+@router.post("/forgot-password", status_code=status.HTTP_200_OK)
+def forgot_password(
+    request: ForgotPasswordRequest,
+    session: SessionDep,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Request password reset link.
+    If email exists, send reset link. Always return 200 OK for security.
+    """
+    # Find user by email
+    user = user_repo.get_user_by_email(session, request.email)
+    
+    # Always return 200 OK (security: don't reveal if email exists)
+    if not user:
+        print(f"⚠️ Password reset requested for non-existent email: {request.email}")
+        return {"message": "If an account with this email exists, a reset link has been sent."}
+    
+    # Check if user has a password (Google-only users can't reset password)
+    if not user.password_hash:
+        print(f"⚠️ Password reset requested for Google-only user: {user.email}")
+        return {"message": "If an account with this email exists, a reset link has been sent."}
+    
+    # Delete any existing reset tokens for this user
+    session.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id
+    ).delete()
+    session.commit()
+    
+    # Generate reset token (valid for 1 hour)
+    token = generate_reset_token()
+    expires_at = datetime.utcnow() + timedelta(hours=settings.RESET_TOKEN_EXPIRE_HOURS)
+    
+    # Store token in database
+    reset_token = PasswordResetToken(
+        token=token,
+        user_id=user.id,
+        expires_at=expires_at,
+        used=False,
+    )
+    session.add(reset_token)
+    session.commit()
+    
+    # Send email in background
+    background_tasks.add_task(
+        email_service.send_password_reset_email,
+        user_email=user.email,
+        user_name=user.full_name or user.username,
+        reset_token=token,
+    )
+    
+    print(f"✅ Password reset token generated for {user.email}")
+    return {"message": "If an account with this email exists, a reset link has been sent."}
+
+
+@router.post("/reset-password", status_code=status.HTTP_200_OK)
+def reset_password(
+    request: ResetPasswordRequest,
+    session: SessionDep,
+):
+    """
+    Reset password using token.
+    """
+    # Get token from database
+    reset_token = session.query(PasswordResetToken).filter(
+        PasswordResetToken.token == request.token,
+        PasswordResetToken.used == False,
+        PasswordResetToken.expires_at > datetime.utcnow(),
+    ).first()
+    
+    if not reset_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset token",
+        )
+    
+    # Get user
+    user = session.get(User, reset_token.user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+    
+    # Update password
+    user.password_hash = hash_password(request.new_password)
+    user.auth_provider = "both" if user.google_id else "email"
+    
+    # Mark token as used
+    reset_token.used = True
+    
+    session.add(user)
+    session.add(reset_token)
+    session.commit()
+    
+    print(f"✅ Password reset successful for {user.email}")
+    return {"message": "Password reset successfully. You can now login with your new password."}
+
+
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+def change_password(
+    request: ChangePasswordRequest,
+    session: SessionDep,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Change password for logged-in user.
+    Requires current password for verification.
+    """
+    # Check if user has a password (Google-only users can't change password via this endpoint)
+    if not current_user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You don't have a password set. Use 'set-password' endpoint.",
+        )
+    
+    # Verify current password
+    if not verify_password(request.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect",
+        )
+    
+    # Update password
+    current_user.password_hash = hash_password(request.new_password)
+    session.add(current_user)
+    session.commit()
+    
+    print(f"✅ Password changed successfully for {current_user.email}")
+    return {"message": "Password changed successfully."}

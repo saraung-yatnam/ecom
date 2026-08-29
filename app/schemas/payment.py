@@ -25,7 +25,7 @@ class PaymentProviderEnum(str, Enum):
 
 class PaymentCreateRequest(BaseModel):
     order_id: UUID
-    payment_method: str = Field(default="card")
+    payment_method: str = Field(default="online")  # kept for compat; Razorpay records the real instrument
 
 
 class PaymentConfirmRequest(BaseModel):

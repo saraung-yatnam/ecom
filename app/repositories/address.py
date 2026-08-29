@@ -15,7 +15,8 @@ def get_address_by_id(session: Session, address_id: UUID) -> Address | None:
 def get_addresses_by_user(session: Session, user_id: UUID) -> list[Address]:
     """Get all addresses for a user"""
     statement = select(Address).where(Address.user_id == user_id)
-    return session.exec(statement).all()
+    result = session.execute(statement)
+    return result.scalars().all()  # ✅ Use scalars().all() instead of exec()
 
 
 def create_address(session: Session, user_id: UUID, address_data: dict) -> Address:
@@ -42,14 +43,12 @@ def can_delete_address(session: Session, address_id: UUID) -> tuple[bool, str]:
     Check if address can be deleted.
     Returns: (can_delete, message)
     """
-    # Check if address is used in any order
     statement = select(Order).where(
         (Order.shipping_address_id == address_id) | 
         (Order.billing_address_id == address_id)
     )
-    # 👇 Use execute() instead of exec() to get proper model instances
     result = session.execute(statement)
-    orders = result.scalars().all()  # 👈 This returns Order objects
+    orders = result.scalars().all()
     
     if orders:
         order_numbers = [str(o.order_number) for o in orders[:3]]
@@ -65,7 +64,6 @@ def can_delete_address(session: Session, address_id: UUID) -> tuple[bool, str]:
 
 def delete_address(session: Session, address: Address) -> None:
     """Delete an address (only if not used in orders)"""
-    # Check if address is used in orders
     statement = select(Order).where(
         (Order.shipping_address_id == address.id) | 
         (Order.billing_address_id == address.id)
@@ -88,7 +86,9 @@ def set_default_address(session: Session, user_id: UUID, address_id: UUID) -> No
     """Set an address as default for user"""
     # Remove default from all addresses
     statement = select(Address).where(Address.user_id == user_id)
-    addresses = session.exec(statement).all()
+    result = session.execute(statement)
+    addresses = result.scalars().all()
+    
     for addr in addresses:
         addr.is_default = False
         session.add(addr)
