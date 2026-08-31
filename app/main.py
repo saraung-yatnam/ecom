@@ -6,7 +6,6 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from app.core.config import settings
 from app.api.v1.router import api_router
 
-
 app = FastAPI(title=settings.PROJECT_NAME)
 
 
@@ -70,3 +69,5 @@ def root():
         "environment": settings.ENVIRONMENT,
         "payment_provider": settings.PAYMENT_PROVIDER,
     }
+
+

@@ -742,7 +742,7 @@ Creates the order from the logged-in user's cart, validates stock, applies the c
 ```
 
 - `payment_method: "online"` → order created with `status: "pending"`, `payment_status: "pending"` → **continue to Payments flow (§13)**.
-- `payment_method: "cod"` → order created with `status: "confirmed"`, `payment_status: "cod_pending"`; a flat **₹50 COD fee** is added to `grand_total` (COD allowed only for grand totals ₹0–₹10000, else `400`).
+- `payment_method: "cod"` → order created with `status: "confirmed"`, `payment_status: "cod_pending"`; a flat **₹50 COD fee** is added to `grand_total` (COD allowed only for grand totals ₹0–₹10000, else `400`). Fee/limits come from the `COD_FEE` / `COD_MIN_ORDER_VALUE` / `COD_MAX_ORDER_VALUE` settings and are exposed to clients via **§10.2**.
 
 **Errors:**
 - `400 Invalid shipping address` / `400 Invalid billing address`
@@ -751,6 +751,25 @@ Creates the order from the logged-in user's cart, validates stock, applies the c
 - `400` coupon problems
 - `400 Cash on Delivery is available only for orders of ₹0 or more` / `…up to ₹10000. Please pay online.`
 - `401` not logged in · `422` validation
+
+### 10.2 `GET /checkout/config` — Checkout pricing configuration (public)
+
+Display-only pricing rules for the storefront so the frontend never hardcodes business rules (COD fee, COD limits, shipping threshold, tax rate). **The server remains the single source of truth** — `POST /checkout` always recomputes fees/limits from the same settings, so client values are cosmetic only.
+
+**Response `200`** (`CheckoutConfigResponse`):
+
+```json
+{
+  "cod_fee": 50.0,
+  "cod_min_order_value": 0.0,
+  "cod_max_order_value": 10000.0,
+  "free_shipping_threshold": 1000.0,
+  "shipping_cost": 50.0,
+  "tax_rate": 0.18
+}
+```
+
+No auth required (nothing sensitive — mirrors non-secret settings). In production you can add `Cache-Control: public, max-age=60` (or an ETag) since values change rarely.
 
 ---
 
@@ -1435,61 +1454,62 @@ Poll GET /orders/{id}/refund-status → display response.message
 | 36 | `POST /cart/coupon` | opt | Apply coupon |
 | 37 | `DELETE /cart/coupon` | opt | Remove coupon |
 | 38 | `POST /checkout` | 🔒 | Cart → order (201) |
-| 39 | `GET /addresses` | 🔒 | List my addresses |
-| 40 | `POST /addresses` | 🔒 | Create address (201) |
-| 41 | `PUT /addresses/{id}` | 🔒 | Update address |
-| 42 | `DELETE /addresses/{id}` | 🔒 | Delete address (204) |
-| 43 | `POST /addresses/default/{id}` | 🔒 | Set default |
-| 44 | `GET /orders` | 🔒 | My orders |
-| 45 | `GET /orders/{id}` | 🔒 | Order detail |
-| 46 | `GET /orders/number/{order_number}` | 🔒 | Order by number |
-| 47 | `POST /orders/{id}/cancel` | 🔒 | Cancel (+ refund) |
-| 48 | `GET /orders/{id}/refund-status` | 🔒 | Refund status |
-| 49 | `POST /payments/create-intent` | 🔒 | Start online payment |
-| 50 | `POST /payments/confirm` | 🔒 | Confirm payment |
-| 51 | `POST /webhooks/payment` | signature | Razorpay only — not frontend |
-| 52 | `POST /reviews/{product_id}` | 🔒 | Create review |
-| 53 | `GET /reviews/products/{id}` | 🔓 | Product reviews |
-| 54 | `GET /reviews/product/{id}/rating` | 🔓 | Average rating |
-| 55 | `GET /reviews/my-reviews` | 🔒 | My reviews |
-| 56 | `PUT /reviews/{review_id}` | 🔒 | Update my review |
-| 57 | `DELETE /reviews/{review_id}` | 🔒 | Delete my review (204) |
-| 58 | `GET /wishlist` | 🔒 | My wishlist |
-| 59 | `POST /wishlist/{product_id}` | 🔒 | Add to wishlist (201) |
-| 60 | `DELETE /wishlist/{product_id}` | 🔒 | Remove (204) |
-| 61 | `GET /wishlist/check/{product_id}` | 🔒 | In wishlist? |
-| 62 | `POST /coupons/validate` | 🔓 | Validate code |
-| 63 | `GET /coupons` | mgr+ | List coupons |
-| 64 | `GET /coupons/{id}` | mgr+ | Coupon detail |
-| 65 | `POST /coupons` | mgr+ | Create coupon (201) |
-| 66 | `PUT /coupons/{id}` | mgr+ | Update coupon |
-| 67 | `DELETE /coupons/{id}` | mgr+ | Delete coupon (204) |
-| 68 | `POST /coupons/generate` | mgr+ | Generate code |
-| 69 | `POST /email/test` | mgr+ | Send test email |
-| 70 | `GET /analytics/dashboard` | mgr+ | Dashboard stats |
-| 71 | `GET /analytics/sales` | mgr+ | Sales report |
-| 72 | `GET /analytics/top-products` | mgr+ | Top products |
-| 73 | `GET /analytics/orders` | mgr+ | Order stats |
-| 74 | `GET /analytics/revenue` | mgr+ | Revenue report |
-| 75 | `GET /analytics/customers` | mgr+ | Customer summary |
-| 76 | `GET /admin/dashboard` | mgr+ | Admin overview |
-| 77 | `GET /admin/orders` | mgr+ | All orders (paginated) |
-| 78 | `GET /admin/orders/stats` | mgr+ | Order stats |
-| 79 | `GET /admin/orders/{id}` | mgr+ | Order detail |
-| 80 | `PUT /admin/orders/{id}/status` | mgr+ | Update status |
-| 81 | `GET /admin/users` | admin | All users (paginated) |
-| 82 | `GET /admin/users/stats` | admin | User stats |
-| 83 | `GET /admin/users/{id}` | admin | User detail |
-| 84 | `PUT /admin/users/{id}/role` | admin | Change role |
-| 85 | `PUT /admin/users/{id}/status` | admin | Activate/deactivate |
-| 86 | `DELETE /admin/users/{id}` | admin | Delete user (204) |
-| 87 | `GET /admin/products` | mgr+ | All products (paginated) |
-| 88 | `GET /admin/products/export` | admin | Export JSON |
-| 89 | `GET /admin/products/{id}` | mgr+ | Product detail |
-| 90 | `POST /admin/products/bulk-delete` | admin | Bulk delete (query params) |
-| 91 | `POST /admin/products/bulk-update-status` | admin | Bulk active toggle (query params) |
-| 92 | `GET /admin/cod/pending` | mgr+ | COD awaiting collection |
-| 93 | `POST /admin/cod/orders/{id}/collect` | mgr+ | Mark COD collected |
+| 39 | `GET /checkout/config` | 🔓 | Checkout pricing config (COD fee/limits, shipping, tax rate) |
+| 40 | `GET /addresses` | 🔒 | List my addresses |
+| 41 | `POST /addresses` | 🔒 | Create address (201) |
+| 42 | `PUT /addresses/{id}` | 🔒 | Update address |
+| 43 | `DELETE /addresses/{id}` | 🔒 | Delete address (204) |
+| 44 | `POST /addresses/default/{id}` | 🔒 | Set default |
+| 45 | `GET /orders` | 🔒 | My orders |
+| 46 | `GET /orders/{id}` | 🔒 | Order detail |
+| 47 | `GET /orders/number/{order_number}` | 🔒 | Order by number |
+| 48 | `POST /orders/{id}/cancel` | 🔒 | Cancel (+ refund) |
+| 49 | `GET /orders/{id}/refund-status` | 🔒 | Refund status |
+| 50 | `POST /payments/create-intent` | 🔒 | Start online payment |
+| 51 | `POST /payments/confirm` | 🔒 | Confirm payment |
+| 52 | `POST /webhooks/payment` | signature | Razorpay only — not frontend |
+| 53 | `POST /reviews/{product_id}` | 🔒 | Create review |
+| 54 | `GET /reviews/products/{id}` | 🔓 | Product reviews |
+| 55 | `GET /reviews/product/{id}/rating` | 🔓 | Average rating |
+| 56 | `GET /reviews/my-reviews` | 🔒 | My reviews |
+| 57 | `PUT /reviews/{review_id}` | 🔒 | Update my review |
+| 58 | `DELETE /reviews/{review_id}` | 🔒 | Delete my review (204) |
+| 59 | `GET /wishlist` | 🔒 | My wishlist |
+| 60 | `POST /wishlist/{product_id}` | 🔒 | Add to wishlist (201) |
+| 61 | `DELETE /wishlist/{product_id}` | 🔒 | Remove (204) |
+| 62 | `GET /wishlist/check/{product_id}` | 🔒 | In wishlist? |
+| 63 | `POST /coupons/validate` | 🔓 | Validate code |
+| 64 | `GET /coupons` | mgr+ | List coupons |
+| 65 | `GET /coupons/{id}` | mgr+ | Coupon detail |
+| 66 | `POST /coupons` | mgr+ | Create coupon (201) |
+| 67 | `PUT /coupons/{id}` | mgr+ | Update coupon |
+| 68 | `DELETE /coupons/{id}` | mgr+ | Delete coupon (204) |
+| 69 | `POST /coupons/generate` | mgr+ | Generate code |
+| 70 | `POST /email/test` | mgr+ | Send test email |
+| 71 | `GET /analytics/dashboard` | mgr+ | Dashboard stats |
+| 72 | `GET /analytics/sales` | mgr+ | Sales report |
+| 73 | `GET /analytics/top-products` | mgr+ | Top products |
+| 74 | `GET /analytics/orders` | mgr+ | Order stats |
+| 75 | `GET /analytics/revenue` | mgr+ | Revenue report |
+| 76 | `GET /analytics/customers` | mgr+ | Customer summary |
+| 77 | `GET /admin/dashboard` | mgr+ | Admin overview |
+| 78 | `GET /admin/orders` | mgr+ | All orders (paginated) |
+| 79 | `GET /admin/orders/stats` | mgr+ | Order stats |
+| 80 | `GET /admin/orders/{id}` | mgr+ | Order detail |
+| 81 | `PUT /admin/orders/{id}/status` | mgr+ | Update status |
+| 82 | `GET /admin/users` | admin | All users (paginated) |
+| 83 | `GET /admin/users/stats` | admin | User stats |
+| 84 | `GET /admin/users/{id}` | admin | User detail |
+| 85 | `PUT /admin/users/{id}/role` | admin | Change role |
+| 86 | `PUT /admin/users/{id}/status` | admin | Activate/deactivate |
+| 87 | `DELETE /admin/users/{id}` | admin | Delete user (204) |
+| 88 | `GET /admin/products` | mgr+ | All products (paginated) |
+| 89 | `GET /admin/products/export` | admin | Export JSON |
+| 90 | `GET /admin/products/{id}` | mgr+ | Product detail |
+| 91 | `POST /admin/products/bulk-delete` | admin | Bulk delete (query params) |
+| 92 | `POST /admin/products/bulk-update-status` | admin | Bulk active toggle (query params) |
+| 93 | `GET /admin/cod/pending` | mgr+ | COD awaiting collection |
+| 94 | `POST /admin/cod/orders/{id}/collect` | mgr+ | Mark COD collected |
 
 **Legend:** 🔓 public · 🔒 Bearer token · opt — optional auth (guest session or Bearer) · staff+ / mgr+ / admin — minimum role required.
 

@@ -13,7 +13,7 @@ from app.models.address import Address
 from app.repositories import cart as cart_repo
 from app.repositories import address as address_repo
 from app.repositories import coupon as coupon_repo
-from app.schemas.checkout import CheckoutRequest, OrderRead
+from app.schemas.checkout import CheckoutConfigResponse, CheckoutRequest, OrderRead
 from app.utils.cart import calculate_cart_total, validate_cart_items, calculate_tax, calculate_shipping
 from app.utils.coupon import validate_coupon, calculate_discount as calc_discount
 from app.utils.order import generate_order_number
@@ -22,6 +22,27 @@ from app.core.config import settings
 
 
 router = APIRouter(prefix="/checkout", tags=["Checkout"])
+
+
+@router.get("/config", response_model=CheckoutConfigResponse)
+def get_checkout_config():
+    """
+    Client-facing checkout pricing configuration (public — nothing sensitive).
+
+    Production rule ("single source of truth"): these values are display-only
+    hints so the storefront doesn't hardcode business rules like the COD fee
+    or eligibility limits. The authoritative computation always happens
+    server-side in `checkout()` below, which re-reads the same settings,
+    re-applies the eligibility guards and persists `cod_fee` on the order row.
+    """
+    return CheckoutConfigResponse(
+        cod_fee=settings.COD_FEE,
+        cod_min_order_value=settings.COD_MIN_ORDER_VALUE,
+        cod_max_order_value=settings.COD_MAX_ORDER_VALUE,
+        free_shipping_threshold=settings.FREE_SHIPPING_THRESHOLD,
+        shipping_cost=settings.SHIPPING_COST,
+        tax_rate=settings.TAX_RATE,
+    )
 
 
 @router.post("", response_model=OrderRead, status_code=status.HTTP_201_CREATED)

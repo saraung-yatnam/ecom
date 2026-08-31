@@ -35,6 +35,23 @@ class CheckoutRequest(BaseModel):
         return v
 
 
+class CheckoutConfigResponse(BaseModel):
+    """Client-facing checkout pricing configuration.
+
+    Display-only hints for the storefront (COD fee, COD eligibility limits,
+    shipping/tax rules) so the UI never hardcodes business rules. The server
+    recomputes everything when the order is actually placed (POST /checkout),
+    so a stale or tampered client copy can never change what is charged.
+    """
+
+    cod_fee: float
+    cod_min_order_value: float
+    cod_max_order_value: float
+    free_shipping_threshold: float
+    shipping_cost: float
+    tax_rate: float
+
+
 class OrderRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
