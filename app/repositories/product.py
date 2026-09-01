@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import Session
 
 from app.models.product import Product, ProductVariant
+from app.models.review import Review
 from app.schemas.product import (
     ProductCreate,
     ProductUpdate,
@@ -107,6 +108,44 @@ def get_product_by_slug(
 
     result = session.execute(statement)
     return result.scalar_one_or_none()
+
+
+def get_product_rating_stats(
+    session: Session,
+    product_ids: list[UUID],
+) -> dict[UUID, dict]:
+    """
+    Batch-fetch average rating + review count for a set of products in a
+    single grouped query, instead of one query per product (avoids N+1
+    when populating a product list response).
+
+    Returns a dict keyed by product_id: {"average_rating": float, "review_count": int}.
+    Products with no reviews simply won't have an entry — callers should
+    default to {"average_rating": 0.0, "review_count": 0}.
+    """
+    if not product_ids:
+        return {}
+
+    statement = (
+        select(
+            Review.product_id,
+            func.avg(Review.rating).label("average_rating"),
+            func.count(Review.id).label("review_count"),
+        )
+        .where(Review.product_id.in_(product_ids))
+        .group_by(Review.product_id)
+    )
+
+    result = session.execute(statement)
+
+    stats: dict[UUID, dict] = {}
+    for product_id, avg_rating, count in result:
+        stats[product_id] = {
+            "average_rating": round(float(avg_rating), 1) if avg_rating is not None else 0.0,
+            "review_count": count or 0,
+        }
+
+    return stats
 
 
 def create_product(

@@ -5,7 +5,7 @@ from sqlmodel import Session
 
 from app.models.review import Review
 from app.models.user import User
-from app.schemas.review import ReviewRead  # 👈 Add this import
+from app.schemas.review import ReviewRead
 
 
 def create_review(
@@ -14,12 +14,14 @@ def create_review(
     user_id: UUID,
     review_data: dict,
     order_id: UUID | None = None,
+    is_verified_purchase: bool = False,
 ) -> Review:
     """Create a new review"""
     review = Review(
         product_id=product_id,
         user_id=user_id,
         order_id=order_id,
+        is_verified_purchase=is_verified_purchase,
         **review_data
     )
     session.add(review)
@@ -28,12 +30,29 @@ def create_review(
     return review
 
 
+def _to_review_read(review: Review, full_name: str | None) -> ReviewRead:
+    """Shared builder so the field list only lives in one place"""
+    return ReviewRead(
+        id=review.id,
+        product_id=review.product_id,
+        user_id=review.user_id,
+        order_id=review.order_id,
+        rating=review.rating,
+        title=review.title,
+        comment=review.comment,
+        is_verified_purchase=review.is_verified_purchase,
+        created_at=review.created_at,
+        updated_at=review.updated_at,
+        user_full_name=full_name,
+    )
+
+
 def get_reviews_by_product(
     session: Session,
     product_id: UUID,
     skip: int = 0,
     limit: int = 20,
-) -> list[ReviewRead]:  # 👈 Change return type to ReviewRead
+) -> list[ReviewRead]:
     """Get all reviews for a product with user info"""
     statement = (
         select(Review, User.full_name)
@@ -44,25 +63,7 @@ def get_reviews_by_product(
         .limit(limit)
     )
     result = session.execute(statement)
-    
-    reviews = []
-    for review, full_name in result:
-        # 👇 Create ReviewRead object with user_full_name
-        review_data = ReviewRead(
-            id=review.id,
-            product_id=review.product_id,
-            user_id=review.user_id,
-            order_id=review.order_id,
-            rating=review.rating,
-            title=review.title,
-            comment=review.comment,
-            created_at=review.created_at,
-            updated_at=review.updated_at,
-            user_full_name=full_name  # 👈 Set the user's full name
-        )
-        reviews.append(review_data)
-    
-    return reviews
+    return [_to_review_read(review, full_name) for review, full_name in result]
 
 
 def get_review_by_id(session: Session, review_id: UUID) -> Review | None:
@@ -75,7 +76,7 @@ def get_reviews_by_user(
     user_id: UUID,
     skip: int = 0,
     limit: int = 20,
-) -> list[Review]:
+) -> list[ReviewRead]:
     """Get all reviews by a user with user info"""
     statement = (
         select(Review, User.full_name)
@@ -86,24 +87,16 @@ def get_reviews_by_user(
         .limit(limit)
     )
     result = session.execute(statement)
-    
-    reviews = []
-    for review, full_name in result:
-        review_data = ReviewRead(
-            id=review.id,
-            product_id=review.product_id,
-            user_id=review.user_id,
-            order_id=review.order_id,
-            rating=review.rating,
-            title=review.title,
-            comment=review.comment,
-            created_at=review.created_at,
-            updated_at=review.updated_at,
-            user_full_name=full_name
-        )
-        reviews.append(review_data)
-    
-    return reviews
+    return [_to_review_read(review, full_name) for review, full_name in result]
+
+
+def has_reviewed_product(session: Session, user_id: UUID, product_id: UUID) -> bool:
+    """Efficient existence check for the duplicate-review guard"""
+    statement = select(Review.id).where(
+        Review.user_id == user_id,
+        Review.product_id == product_id,
+    )
+    return session.execute(statement).first() is not None
 
 
 def get_product_average_rating(
@@ -127,7 +120,7 @@ def update_review(
     for key, value in review_data.items():
         if value is not None:
             setattr(review, key, value)
-    
+
     session.add(review)
     session.commit()
     session.refresh(review)

@@ -164,3 +164,7 @@ class ProductRead(BaseModel):
     discount_percentage: int = 0
     savings_amount: Decimal = Decimal("0.00")
     is_on_sale: bool = False
+
+    # 👇 Review aggregate fields (NOT stored in DB — computed from reviews table)
+    average_rating: float = 0.0
+    review_count: int = 0

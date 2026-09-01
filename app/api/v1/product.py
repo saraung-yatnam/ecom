@@ -101,11 +101,19 @@ def get_products(
         limit=limit,
     )
 
+    # 👇 Batch-fetch rating stats for all products in this page in ONE query
+    product_ids = [product.id for product in products]
+    rating_stats = product_repo.get_product_rating_stats(session, product_ids)
+
     # 👇 Create response objects with computed fields
     response_products = []
     for product in products:
         pricing_data = get_product_pricing_data(product)
-        
+        stats = rating_stats.get(
+            product.id,
+            {"average_rating": 0.0, "review_count": 0},
+        )
+
         # Create ProductRead instance with all data
         product_read = ProductRead(
             id=product.id,
@@ -124,6 +132,8 @@ def get_products(
             discount_percentage=pricing_data["discount_percentage"],
             savings_amount=pricing_data["savings_amount"],
             is_on_sale=pricing_data["is_on_sale"],
+            average_rating=stats["average_rating"],
+            review_count=stats["review_count"],
         )
         
         # Add variants with computed fields
@@ -175,6 +185,13 @@ def get_product(
 
     # 👇 Create response object with computed fields
     pricing_data = get_product_pricing_data(product)
+
+    # 👇 Fetch rating stats for this single product
+    rating_stats = product_repo.get_product_rating_stats(session, [product.id])
+    stats = rating_stats.get(
+        product.id,
+        {"average_rating": 0.0, "review_count": 0},
+    )
     
     product_read = ProductRead(
         id=product.id,
@@ -193,6 +210,8 @@ def get_product(
         discount_percentage=pricing_data["discount_percentage"],
         savings_amount=pricing_data["savings_amount"],
         is_on_sale=pricing_data["is_on_sale"],
+        average_rating=stats["average_rating"],
+        review_count=stats["review_count"],
     )
     
     # Add variants with computed fields
@@ -278,6 +297,9 @@ def create_product(
         discount_percentage=pricing_data["discount_percentage"],
         savings_amount=pricing_data["savings_amount"],
         is_on_sale=pricing_data["is_on_sale"],
+        # 👇 A brand-new product has no reviews yet — no query needed
+        average_rating=0.0,
+        review_count=0,
     )
     
     # Add variants with computed fields
@@ -357,6 +379,13 @@ def update_product(
 
     # 👇 Create response object with computed fields
     pricing_data = get_product_pricing_data(product)
+
+    # 👇 Fetch this product's real rating stats (it may already have reviews)
+    rating_stats = product_repo.get_product_rating_stats(session, [product.id])
+    stats = rating_stats.get(
+        product.id,
+        {"average_rating": 0.0, "review_count": 0},
+    )
     
     product_read = ProductRead(
         id=product.id,
@@ -375,6 +404,8 @@ def update_product(
         discount_percentage=pricing_data["discount_percentage"],
         savings_amount=pricing_data["savings_amount"],
         is_on_sale=pricing_data["is_on_sale"],
+        average_rating=stats["average_rating"],
+        review_count=stats["review_count"],
     )
     
     # Add variants with computed fields

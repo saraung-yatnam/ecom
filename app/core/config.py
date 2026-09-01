@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     RESTOCKING_FEE_CONFIRMED: float = 5.0     # % fee when cancelling a CONFIRMED order
     RESTOCKING_FEE_PROCESSING: float = 15.0   # % fee when cancelling a PROCESSING order
 
+    GEMINI_API_KEY:str|None=None
+
     @property
     def cors_origins_list(self) -> List[str]:
         if self.CORS_ORIGINS == "*":

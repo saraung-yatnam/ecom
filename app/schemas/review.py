@@ -1,3 +1,4 @@
+# app/schemas/review.py
 from uuid import UUID
 from datetime import datetime
 
@@ -18,7 +19,7 @@ class ReviewUpdate(BaseModel):
 
 class ReviewRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: UUID
     product_id: UUID
     user_id: UUID
@@ -26,6 +27,7 @@ class ReviewRead(BaseModel):
     rating: int
     title: str | None
     comment: str | None
+    is_verified_purchase: bool  # 👈 new
     created_at: datetime
     updated_at: datetime
-    user_full_name: str | None = None  # 👈 Add this
+    user_full_name: str | None = None

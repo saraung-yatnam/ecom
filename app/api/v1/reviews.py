@@ -7,6 +7,7 @@ from app.api.deps import SessionDep, get_current_user
 from app.models.user import User
 from app.repositories import review as review_repo
 from app.repositories import product as product_repo
+from app.repositories import order as order_repo
 from app.schemas.review import ReviewCreate, ReviewRead, ReviewUpdate
 
 
@@ -20,28 +21,35 @@ def create_review(
     session: SessionDep,
     current_user: User = Depends(get_current_user),
 ):
-    """Create a review for a product"""
+    """Create a review for a product — requires a verified purchase"""
     product = product_repo.get_product_by_id(session, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    
-    existing_reviews = review_repo.get_reviews_by_user(session, current_user.id)
-    for review in existing_reviews:
-        if review.product_id == product_id:
-            raise HTTPException(
-                status_code=400,
-                detail="You have already reviewed this product"
-            )
-    
+
+    if review_repo.has_reviewed_product(session, current_user.id, product_id):
+        raise HTTPException(
+            status_code=400,
+            detail="You have already reviewed this product"
+        )
+
+    order_id = order_repo.get_verified_purchase_order_id(
+        session, current_user.id, product_id
+    )
+    if not order_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only review products you have purchased and received"
+        )
+
     review = review_repo.create_review(
         session,
         product_id,
         current_user.id,
         review_data.model_dump(),
-        order_id=None,
+        order_id=order_id,
+        is_verified_purchase=True,
     )
-    
-    # 👇 Return ReviewRead with user_full_name
+
     return ReviewRead(
         id=review.id,
         product_id=review.product_id,
@@ -50,6 +58,7 @@ def create_review(
         rating=review.rating,
         title=review.title,
         comment=review.comment,
+        is_verified_purchase=review.is_verified_purchase,
         created_at=review.created_at,
         updated_at=review.updated_at,
         user_full_name=current_user.full_name
@@ -67,7 +76,7 @@ def get_product_reviews(
     product = product_repo.get_product_by_id(session, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    
+
     return review_repo.get_reviews_by_product(session, product_id, skip, limit)
 
 
@@ -80,7 +89,7 @@ def get_product_rating(
     product = product_repo.get_product_by_id(session, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    
+
     avg_rating = review_repo.get_product_average_rating(session, product_id)
     return {"average_rating": avg_rating}
 
@@ -107,17 +116,16 @@ def update_review(
     review = review_repo.get_review_by_id(session, review_id)
     if not review:
         raise HTTPException(status_code=404, detail="Review not found")
-    
+
     if review.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     review = review_repo.update_review(
         session,
         review,
         review_data.model_dump(exclude_unset=True)
     )
-    
-    # 👇 Return ReviewRead with user_full_name
+
     return ReviewRead(
         id=review.id,
         product_id=review.product_id,
@@ -126,6 +134,7 @@ def update_review(
         rating=review.rating,
         title=review.title,
         comment=review.comment,
+        is_verified_purchase=review.is_verified_purchase,
         created_at=review.created_at,
         updated_at=review.updated_at,
         user_full_name=current_user.full_name
@@ -142,9 +151,9 @@ def delete_review(
     review = review_repo.get_review_by_id(session, review_id)
     if not review:
         raise HTTPException(status_code=404, detail="Review not found")
-    
+
     if review.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     review_repo.delete_review(session, review)
     return None

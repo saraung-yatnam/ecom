@@ -10,6 +10,7 @@ from sqlmodel import Session
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.user import User
 from app.models.address import Address  # Add this if you have address model
+from app.models.product import ProductVariant  # ⚠️ ASSUMED — see note below
 
 
 def get_order_by_id(session: Session, order_id: UUID) -> Order | None:
@@ -83,6 +84,34 @@ def get_order_by_number(session: Session, order_number: str) -> Order | None:
     )
     result = session.execute(statement)
     return result.scalar_one_or_none()
+
+
+def get_verified_purchase_order_id(
+    session: Session,
+    user_id: UUID,
+    product_id: UUID,
+) -> UUID | None:
+    """
+    Return the id of the most recent order where this user purchased
+    and received this product (order delivered), or None if no such
+    order exists. Used to gate review creation to verified purchases.
+
+    OrderItem stores variant_id (not product_id), so this joins through
+    ProductVariant to match on the parent product.
+    """
+    statement = (
+        select(Order.id)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .join(ProductVariant, ProductVariant.id == OrderItem.variant_id)
+        .where(
+            Order.user_id == user_id,
+            ProductVariant.product_id == product_id,
+            Order.status == OrderStatus.DELIVERED,
+        )
+        .order_by(Order.placed_at.desc())
+    )
+    row = session.execute(statement).first()
+    return row[0] if row else None
 
 
 def get_all_orders(
