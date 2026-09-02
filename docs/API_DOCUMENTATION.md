@@ -2,7 +2,7 @@
 
 > **Handover document for Frontend Developers**
 > Framework: FastAPI (Python 3.12) + SQLModel + PostgreSQL
-> Last updated: 2026-08-29 — generated from source code (`app/api/v1/**`, `app/schemas/**`)
+> Last updated: 2026-09-02 — generated from source code (`app/api/v1/**`, `app/schemas/**`)
 
 ---
 
@@ -27,17 +27,18 @@
 17. [Coupons — `/coupons`](#17-coupons--coupons)
 18. [Email — `/email`](#18-email--email)
 19. [Analytics — `/analytics`](#19-analytics--analytics)
-20. [Admin — `/admin/*`](#20-admin--admin)
-21. [Enums & Status Values Reference](#21-enums--status-values-reference)
-22. [Business Rules (Pricing / COD / Refunds)](#22-business-rules-pricing--cod--refunds)
-23. [Typical Frontend Flows](#23-typical-frontend-flows)
-24. [Endpoint Quick-Reference Table](#24-endpoint-quick-reference-table)
+20. [Chat — `/chat`](#20-chat--chat)
+21. [Admin — `/admin/*`](#21-admin--admin)
+22. [Enums & Status Values Reference](#22-enums--status-values-reference)
+23. [Business Rules (Pricing / COD / Refunds)](#23-business-rules-pricing--cod--refunds)
+24. [Typical Frontend Flows](#24-typical-frontend-flows)
+25. [Endpoint Quick-Reference Table](#25-endpoint-quick-reference-table)
 
 ---
 
 ## 1. Overview & Base URL
 
-This is a full e-commerce backend: auth (email + Google), catalog, cart (guest + user), checkout, online payments (Razorpay) + Cash-on-Delivery, orders with cancellation/refunds, reviews, wishlist, coupons, analytics, and an admin suite.
+This is a full e-commerce backend: auth (email + Google), catalog, cart (guest + user), checkout, online payments (Razorpay) + Cash-on-Delivery, orders with cancellation/refunds, reviews, wishlist, coupons, an AI customer-support chatbot (Google Gemini), analytics, and an admin suite.
 
 | Item | Value |
 |---|---|
@@ -451,11 +452,13 @@ Only for users who have **no password yet** (Google-only).
   ],
   "discount_percentage": 25,
   "savings_amount": "500.00",
-  "is_on_sale": true
+  "is_on_sale": true,
+  "average_rating": 4.6,
+  "review_count": 12
 }
 ```
 
-> **Money = strings.** `price`, `compare_at_price`, `savings_amount`, `price_override`, `effective_price` are JSON strings. `discount_percentage` and `is_on_sale` are **computed server-side** — use them for badges; don't recompute.
+> **Money = strings.** `price`, `compare_at_price`, `savings_amount`, `price_override`, `effective_price` are JSON strings. `discount_percentage`, `is_on_sale`, `average_rating` and `review_count` are **computed server-side** (pricing from the product/variants; `average_rating`/`review_count` aggregated from the reviews table) — use them for badges & rating chips; don't recompute.
 
 ### 6.1 `GET /products/` — List products 🔓 Public
 
@@ -647,7 +650,7 @@ Cart works **with or without login** (see §2.4). Every cart endpoint returns th
 }
 ```
 
-Totals rules: `subtotal` = Σ(price_at_add × qty) · tax = **18% GST** on (subtotal − discount) · shipping = **free ≥ ₹1000** else **₹50** · `total` = subtotal − discount + tax + shipping (see §22).
+Totals rules: `subtotal` = Σ(price_at_add × qty) · tax = **18% GST** on (subtotal − discount) · shipping = **free ≥ ₹1000** else **₹50** · `total` = subtotal − discount + tax + shipping (see §23).
 
 ### 9.1 `GET /cart` — Get cart 🍪/🔒 optional auth
 
@@ -901,7 +904,7 @@ Query: `?skip=0&limit=20`. **Response `200`:** array of `OrderRead`.
 
 ### 12.4 `POST /orders/{order_id}/cancel` — Cancel order 🔒 Bearer
 
-Allowed while status is `pending`, `confirmed` or `processing`. Stock is restored. COD orders are simply cancelled; paid online orders get a Razorpay refund minus a **restocking fee** (0% pending / 5% confirmed / 15% processing — see §22).
+Allowed while status is `pending`, `confirmed` or `processing`. Stock is restored. COD orders are simply cancelled; paid online orders get a Razorpay refund minus a **restocking fee** (0% pending / 5% confirmed / 15% processing — see §23).
 
 **Request body** (`CancelOrderRequest`) — optional:
 
@@ -1048,10 +1051,11 @@ On success the order flips to `status: "confirmed"`, `payment_status: "paid"`, a
   "id": "uuid",
   "product_id": "uuid",
   "user_id": "uuid",
-  "order_id": null,
+  "order_id": "uuid",            // the verified-purchase order this review is attached to
   "rating": 4,
   "title": "Great fit",
   "comment": "Fabric quality is excellent.",
+  "is_verified_purchase": true,
   "created_at": "…",
   "updated_at": "…",
   "user_full_name": "John Doe"
@@ -1060,9 +1064,9 @@ On success the order flips to `status: "confirmed"`, `payment_status: "paid"`, a
 
 | Endpoint | Auth | Details |
 |---|---|---|
-| `POST /reviews/{product_id}` | 🔒 Bearer | Body: `{ "rating": 1–5 (required), "title": "…?", "comment": "…?" }` → `200 ReviewRead`. One review per user per product → `400 You have already reviewed this product`; `404 Product not found` |
+| `POST /reviews/{product_id}` | 🔒 Bearer | Body: `{ "rating": 1–5 (required), "title": "…?", "comment": "…?" }` → `200 ReviewRead`. **Verified-purchase rule:** only a buyer whose order for this product was paid & received can review → `403 You can only review products you have purchased and received`. One review per user per product → `400 You have already reviewed this product`; `404 Product not found` |
 | `GET /reviews/products/{product_id}` | 🔓 Public | `?skip=0&limit=20` → array of `ReviewRead`; `404 Product not found` |
-| `GET /reviews/product/{product_id}/rating` | 🔓 Public | → `{ "average_rating": 4.25 }` (or `null` when unrated); `404` |
+| `GET /reviews/product/{product_id}/rating` | 🔓 Public | → `{ "average_rating": 4.3 }` (`0.0` when unrated); `404` |
 | `GET /reviews/my-reviews` | 🔒 Bearer | `?skip=0&limit=20` → array of `ReviewRead` |
 | `PUT /reviews/{review_id}` | 🔒 Bearer (owner) | Body: any of `rating`/`title`/`comment` → `200 ReviewRead`; `404` · `403 Not authorized` |
 | `DELETE /reviews/{review_id}` | 🔒 Bearer (owner) | → `204`; `404` · `403` |
@@ -1185,9 +1189,23 @@ All 🔒 **manager/admin**. Dates are `YYYY-MM-DD`.
 
 ---
 
-## 20. Admin — `/admin/*`
+## 20. Chat — `/chat`
 
-### 20.1 Dashboard — `GET /admin/dashboard` 🔒 manager/admin
+AI customer-support chatbot powered by **Google Gemini** (`GEMINI_API_KEY`; model `gemini-3.5-flash`) with a fixed e-commerce system prompt (answers stay short — 2–3 sentences; it offers to connect the user with a human agent when it doesn't know something). Currently **public (no auth)** and **stateless** — no conversation history is stored server-side.
+
+| Endpoint | Auth | Body / Query | Response `200` |
+|---|---|---|---|
+| `POST /chat` | 🔓 Public | `{ "message": "Do you ship internationally?" }` | `{ "reply": "…" }` |
+| `GET /chat/history` | 🔓 Public | — | `[]` (stateless placeholder — nothing persisted yet) |
+| `DELETE /chat/history` | 🔓 Public | — | `{ "message": "History cleared" }` |
+
+`message` is trimmed; an empty message returns `{ "reply": "Please type a message 🙂" }`. If the Gemini call fails (quota / network / no API key) the API still answers `200` with a graceful fallback: `{ "reply": "Sorry, I'm having trouble right now. Please try again." }`.
+
+---
+
+## 21. Admin — `/admin/*`
+
+### 21.1 Dashboard — `GET /admin/dashboard` 🔒 manager/admin
 
 **Response `200`:**
 
@@ -1197,12 +1215,12 @@ All 🔒 **manager/admin**. Dates are `YYYY-MM-DD`.
   "orders":    { "total_orders": 0, "pending_orders": 0, "confirmed_orders": 0, "processing_orders": 0, "shipped_orders": 0, "delivered_orders": 0, "cancelled_orders": 0, "refunded_orders": 0, "total_revenue": 0.0 },
   "revenue":   { "today": {...}, "this_week": {...}, "this_month": {...}, "total": {...} },
   "total_products": 0,
-  "recent_orders": [ { "...order fields as in §20.2 items..." } ],
+  "recent_orders": [ { "...order fields as in §21.2 items..." } ],
   "timestamp": "2026-08-29T12:00:00.000000"
 }
 ```
 
-### 20.2 Admin Orders 🔒 manager/admin — `/admin/orders`
+### 21.2 Admin Orders 🔒 manager/admin — `/admin/orders`
 
 **`GET /admin/orders`** — query: `page=1`, `limit=20` (≤100), `status` (order status string), `search` (order number / customer), `from_date`, `to_date` (`YYYY-MM-DD`).
 
@@ -1247,7 +1265,7 @@ All 🔒 **manager/admin**. Dates are `YYYY-MM-DD`.
 - **`400 Order cannot be cancelled. Current status: shipped|delivered`** when trying to cancel an order that has shipped.
 - ⚠️ Setting `refunded` here only changes the label — no money moves. Use the user-cancel flow (`POST /orders/{id}/cancel`) for real Razorpay refunds.
 
-### 20.3 Admin Users 🔒 **admin** — `/admin/users`
+### 21.3 Admin Users 🔒 **admin** — `/admin/users`
 
 **`AdminUserRead` shape** (same fields as `UserRead` in §5.5):
 
@@ -1266,7 +1284,7 @@ All 🔒 **manager/admin**. Dates are `YYYY-MM-DD`.
 
 `role` ∈ `customer | staff | manager | admin`.
 
-### 20.4 Admin Products 🔒 — `/admin/products`
+### 21.4 Admin Products 🔒 — `/admin/products`
 
 | Endpoint | Auth | Query / Body | Response |
 |---|---|---|---|
@@ -1278,7 +1296,7 @@ All 🔒 **manager/admin**. Dates are `YYYY-MM-DD`.
 
 Both bulk endpoints return `400 No product IDs provided` when the list is empty.
 
-### 20.5 Admin COD (Cash on Delivery) 🔒 manager/admin — `/admin/cod`
+### 21.5 Admin COD (Cash on Delivery) 🔒 manager/admin — `/admin/cod`
 
 COD lifecycle: checkout (`payment_method=cod`) → order `status=confirmed`, `payment_status=cod_pending` → cash collected on delivery → `POST /admin/cod/orders/{id}/collect` → `payment_status=paid`.
 
@@ -1318,7 +1336,7 @@ COD lifecycle: checkout (`payment_method=cod`) → order `status=confirmed`, `pa
 
 ---
 
-## 21. Enums & Status Values Reference
+## 22. Enums & Status Values Reference
 
 | Enum | Values |
 |---|---|
@@ -1345,7 +1363,7 @@ pending ──(payment confirmed)──▶ confirmed ──▶ processing ──
 
 ---
 
-## 22. Business Rules (Pricing / COD / Refunds)
+## 23. Business Rules (Pricing / COD / Refunds)
 
 Server-side configuration the frontend should not hardcode (ask backend for changes):
 
@@ -1366,9 +1384,9 @@ Server-side configuration the frontend should not hardcode (ask backend for chan
 
 ---
 
-## 23. Typical Frontend Flows
+## 24. Typical Frontend Flows
 
-### 23.1 Authentication flow
+### 24.1 Authentication flow
 
 ```
 Register ─▶ POST /auth/register ─▶ redirect to login
@@ -1378,14 +1396,14 @@ Any 401   ─▶ POST /auth/refresh ─▶ save new pair ─▶ retry original c
 Logout    ─▶ POST /auth/logout ─▶ clear tokens
 ```
 
-### 23.2 Guest → user cart
+### 24.2 Guest → user cart
 
 ```
 Guest: generate X-Cart-Session-ID, POST /cart/items …
 Login: tokens stored; subsequent cart calls (Bearer) resolve the user's cart.
 ```
 
-### 23.3 Checkout — online payment (Razorpay)
+### 24.3 Checkout — online payment (Razorpay)
 
 ```
 1. POST /addresses             (if needed)
@@ -1396,14 +1414,14 @@ Login: tokens stored; subsequent cart calls (Bearer) resolve the user's cart.
 6. GET /orders/{id} to show the confirmed order
 ```
 
-### 23.4 Checkout — Cash on Delivery
+### 24.4 Checkout — Cash on Delivery
 
 ```
 1. POST /checkout {…, payment_method:"cod"} → 201 (status:"confirmed", payment_status:"cod_pending", cod_fee added)
 2. Done — no payment calls. Show "Pay ₹X on delivery".
 ```
 
-### 23.5 Cancel & refund
+### 24.5 Cancel & refund
 
 ```
 POST /orders/{id}/cancel {reason?} → CancelOrderResponse (refund.processed = true for paid online orders)
@@ -1412,7 +1430,7 @@ Poll GET /orders/{id}/refund-status → display response.message
 
 ---
 
-## 24. Endpoint Quick-Reference Table
+## 25. Endpoint Quick-Reference Table
 
 | # | Method & Path | Auth | Purpose |
 |---|---|---|---|
@@ -1510,6 +1528,9 @@ Poll GET /orders/{id}/refund-status → display response.message
 | 92 | `POST /admin/products/bulk-update-status` | admin | Bulk active toggle (query params) |
 | 93 | `GET /admin/cod/pending` | mgr+ | COD awaiting collection |
 | 94 | `POST /admin/cod/orders/{id}/collect` | mgr+ | Mark COD collected |
+| 95 | `POST /chat` | 🔓 | AI chatbot reply |
+| 96 | `GET /chat/history` | 🔓 | Chat history (stateless — `[]`) |
+| 97 | `DELETE /chat/history` | 🔓 | Clear history |
 
 **Legend:** 🔓 public · 🔒 Bearer token · opt — optional auth (guest session or Bearer) · staff+ / mgr+ / admin — minimum role required.
 
