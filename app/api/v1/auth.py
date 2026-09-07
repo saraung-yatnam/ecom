@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks
 from sqlmodel import Session
 from pydantic import BaseModel, EmailStr
 
-from app.api.deps import SessionDep, CurrentUser, get_current_user
+from app.api.deps import SessionDep, CurrentUser, CurrentUser
 from app.schemas.google_auth import GoogleAuthRequest
 from app.schemas.user import UserCreate, UserRead, UserLogin, SetPasswordRequest, UserUpdateProfile
 from app.schemas.token import TokenPair, RefreshRequest
@@ -58,7 +58,7 @@ def register(data: UserCreate, session: SessionDep):
     
     return user
 
-
+    
 @router.post("/login", response_model=TokenPair)
 def login(data: UserLogin, session: SessionDep):
     user = user_repo.get_user_by_email(session, data.email)
@@ -114,7 +114,7 @@ def me(current_user: CurrentUser):
 def update_profile(
     profile_data: UserUpdateProfile,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Update user profile (full_name, phone, username).
@@ -221,7 +221,7 @@ def google_auth(
 def set_password(
     data: SetPasswordRequest,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Set password for Google users (so they can also login with email/password).
@@ -352,7 +352,7 @@ def reset_password(
 def change_password(
     request: ChangePasswordRequest,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Change password for logged-in user.

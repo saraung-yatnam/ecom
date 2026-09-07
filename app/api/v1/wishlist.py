@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, get_current_user
+from app.api.deps import SessionDep, CurrentUser
 from app.models.user import User
 from app.repositories import wishlist as wishlist_repo
 from app.repositories import product as product_repo
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/wishlist", tags=["Wishlist"])
 @router.get("", response_model=WishlistResponse)
 def get_wishlist(
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
     skip: int = 0,
     limit: int = 20,
 ):
@@ -50,7 +50,7 @@ def get_wishlist(
 def add_to_wishlist(
     product_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """Add product to wishlist"""
     product = product_repo.get_product_by_id(session, product_id)
@@ -75,7 +75,7 @@ def add_to_wishlist(
 def remove_from_wishlist(
     product_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """Remove product from wishlist"""
     removed = wishlist_repo.remove_from_wishlist(session, current_user.id, product_id)
@@ -89,7 +89,7 @@ def remove_from_wishlist(
 def check_wishlist(
     product_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user:CurrentUser,
 ):
     """Check if product is in wishlist"""
     in_wishlist = wishlist_repo.is_in_wishlist(session, current_user.id, product_id)

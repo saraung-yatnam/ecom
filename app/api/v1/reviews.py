@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, get_current_user
+from app.api.deps import SessionDep, CurrentUser
 from app.models.user import User
 from app.repositories import review as review_repo
 from app.repositories import product as product_repo
@@ -19,7 +19,7 @@ def create_review(
     product_id: UUID,
     review_data: ReviewCreate,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """Create a review for a product — requires a verified purchase"""
     product = product_repo.get_product_by_id(session, product_id)
@@ -97,7 +97,7 @@ def get_product_rating(
 @router.get("/my-reviews", response_model=list[ReviewRead])
 def get_my_reviews(
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
     skip: int = 0,
     limit: int = 20,
 ):
@@ -110,7 +110,7 @@ def update_review(
     review_id: UUID,
     review_data: ReviewUpdate,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """Update a review"""
     review = review_repo.get_review_by_id(session, review_id)
@@ -145,7 +145,7 @@ def update_review(
 def delete_review(
     review_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """Delete a review"""
     review = review_repo.get_review_by_id(session, review_id)

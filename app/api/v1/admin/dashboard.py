@@ -38,11 +38,15 @@ def get_admin_dashboard(
     # Total products
     total_products = product_repo.get_total_products(session)
     
+    # Daily sales trend (last 7 days, zero-filled) for the dashboard chart
+    sales_trend = analytics_repo.get_sales_trend(session, days=7)
+    
     return {
         "users": user_stats,
         "orders": order_stats,
         "revenue": revenue_stats,
         "total_products": total_products,
         "recent_orders": recent_orders,
+        "sales_trend": sales_trend,
         "timestamp": datetime.now().isoformat(),
     }

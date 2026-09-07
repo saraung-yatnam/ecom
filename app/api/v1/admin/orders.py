@@ -10,6 +10,7 @@ from app.api.deps import SessionDep, require_role
 from app.models.user import User, UserRole
 from app.models.order import OrderStatus
 from app.repositories import order as order_repo
+from app.repositories import notification as notification_repo
 from app.schemas.order import OrderRead, OrderStatusUpdate, OrderListRead
 from app.services.email_service import email_service
 from app.services.refund_service import restore_stock
@@ -351,5 +352,18 @@ def update_order_status_admin(
                     print(f"Order refunded email sent to {user.email}")
         except Exception as e:
             print(f"Failed to send order status email: {str(e)}")
-    
+
+    # --- Notifications feed ---
+    # Customer gets an order_status update; admins/managers get an
+    # order_cancelled alert when the cancellation happens from the panel.
+    try:
+        if new_status != old_status.value:
+            notification_repo.notify_customer_status_changed(session, order, new_status)
+        if new_status == "cancelled" and old_status != "cancelled":
+            notification_repo.notify_admins_order_cancelled(session, order)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"Failed to create status notifications: {str(e)}")
+
     return order

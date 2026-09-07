@@ -66,9 +66,7 @@ def get_sales_report(
 @router.get("/top-products", response_model=list[TopProductItem])
 def get_top_products(
     session: SessionDep,
-    current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
-    ),
+    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),  # 👈 ADD THIS BACK
     limit: int = Query(default=10, ge=1, le=100),
     from_date: Optional[date] = Query(default=None),
     to_date: Optional[date] = Query(default=None),
@@ -80,7 +78,9 @@ def get_top_products(
         manager
         admin
     """
-    return analytics_repo.get_top_products(session, limit, from_date, to_date)
+    products = analytics_repo.get_top_products(session, limit, from_date, to_date)
+    
+    return products
 
 
 @router.get("/orders", response_model=OrderStatisticsResponse)

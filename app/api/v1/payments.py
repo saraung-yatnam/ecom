@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, get_current_user
+from app.api.deps import SessionDep, CurrentUser
 from app.models.user import User
 from app.repositories import order as order_repo
 from app.repositories import payment as payment_repo
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/payments", tags=["Payments"])
 def create_payment_intent(
     request: PaymentCreateRequest,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Create payment intent.
@@ -79,7 +79,7 @@ def create_payment_intent(
 def confirm_payment(
     request: PaymentConfirmRequest,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Confirm payment.

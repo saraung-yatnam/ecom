@@ -200,6 +200,119 @@ def get_order_statistics(session: Session) -> dict:
     }
 
 
+def get_user_order_statistics(session: Session, user_id: UUID) -> dict:
+    """
+    Get lifetime order statistics for a single user (admin view).
+
+    Returns:
+        dict: total_orders, total_spent, gross_total, refunded_total,
+            average_order_value, total_items_purchased, first_order,
+            last_order, per-status breakdown, most_ordered_product
+    """
+    total_orders = (
+        session.execute(
+            select(func.count()).select_from(Order).where(Order.user_id == user_id)
+        ).scalar()
+        or 0
+    )
+
+    # "Total Spent" = sum of grand_total for non-cancelled / non-refunded orders
+    total_spent = (
+        session.execute(
+            select(func.coalesce(func.sum(Order.grand_total), 0))
+            .select_from(Order)
+            .where(
+                Order.user_id == user_id,
+                Order.status.not_in([OrderStatus.CANCELLED, OrderStatus.REFUNDED]),
+            )
+        ).scalar()
+        or 0
+    )
+
+    # Gross total = sum of grand_total across EVERY order (incl. cancelled / refunded)
+    gross_total = (
+        session.execute(
+            select(func.coalesce(func.sum(Order.grand_total), 0))
+            .select_from(Order)
+            .where(Order.user_id == user_id)
+        ).scalar()
+        or 0
+    )
+
+    # Total refunded so far
+    refunded_total = (
+        session.execute(
+            select(func.coalesce(func.sum(Order.refund_amount), 0))
+            .select_from(Order)
+            .where(Order.user_id == user_id)
+        ).scalar()
+        or 0
+    )
+
+    # First / last order timestamps
+    first_order = session.execute(
+        select(Order.placed_at)
+        .where(Order.user_id == user_id)
+        .order_by(Order.placed_at.asc())
+        .limit(1)
+    ).scalar()
+    last_order = session.execute(
+        select(Order.placed_at)
+        .where(Order.user_id == user_id)
+        .order_by(Order.placed_at.desc())
+        .limit(1)
+    ).scalar()
+
+    # Total items purchased (sum of quantities across all order items)
+    total_items_purchased = (
+        session.execute(
+            select(func.coalesce(func.sum(OrderItem.quantity), 0))
+            .select_from(OrderItem)
+            .join(Order, OrderItem.order_id == Order.id)
+            .where(Order.user_id == user_id)
+        ).scalar()
+        or 0
+    )
+
+    # Per-status counts
+    status_counts = {}
+    for status in OrderStatus:
+        status_counts[status.value] = (
+            session.execute(
+                select(func.count())
+                .select_from(Order)
+                .where(Order.user_id == user_id, Order.status == status)
+            ).scalar()
+            or 0
+        )
+
+    # Most-purchased product (grouped by the order-item snapshot name)
+    most_ordered = session.execute(
+        select(OrderItem.product_name, func.sum(OrderItem.quantity).label("qty"))
+        .select_from(OrderItem)
+        .join(Order, OrderItem.order_id == Order.id)
+        .where(Order.user_id == user_id)
+        .group_by(OrderItem.product_name)
+        .order_by(func.sum(OrderItem.quantity).desc(), OrderItem.product_name.asc())
+        .limit(1)
+    ).first()
+
+    average_order_value = float(total_spent) / total_orders if total_orders else 0
+
+    return {
+        "total_orders": total_orders,
+        "total_spent": float(total_spent),
+        "gross_total": float(gross_total),
+        "refunded_total": float(refunded_total),
+        "average_order_value": round(average_order_value, 2),
+        "total_items_purchased": total_items_purchased,
+        "first_order": first_order.isoformat() if first_order else None,
+        "last_order": last_order.isoformat() if last_order else None,
+        "status_breakdown": status_counts,
+        "most_ordered_product": most_ordered[0] if most_ordered else None,
+    }
+
+
 def get_recent_orders(session: Session, limit: int = 10) -> list[Order]:
     """Get recent orders with user data"""
     statement = (

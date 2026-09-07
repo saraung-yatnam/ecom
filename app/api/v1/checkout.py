@@ -5,7 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, get_current_user
+from app.api.deps import SessionDep,CurrentUser
 from app.models.cart import Cart
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.user import User
@@ -17,6 +17,7 @@ from app.schemas.checkout import CheckoutConfigResponse, CheckoutRequest, OrderR
 from app.utils.cart import calculate_cart_total, validate_cart_items, calculate_tax, calculate_shipping
 from app.utils.coupon import validate_coupon, calculate_discount as calc_discount
 from app.utils.order import generate_order_number
+from app.repositories import notification as notification_repo
 from app.services.email_service import email_service
 from app.core.config import settings
 
@@ -49,7 +50,7 @@ def get_checkout_config():
 def checkout(
     checkout_data: CheckoutRequest,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Convert cart to order.
@@ -220,6 +221,14 @@ def checkout(
     # 13. Commit everything
     session.commit()
     session.refresh(order)
+    
+    # 13b. Notify managers/admins about the new order (notifications feed)
+    try:
+        notification_repo.notify_admins_order_placed(session, order)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"Failed to create order notifications: {str(e)}")
     
     # 14. Send order confirmation email
     #     - COD: order is fully confirmed at checkout -> "pay on delivery" email now

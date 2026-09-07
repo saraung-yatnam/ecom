@@ -5,7 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, get_current_user
+from app.api.deps import SessionDep,CurrentUser
 from app.models.order import OrderStatus
 from app.models.user import User
 from app.repositories import order as order_repo
@@ -18,6 +18,7 @@ from app.schemas.order import (
 )
 from app.services.email_service import email_service
 from app.services.refund_service import fetch_refund_status, process_refund, restore_stock
+from app.repositories import notification as notification_repo
 from app.core.config import settings
 
 
@@ -27,7 +28,7 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 @router.get("", response_model=list[OrderRead])
 def get_orders(
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
     skip: int = 0,
     limit: int = 20,
 ):
@@ -39,7 +40,7 @@ def get_orders(
 def get_order(
     order_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """Get specific order by ID"""
     order = order_repo.get_order_by_id(session, order_id)
@@ -61,7 +62,7 @@ def cancel_order(
     order_id: UUID,
     cancel_data: CancelOrderRequest,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Cancel an order.
@@ -160,6 +161,14 @@ def cancel_order(
         except Exception as e:
             print(f"Failed to send cancellation email: {str(e)}")
 
+    # --- Notify managers/admins about the cancellation (notifications feed) ---
+    try:
+        notification_repo.notify_admins_order_cancelled(session, order)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"Failed to create cancellation notifications: {str(e)}")
+
     return CancelOrderResponse(
         order_id=order.id,
         order_number=order.order_number,
@@ -173,7 +182,7 @@ def cancel_order(
 def get_refund_status(
     order_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """
     Get the refund status for an order.
@@ -233,7 +242,7 @@ def get_refund_status(
 def get_order_by_number(
     order_number: str,
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: CurrentUser,
 ):
     """Get specific order by order number"""
     order = order_repo.get_order_by_number(session, order_number)

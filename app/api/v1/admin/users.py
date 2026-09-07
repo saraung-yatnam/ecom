@@ -9,12 +9,16 @@ from app.models.address import Address
 from app.models.order import Order
 from app.models.cart import Cart
 from app.repositories import user as user_repo
+from app.repositories import order as order_repo
+from app.repositories import address as address_repo
 from app.schemas.admin import (
     AdminUserListResponse,
     AdminUserRead,
+    AdminUserOrderStats,
     AdminUserStats,
     AdminUserUpdate,
 )
+from app.schemas.address import AddressRead
 
 router = APIRouter(prefix="/admin/users", tags=["Admin Users"])
 
@@ -67,6 +71,75 @@ def get_user_stats(
         admin
     """
     return user_repo.get_user_stats(session)
+
+
+@router.get("/{user_id}/stats", response_model=AdminUserOrderStats)
+def get_user_order_stats(
+    user_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_role(UserRole.admin)),
+):
+    """
+    Get lifetime order statistics for a single user (Admin only).
+
+    Returns total orders, total spent, last order, average order value,
+    items purchased, per-status breakdown, etc.
+
+    Allowed:
+        admin
+    """
+    user = user_repo.get_user_by_id(session, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    stats = order_repo.get_user_order_statistics(session, user_id)
+    stats["user_id"] = user_id
+    return stats
+
+
+@router.get("/{user_id}/addresses", response_model=list[AddressRead])
+def get_user_addresses(
+    user_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_role(UserRole.admin)),
+):
+    """
+    Get all addresses for a specific user (Admin only).
+
+    Unlike the customer-facing `GET /addresses` (which ONLY returns the
+    current user's own addresses), this lets an admin view any user's
+    saved addresses from the user detail page.
+
+    Allowed:
+        admin
+    """
+    user = user_repo.get_user_by_id(session, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    addresses = address_repo.get_addresses_by_user(session, user_id)
+    return [
+        AddressRead(
+            id=addr.id,
+            user_id=addr.user_id,
+            label=addr.label,
+            line1=addr.line1,
+            line2=addr.line2,
+            city=addr.city,
+            state=addr.state,
+            postal_code=addr.postal_code,
+            country=addr.country,
+            is_default=addr.is_default,
+            created_at=addr.created_at,
+        )
+        for addr in addresses
+    ]
 
 
 @router.get("/{user_id}", response_model=AdminUserRead)

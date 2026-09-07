@@ -1,3 +1,5 @@
+# app/schemas/analytics.py (or wherever your schemas are)
+
 from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional
@@ -23,6 +25,7 @@ class SalesReportResponse(BaseModel):
     period_data: List[SalesPeriodData]
 
 
+# 👇 UPDATED: Add missing fields
 class TopProductItem(BaseModel):
     product_id: str
     product_name: str
@@ -30,6 +33,11 @@ class TopProductItem(BaseModel):
     total_quantity_sold: int
     total_revenue: float
     average_price: float
+    order_count: int = 0  # 👈 ADDED
+    variant_count: int = 0  # 👈 ADDED
+
+    class Config:
+        from_attributes = True  # For ORM compatibility
 
 
 class OrderStatusStats(BaseModel):

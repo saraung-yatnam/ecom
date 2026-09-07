@@ -49,3 +49,17 @@ class AdminUserStats(BaseModel):
     google_users: int
     email_users: int
     both_users: int
+
+
+class AdminUserOrderStats(BaseModel):
+    user_id: UUID
+    total_orders: int
+    total_spent: float
+    gross_total: float
+    refunded_total: float
+    average_order_value: float
+    total_items_purchased: int
+    first_order: datetime | None
+    last_order: datetime | None
+    status_breakdown: dict[str, int]
+    most_ordered_product: str | None
