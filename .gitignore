@@ -9,3 +9,9 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+
+# Vector Database
+chroma_db/
+*.sqlite3
+*.bin
