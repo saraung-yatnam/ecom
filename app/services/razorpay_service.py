@@ -39,10 +39,17 @@ class RazorpayPaymentService(PaymentService):
         except Exception as e:
             print(f"❌ Razorpay initialization failed: {str(e)}")
             self.is_configured = False
+
+    def _production_raise(self, message):
+        if settings.ENVIRONMENT == "production":
+            raise RuntimeError(message)
+        return None
     
     def create_payment_intent(self, order, payment_method="card"):
         """Create Razorpay order"""
         if not self.is_configured:
+            if settings.ENVIRONMENT == "production":
+                raise RuntimeError("Razorpay is not configured but ENVIRONMENT=production. No dummy fallback.")
             from app.services.payment_service import DummyPaymentService
             print("⚠️ Using dummy payment (Razorpay not configured)")
             return DummyPaymentService().create_payment_intent(order, payment_method)
@@ -74,12 +81,16 @@ class RazorpayPaymentService(PaymentService):
             }
         except Exception as e:
             print(f"❌ Razorpay order creation failed: {str(e)}")
+            if settings.ENVIRONMENT == "production":
+                raise RuntimeError(f"Razorpay order creation failed: {str(e)}")
             from app.services.payment_service import DummyPaymentService
             return DummyPaymentService().create_payment_intent(order, payment_method)
     
     def confirm_payment(self, payment_intent_id):
         """Fetch Razorpay order status"""
         if not self.is_configured:
+            if settings.ENVIRONMENT == "production":
+                raise RuntimeError("Razorpay is not configured but ENVIRONMENT=production. No dummy fallback.")
             from app.services.payment_service import DummyPaymentService
             return DummyPaymentService().confirm_payment(payment_intent_id)
         
@@ -114,17 +125,19 @@ class RazorpayPaymentService(PaymentService):
             return DummyPaymentService().handle_webhook(payload, signature)
         
         # Razorpay signs the raw body with HMAC-SHA256 -> sent in X-Razorpay-Signature
-        if self.webhook_secret:
-            if not signature:
-                print("❌ Webhook rejected: missing X-Razorpay-Signature header")
-                return {"event_type": "invalid_signature", "data": {}, "is_dummy": False}
-            try:
-                self.client.utility.verify_webhook_signature(payload, signature, self.webhook_secret)
-            except Exception as e:
-                print(f"❌ Razorpay webhook signature verification failed: {str(e)}")
-                return {"event_type": "invalid_signature", "data": {}, "is_dummy": False, "error": str(e)}
-        else:
-            print("⚠️ RAZORPAY_WEBHOOK_SECRET not set — webhook signature NOT verified!")
+        if not self.webhook_secret:
+            # Never accept unverified webhooks — a missing secret is a
+            # misconfiguration, not a reason to process the event.
+            print("❌ RAZORPAY_WEBHOOK_SECRET not set — rejecting unverified webhook")
+            return {"event_type": "invalid_signature", "data": {}, "is_dummy": False}
+        if not signature:
+            print("❌ Webhook rejected: missing X-Razorpay-Signature header")
+            return {"event_type": "invalid_signature", "data": {}, "is_dummy": False}
+        try:
+            self.client.utility.verify_webhook_signature(payload, signature, self.webhook_secret)
+        except Exception as e:
+            print(f"❌ Razorpay webhook signature verification failed: {str(e)}")
+            return {"event_type": "invalid_signature", "data": {}, "is_dummy": False, "error": str(e)}
         
         try:
             import json

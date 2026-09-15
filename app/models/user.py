@@ -28,6 +28,10 @@ class User(SQLModel, table=True):
     # Google OAuth fields
     google_id: str | None = Field(default=None, unique=True, index=True)
     auth_provider: str = Field(default="email")  # email, google, both
+
+    # Notification preferences
+    push_notifications_enabled: bool = Field(default=True)
+    email_notifications_enabled: bool = Field(default=True)
     
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

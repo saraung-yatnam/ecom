@@ -31,6 +31,7 @@ class PaymentCreateRequest(BaseModel):
 class PaymentConfirmRequest(BaseModel):
     payment_intent_id: str
     payment_method_id: str | None = None
+    transaction_id: str | None = None  # fast-path: pay_xxx from the checkout callback
 
 
 # -------------------------
@@ -44,6 +45,7 @@ class PaymentRead(BaseModel):
     order_id: UUID
     provider: str
     provider_payment_id: str
+    transaction_id: str | None
     amount: Decimal
     currency: str
     status: str

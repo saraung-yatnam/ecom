@@ -97,6 +97,33 @@ class Order(SQLModel, table=True):
     # Computed helpers (not DB columns)
     # ---------------------------------------------------------
     @property
+    def succeeded_payment(self):
+        """The payment that captured money for this order (None if never paid).
+
+        Matches `succeeded` and `refunded` payments — a refunded payment was
+        still a real transaction, so it keeps an identifiable transaction ID.
+        """
+        for payment in self.payments or []:
+            status = getattr(payment, "status", None)
+            value = getattr(status, "value", status)
+            if value in ("succeeded", "refunded"):
+                return payment
+        return None
+
+    @property
+    def transaction_id(self) -> str | None:
+        """Razorpay transaction ID (pay_xxx) for a paid order.
+
+        Resolves from the succeeded payment record: prefers the provider
+        payment intent (pay_xxx) and falls back to the provider payment /
+        order ID (order_xxx, or dummy_pay_xxx in dev).
+        """
+        payment = self.succeeded_payment
+        if payment is None:
+            return None
+        return payment.provider_payment_intent or payment.provider_payment_id
+
+    @property
     def can_cancel(self) -> bool:
         """Orders can be cancelled while PENDING, CONFIRMED or PROCESSING."""
         return self.status in (

@@ -39,6 +39,14 @@ class PaymentService(ABC):
         """Fetch the status of a refund."""
         pass
 
+    def get_payment_id_for_order(self, razorpay_order_id: str) -> str | None:
+        """Resolve the provider payment (pay_xxx) for an order id.
+
+        Base implementation returns None; providers that support it override
+        this. Currently only Razorpay implements it.
+        """
+        return None
+
 
 class DummyPaymentService(PaymentService):
     """Dummy payment service for testing"""
@@ -60,9 +68,13 @@ class DummyPaymentService(PaymentService):
         return {
             "status": "succeeded",
             "payment_intent_id": payment_intent_id,
+            "transaction_id": f"dummy_txn_{uuid.uuid4().hex[:12]}",
             "is_dummy": True,
             "message": "Dummy payment confirmed"
         }
+
+    def get_payment_id_for_order(self, razorpay_order_id: str) -> str | None:
+        return f"dummy_txn_{uuid.uuid4().hex[:12]}"
     
     def handle_webhook(self, payload, signature: str) -> dict:
         """Dummy webhook handler.
@@ -124,13 +136,24 @@ class DummyPaymentService(PaymentService):
 def get_payment_service() -> PaymentService:
     """Factory function to get payment service"""
     provider = settings.PAYMENT_PROVIDER  # 👈 Use settings
-    
+    is_production = settings.ENVIRONMENT == "production"
+
     print(f"Payment Provider from settings: {provider}")
-    
+    print(f"Environment: {settings.ENVIRONMENT}")
+
+    if not provider:
+        # No provider configured — a configuration error, never silently pay.
+        raise RuntimeError("PAYMENT_PROVIDER is not set")
+
     if provider == "dummy":
+        if is_production:
+            raise RuntimeError(
+                "PAYMENT_PROVIDER is 'dummy' in production — customers would pay "
+                "without any real money being collected. Set it to 'razorpay'."
+            )
         print("Using DUMMY payment service")
         return DummyPaymentService()
-    
+
     elif provider == "razorpay":
         try:
             from app.services.razorpay_service import RazorpayPaymentService
@@ -138,21 +161,33 @@ def get_payment_service() -> PaymentService:
             if hasattr(service, 'is_configured') and service.is_configured:
                 print("✅ Using RAZORPAY payment service")
                 return service
-            else:
-                print("⚠️ Razorpay not configured. Falling back to DUMMY.")
-                return DummyPaymentService()
+            if is_production:
+                raise RuntimeError(
+                    "Razorpay is not configured but ENVIRONMENT=production. "
+                    "Refusing to fall back to dummy payments."
+                )
+            print("⚠️ Razorpay not configured. Falling back to DUMMY.")
+            return DummyPaymentService()
+        except RuntimeError:
+            raise
         except Exception as e:
+            if is_production:
+                raise RuntimeError(f"Failed to initialize Razorpay: {str(e)}")
             print(f"❌ Error initializing Razorpay: {str(e)}")
             return DummyPaymentService()
-    
+
     elif provider == "stripe":
+        if is_production:
+            raise RuntimeError("PAYMENT_PROVIDER='stripe' is not supported in production. Use 'razorpay'.")
         try:
             from app.services.stripe_service import StripePaymentService
             return StripePaymentService()
         except ImportError:
             print("Stripe not installed. Falling back to dummy.")
             return DummyPaymentService()
-    
+
     else:
+        if is_production:
+            raise RuntimeError(f"Unknown PAYMENT_PROVIDER: {provider}")
         print(f"Unknown provider: {provider}. Falling back to dummy.")
         return DummyPaymentService()

@@ -18,13 +18,13 @@ from app.utils.pricing import (
     get_product_pricing_data,
     get_variant_pricing_data,
 )
+from app.services.rag_service import ingest_all_products, delete_product_from_rag  # ✅ Import RAG functions
 
 
 router = APIRouter(
     prefix="/products",
     tags=["Products"],
 )
-
 
 
 @router.get(
@@ -101,11 +101,11 @@ def get_products(
         limit=limit,
     )
 
-    # 👇 Batch-fetch rating stats for all products in this page in ONE query
+    # Batch-fetch rating stats for all products in this page in ONE query
     product_ids = [product.id for product in products]
     rating_stats = product_repo.get_product_rating_stats(session, product_ids)
 
-    # 👇 Create response objects with computed fields
+    # Create response objects with computed fields
     response_products = []
     for product in products:
         pricing_data = get_product_pricing_data(product)
@@ -183,10 +183,10 @@ def get_product(
             detail="Product not found",
         )
 
-    # 👇 Create response object with computed fields
+    # Create response object with computed fields
     pricing_data = get_product_pricing_data(product)
 
-    # 👇 Fetch rating stats for this single product
+    # Fetch rating stats for this single product
     rating_stats = product_repo.get_product_rating_stats(session, [product.id])
     stats = rating_stats.get(
         product.id,
@@ -277,7 +277,14 @@ def create_product(
         current_user.id,
     )
 
-    # 👇 Create response object with computed fields
+    # ✅ Sync product to RAG after creation
+    try:
+        count = ingest_all_products(session)
+        print(f"✅ Synced {count} products to RAG after product creation")
+    except Exception as e:
+        print(f"⚠️ Failed to sync products to RAG: {e}")
+
+    # Create response object with computed fields
     pricing_data = get_product_pricing_data(product)
     
     product_read = ProductRead(
@@ -297,7 +304,6 @@ def create_product(
         discount_percentage=pricing_data["discount_percentage"],
         savings_amount=pricing_data["savings_amount"],
         is_on_sale=pricing_data["is_on_sale"],
-        # 👇 A brand-new product has no reviews yet — no query needed
         average_rating=0.0,
         review_count=0,
     )
@@ -377,10 +383,17 @@ def update_product(
         product_data,
     )
 
-    # 👇 Create response object with computed fields
+    # ✅ Sync product to RAG after update
+    try:
+        count = ingest_all_products(session)
+        print(f"✅ Synced {count} products to RAG after product update")
+    except Exception as e:
+        print(f"⚠️ Failed to sync products to RAG: {e}")
+
+    # Create response object with computed fields
     pricing_data = get_product_pricing_data(product)
 
-    # 👇 Fetch this product's real rating stats (it may already have reviews)
+    # Fetch this product's real rating stats (it may already have reviews)
     rating_stats = product_repo.get_product_rating_stats(session, [product.id])
     stats = rating_stats.get(
         product.id,
@@ -467,6 +480,13 @@ def delete_product(
         product,
     )
 
+    # ✅ Remove product from RAG after deletion
+    try:
+        delete_product_from_rag(product_id)
+        print(f"✅ Removed product {product_id} from RAG")
+    except Exception as e:
+        print(f"⚠️ Failed to remove product from RAG: {e}")
+
     return None
 
 
@@ -502,7 +522,7 @@ def get_product_variants(
         product_id,
     )
 
-    # 👇 Create response objects with computed fields
+    # Create response objects with computed fields
     response_variants = []
     for variant in variants:
         variant_pricing = get_variant_pricing_data(product, variant)
@@ -578,7 +598,14 @@ def create_product_variant(
         variant_data,
     )
 
-    # 👇 Create response object with computed fields
+    # ✅ Sync product to RAG after variant creation
+    try:
+        count = ingest_all_products(session)
+        print(f"✅ Synced {count} products to RAG after variant creation")
+    except Exception as e:
+        print(f"⚠️ Failed to sync products to RAG: {e}")
+
+    # Create response object with computed fields
     variant_pricing = get_variant_pricing_data(product, variant)
     
     variant_read = ProductVariantRead(
@@ -670,7 +697,14 @@ def update_product_variant(
         variant_data,
     )
 
-    # 👇 Create response object with computed fields
+    # ✅ Sync product to RAG after variant update
+    try:
+        count = ingest_all_products(session)
+        print(f"✅ Synced {count} products to RAG after variant update")
+    except Exception as e:
+        print(f"⚠️ Failed to sync products to RAG: {e}")
+
+    # Create response object with computed fields
     variant_pricing = get_variant_pricing_data(product, variant)
     
     variant_read = ProductVariantRead(
@@ -691,7 +725,7 @@ def update_product_variant(
 
 
 # =========================================================
-# PRODUCT VARIANTS - STAFF+ (DELETE)  ⬅️ NEW ENDPOINT
+# PRODUCT VARIANTS - STAFF+ (DELETE)
 # =========================================================
 
 @router.delete(
@@ -750,5 +784,12 @@ def delete_product_variant(
         session,
         variant,
     )
+
+    # ✅ Sync product to RAG after variant deletion
+    try:
+        count = ingest_all_products(session)
+        print(f"✅ Synced {count} products to RAG after variant deletion")
+    except Exception as e:
+        print(f"⚠️ Failed to sync products to RAG: {e}")
     
     return None

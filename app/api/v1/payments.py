@@ -116,10 +116,21 @@ def confirm_payment(
     result = payment_service.confirm_payment(request.payment_intent_id)
     
     if result["status"] == "succeeded":
+        # Resolve the real transaction ID (pay_xxx) — prefer the value passed
+        # from the checkout callback, else fetch it from the provider, else
+        # fall back to whatever confirm returned (dummy_txn_... in dev).
+        transaction_id = request.transaction_id
+        if not transaction_id and not result.get("is_dummy", True):
+            resolver = getattr(payment_service, "get_payment_id_for_order", None)
+            if callable(resolver):
+                transaction_id = resolver(payment.provider_payment_id)
+        transaction_id = transaction_id or result.get("transaction_id") or payment.provider_payment_id
+
         # Update payment status (payment_method = real instrument from Razorpay: upi/card/netbanking/...)
         payment = payment_repo.mark_payment_succeeded(
             session, request.payment_intent_id,
             payment_method=result.get("method"),
+            provider_payment_intent=transaction_id,
         )
         # Update order status
         order.status = "confirmed"

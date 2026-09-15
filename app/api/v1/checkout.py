@@ -14,8 +14,9 @@ from app.repositories import cart as cart_repo
 from app.repositories import address as address_repo
 from app.repositories import coupon as coupon_repo
 from app.schemas.checkout import CheckoutConfigResponse, CheckoutRequest, OrderRead
-from app.utils.cart import calculate_cart_total, validate_cart_items, calculate_tax, calculate_shipping
-from app.utils.coupon import validate_coupon, calculate_discount as calc_discount
+from app.models.coupon import CouponType
+from app.utils.cart import validate_cart_items
+from app.services.pricing import resolve_cart_pricing
 from app.utils.order import generate_order_number
 from app.repositories import notification as notification_repo
 from app.services.email_service import email_service
@@ -102,50 +103,38 @@ def checkout(
             detail="; ".join(validation["errors"])
         )
     
-    # 5. Calculate subtotal
-    subtotal = Decimal("0.00")
-    for item in cart_with_items.items:
-        subtotal += item.price_at_add * item.quantity
-    
+    # 5-9. Resolve pricing via the central engine (single source of truth).
+    # The engine re-validates any manual coupon on the cart AND evaluates
+    # automatic coupons against their trigger conditions — checkout is the
+    # final authority on whether a discount applies and how large it is.
+    pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+    subtotal = pricing.subtotal
     print(f"Subtotal: {subtotal}")
     
-    # 6. Process coupon
-    coupon_code = None
-    discount_amount = Decimal("0.00")
-    final_subtotal = subtotal
+    winner = pricing.manual or pricing.automatic
+    coupon_code = winner.coupon.code if winner else None
+    discount_amount = pricing.discount_total
+    final_subtotal = pricing.new_subtotal
     
-    if cart.coupon_code:
-        coupon = coupon_repo.get_coupon_by_code(session, cart.coupon_code)
-        if coupon:
-            is_valid, message = validate_coupon(
-                coupon,
-                subtotal,
-                current_user.id,
-                coupon_repo.get_user_coupon_usage_count(
-                    session, 
-                    cart.coupon_code, 
-                    current_user.id
-                )
-            )
-            if is_valid:
-                coupon_code = cart.coupon_code
-                discount_amount, final_subtotal = calc_discount(coupon, subtotal)
-                print(f"Coupon applied: {discount_amount}, new subtotal: {final_subtotal}")
-            else:
-                # Remove invalid coupon from cart
-                cart.coupon_code = None
-                session.add(cart)
+    if winner:
+        winner_kind = "automatic" if pricing.manual is None else "manual"
+        print(
+            f"Coupon applied ({winner_kind}): {coupon_code}, "
+            f"discount={discount_amount}, new subtotal: {final_subtotal}"
+        )
     
-    # 7. Calculate tax using utils ✅
-    tax_amount = calculate_tax(cart_with_items)
+    if cart.coupon_code and pricing.manual is None:
+        # Stored manual code is no longer valid — drop it from the cart.
+        cart.coupon_code = None
+        session.add(cart)
+    
+    tax_amount = pricing.tax_total
     print(f"Tax amount: {tax_amount}")
     
-    # 8. Calculate shipping using utils ✅
-    shipping_amount = calculate_shipping(cart_with_items)
+    shipping_amount = pricing.shipping_total
     print(f"Shipping amount: {shipping_amount}")
     
-    # 9. Calculate grand total
-    grand_total = final_subtotal + tax_amount + shipping_amount
+    grand_total = pricing.total
     print(f"Grand total: {grand_total}")
     
     # 9.5 Resolve payment method from checkout body (persisted on the order)
@@ -218,6 +207,11 @@ def checkout(
     # 12. Clear cart
     cart_repo.clear_cart(session, cart_with_items)
     
+    # 12b. Record usage of an AUTOMATIC winning coupon (manual coupons are
+    # counted when their code is applied to the cart — unchanged behavior).
+    if winner and winner.coupon.coupon_type == CouponType.AUTOMATIC:
+        coupon_repo.increment_coupon_usage(session, winner.coupon)
+    
     # 13. Commit everything
     session.commit()
     session.refresh(order)
@@ -248,3 +242,4 @@ def checkout(
     print("="*50 + "\n")
     
     return order
+

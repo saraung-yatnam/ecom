@@ -21,6 +21,29 @@ def get_product_images(
     return session.exec(statement).all()
 
 
+def get_first_images_for_products(
+    session: Session,
+    product_ids: list[UUID],
+) -> dict[UUID, str]:
+    """Map product_id -> first image URL (lowest sort_order) for the given products"""
+    
+    if not product_ids:
+        return {}
+    
+    statement = (
+        select(ProductImage)
+        .where(ProductImage.product_id.in_(product_ids))
+        .order_by(ProductImage.sort_order.asc())
+    )
+    images = session.exec(statement).all()
+    
+    first_by_product: dict[UUID, str] = {}
+    for image in images:
+        first_by_product.setdefault(image.product_id, image.url)
+    
+    return first_by_product
+
+
 def get_image_by_id(
     session: Session,
     image_id: UUID,

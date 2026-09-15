@@ -10,7 +10,17 @@ from sqlmodel import Session
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.user import User
 from app.models.address import Address  # Add this if you have address model
-from app.models.product import ProductVariant  # ⚠️ ASSUMED — see note below
+from app.models.product import Product, ProductVariant  # ⚠️ ASSUMED — see note below
+
+
+# Eager-load chain used by the user-facing order responses: each order item
+# resolves its product slug + first image via item -> variant -> product -> images
+_ORDER_ITEM_PRODUCT_LOAD = (
+    selectinload(Order.items)
+    .selectinload(OrderItem.variant)
+    .selectinload(ProductVariant.product)
+    .selectinload(Product.images)
+)
 
 
 def get_order_by_id(session: Session, order_id: UUID) -> Order | None:
@@ -19,10 +29,11 @@ def get_order_by_id(session: Session, order_id: UUID) -> Order | None:
         select(Order)
         .where(Order.id == order_id)
         .options(
-            selectinload(Order.items),
+            _ORDER_ITEM_PRODUCT_LOAD,
             selectinload(Order.user),  # 👈 Add this
             selectinload(Order.shipping_address),  # 👈 Add this
             selectinload(Order.billing_address),   # 👈 Add this
+            selectinload(Order.payments),  # 👈 resolves transaction_id
         )
     )
     result = session.execute(statement)
@@ -43,8 +54,9 @@ def get_orders_by_user(
         .offset(skip)
         .limit(limit)
         .options(
-            selectinload(Order.items),
+            _ORDER_ITEM_PRODUCT_LOAD,
             selectinload(Order.shipping_address),
+            selectinload(Order.payments),  # 👈 resolves transaction_id
         )
     )
     result = session.execute(statement)
@@ -77,9 +89,10 @@ def get_order_by_number(session: Session, order_number: str) -> Order | None:
         select(Order)
         .where(Order.order_number == order_number)
         .options(
-            selectinload(Order.items),
+            _ORDER_ITEM_PRODUCT_LOAD,
             selectinload(Order.user),
             selectinload(Order.shipping_address),
+            selectinload(Order.payments),  # 👈 resolves transaction_id
         )
     )
     result = session.execute(statement)

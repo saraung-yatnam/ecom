@@ -1,5 +1,6 @@
 from decimal import Decimal
 from uuid import UUID
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
@@ -15,8 +16,9 @@ from app.schemas.cart import (
     CartRead,
     UpdateCartItemRequest,
 )
+from app.models.coupon import CouponType
+from app.services.pricing import build_cart_read, resolve_cart_pricing
 from app.utils.cart import calculate_cart_total
-from app.utils.coupon import calculate_discount as calc_discount
 
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
@@ -48,30 +50,11 @@ def get_cart(
     cart = cart_repo.get_or_create_cart(session, user_id, session_id)
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
     
-    # Calculate base totals
-    totals = calculate_cart_total(cart_with_items)
-    
-    # Calculate discount if coupon is applied
-    if cart.coupon_code:
-        coupon = coupon_repo.get_coupon_by_code(session, cart.coupon_code)
-        if coupon:
-            subtotal = totals["subtotal"]
-            discount_amount, new_subtotal = calc_discount(coupon, subtotal)
-            totals["discount_total"] = discount_amount
-            totals["tax_total"] = new_subtotal * Decimal("0.18")
-            totals["total"] = new_subtotal + totals["tax_total"] + totals["shipping_total"]
-    
-    return CartRead(
-        id=cart_with_items.id,
-        items=totals["items"],
-        subtotal=totals["subtotal"],
-        coupon_code=cart.coupon_code,
-        discount_total=totals["discount_total"],
-        tax_total=totals["tax_total"],
-        shipping_total=totals["shipping_total"],
-        total=totals["total"],
-        item_count=totals["item_count"]
-    )
+    # The pricing engine is the single source of truth: it re-validates the
+    # manual coupon on the cart and decides whether an automatic coupon
+    # applies itself (and for how much). The API just returns the decision.
+    pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+    return build_cart_read(cart_with_items, pricing)
 
 
 @router.post("/items", response_model=CartRead, status_code=status.HTTP_201_CREATED)
@@ -98,19 +81,11 @@ def add_to_cart(
         raise HTTPException(status_code=400, detail=str(e))
     
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
-    totals = calculate_cart_total(cart_with_items)
     
-    return CartRead(
-        id=cart_with_items.id,
-        items=totals["items"],
-        subtotal=totals["subtotal"],
-        coupon_code=cart_with_items.coupon_code,
-        discount_total=totals["discount_total"],
-        tax_total=totals["tax_total"],
-        shipping_total=totals["shipping_total"],
-        total=totals["total"],
-        item_count=totals["item_count"]
-    )
+    # Pricing engine decides discounts (manual re-validation + automatic
+    # coupon evaluation) — the API just returns what it decides.
+    pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+    return build_cart_read(cart_with_items, pricing)
 
 
 @router.put("/items/{item_id}", response_model=CartRead)
@@ -148,19 +123,11 @@ def update_cart_item(
         raise HTTPException(status_code=400, detail=str(e))
     
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
-    totals = calculate_cart_total(cart_with_items)
     
-    return CartRead(
-        id=cart_with_items.id,
-        items=totals["items"],
-        subtotal=totals["subtotal"],
-        coupon_code=cart_with_items.coupon_code,
-        discount_total=totals["discount_total"],
-        tax_total=totals["tax_total"],
-        shipping_total=totals["shipping_total"],
-        total=totals["total"],
-        item_count=totals["item_count"]
-    )
+    # Pricing engine decides discounts (manual re-validation + automatic
+    # coupon evaluation) — the API just returns what it decides.
+    pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+    return build_cart_read(cart_with_items, pricing)
 
 
 @router.delete("/items/{item_id}", response_model=CartRead)
@@ -194,19 +161,11 @@ def remove_from_cart(
     cart_repo.remove_cart_item(session, cart_item)
     
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
-    totals = calculate_cart_total(cart_with_items)
     
-    return CartRead(
-        id=cart_with_items.id,
-        items=totals["items"],
-        subtotal=totals["subtotal"],
-        coupon_code=cart_with_items.coupon_code,
-        discount_total=totals["discount_total"],
-        tax_total=totals["tax_total"],
-        shipping_total=totals["shipping_total"],
-        total=totals["total"],
-        item_count=totals["item_count"]
-    )
+    # Pricing engine decides discounts (manual re-validation + automatic
+    # coupon evaluation) — the API just returns what it decides.
+    pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+    return build_cart_read(cart_with_items, pricing)
 
 
 @router.delete("", response_model=CartRead)
@@ -252,31 +211,77 @@ def apply_coupon(
     
     cart = cart_repo.get_or_create_cart(session, user_id, session_id)
     
-    # If same coupon already applied, just return cart with discount
+    # ✅ VALIDATE COUPON BEFORE APPLYING
+    coupon = coupon_repo.get_coupon_by_code(session, request.coupon_code)
+    if not coupon:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Coupon not found"
+        )
+    
+    # Automatic coupons apply themselves — they cannot be typed in as codes
+    if coupon.coupon_type == CouponType.AUTOMATIC:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This coupon is applied automatically and cannot be entered as a code",
+        )
+    
+    # Check if coupon is active
+    if not coupon.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This coupon is currently inactive"
+        )
+    
+    # Check if coupon is valid from date
+    if coupon.valid_from and coupon.valid_from > datetime.now():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This coupon will be available from {coupon.valid_from.strftime('%d %b %Y')}"
+        )
+    
+    # Check if coupon is expired
+    if coupon.valid_until and coupon.valid_until < datetime.now():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This coupon expired on {coupon.valid_until.strftime('%d %b %Y')}"
+        )
+    
+    # Check global usage limit
+    if coupon.max_uses and coupon.times_used >= coupon.max_uses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Sorry, this coupon has reached its maximum usage limit ({coupon.max_uses} uses)"
+        )
+    
+    # ✅ Check user's per-user limit (THIS IS THE KEY FIX!)
+    if user_id and coupon.max_uses_per_user:
+        user_usage = coupon_repo.get_user_coupon_usage_count(
+            session, request.coupon_code, user_id
+        )
+        if user_usage >= coupon.max_uses_per_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"You have already used this coupon. Maximum {coupon.max_uses_per_user} use(s) per customer."
+            )
+    
+    # Check min order value
+    cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
+    totals = calculate_cart_total(cart_with_items)
+    subtotal = totals["subtotal"]
+    
+    if coupon.min_order_value and subtotal < coupon.min_order_value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Minimum order value of ₹{coupon.min_order_value} required. Current subtotal: ₹{subtotal}"
+        )
+    # ✅ END OF VALIDATION BLOCK
+    
+    # If same coupon already applied, just return the cart with its discount
     if cart.coupon_code == request.coupon_code:
         cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
-        totals = calculate_cart_total(cart_with_items)
-        
-        if cart.coupon_code:
-            coupon = coupon_repo.get_coupon_by_code(session, cart.coupon_code)
-            if coupon:
-                subtotal = totals["subtotal"]
-                discount_amount, new_subtotal = calc_discount(coupon, subtotal)
-                totals["discount_total"] = discount_amount
-                totals["tax_total"] = new_subtotal * Decimal("0.18")
-                totals["total"] = new_subtotal + totals["tax_total"] + totals["shipping_total"]
-        
-        return CartRead(
-            id=cart_with_items.id,
-            items=totals["items"],
-            subtotal=totals["subtotal"],
-            coupon_code=cart.coupon_code,
-            discount_total=totals["discount_total"],
-            tax_total=totals["tax_total"],
-            shipping_total=totals["shipping_total"],
-            total=totals["total"],
-            item_count=totals["item_count"]
-        )
+        pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+        return build_cart_read(cart_with_items, pricing)
     
     try:
         cart_repo.apply_coupon_to_cart(session, cart, request.coupon_code)
@@ -288,29 +293,8 @@ def apply_coupon(
         )
     
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
-    totals = calculate_cart_total(cart_with_items)
-    
-    # Calculate discount from coupon
-    if cart.coupon_code:
-        coupon = coupon_repo.get_coupon_by_code(session, cart.coupon_code)
-        if coupon:
-            subtotal = totals["subtotal"]
-            discount_amount, new_subtotal = calc_discount(coupon, subtotal)
-            totals["discount_total"] = discount_amount
-            totals["tax_total"] = new_subtotal * Decimal("0.18")
-            totals["total"] = new_subtotal + totals["tax_total"] + totals["shipping_total"]
-    
-    return CartRead(
-        id=cart_with_items.id,
-        items=totals["items"],
-        subtotal=totals["subtotal"],
-        coupon_code=cart.coupon_code,
-        discount_total=totals["discount_total"],
-        tax_total=totals["tax_total"],
-        shipping_total=totals["shipping_total"],
-        total=totals["total"],
-        item_count=totals["item_count"]
-    )
+    pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+    return build_cart_read(cart_with_items, pricing)
 
 
 @router.delete("/coupon", response_model=CartRead)
@@ -329,16 +313,8 @@ def remove_coupon(
     cart = cart_repo.remove_coupon_from_cart(session, cart)
     
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
-    totals = calculate_cart_total(cart_with_items)
     
-    return CartRead(
-        id=cart_with_items.id,
-        items=totals["items"],
-        subtotal=totals["subtotal"],
-        coupon_code=cart_with_items.coupon_code,
-        discount_total=totals["discount_total"],
-        tax_total=totals["tax_total"],
-        shipping_total=totals["shipping_total"],
-        total=totals["total"],
-        item_count=totals["item_count"]
-    )
+    # Pricing engine decides discounts (manual re-validation + automatic
+    # coupon evaluation) — the API just returns what it decides.
+    pricing = resolve_cart_pricing(session, cart_with_items, current_user)
+    return build_cart_read(cart_with_items, pricing)

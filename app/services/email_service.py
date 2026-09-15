@@ -21,6 +21,18 @@ class EmailService:
         else:
             print("WARNING: SENDGRID_API_KEY not found in settings!")
 
+    # ========== ✅ NEW: Public send_email method ==========
+    def send_email(self, to: str, subject: str, html_body: str, plain_text: str = None) -> bool:
+        """
+        Public method to send emails (used by OTP service, welcome emails, etc.)
+        """
+        return self._send_email(
+            to_email=to,
+            subject=subject,
+            html_content=html_body,
+            plain_text=plain_text
+        )
+
     def format_currency(self, amount: Decimal) -> str:
         return f"₹{amount:,.2f}"
 
@@ -55,15 +67,10 @@ class EmailService:
             "<h1>✅ Test Email</h1><p>If you received this, your email system is working!</p>"
         )
 
-    # ========== NEW: Password Reset Email ==========
+    # ========== Password Reset Email ==========
     def send_password_reset_email(self, user_email: str, user_name: str, reset_token: str):
         """
         Send password reset email to user.
-        
-        Args:
-            user_email: User's email address
-            user_name: User's full name or username
-            reset_token: The password reset token
         """
         reset_link = f"{self.frontend_url}/reset-password?token={reset_token}"
         
@@ -259,7 +266,7 @@ class EmailService:
             </tr>
             """
         
-        # Payment-method banner (the part that was missing entirely)
+        # Payment-method banner
         if is_cod:
             payment_banner = f"""
             <div style="background-color:#fef3c7; border:2px solid #f59e0b; border-radius:8px; padding:16px 20px; margin:20px 0;">
@@ -495,7 +502,7 @@ class EmailService:
         self._send_email(user.email, subject, html_content)
 
     def send_refund_completed(self, order: Order, user: User):
-        """Send refund completed notification (money has reached the customer)."""
+        """Send refund completed notification"""
         subject = f"Refund Completed - #{order.order_number}"
         html_content = f"""
         <!DOCTYPE html>
@@ -529,7 +536,7 @@ class EmailService:
         self._send_email(user.email, subject, html_content)
 
     def send_refund_failed(self, order: Order, user: User):
-        """Send refund failed notification (needs customer/admin attention)."""
+        """Send refund failed notification"""
         subject = f"Refund Issue - #{order.order_number}"
         html_content = f"""
         <!DOCTYPE html>

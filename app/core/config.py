@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     RESTOCKING_FEE_PROCESSING: float = 15.0   # % fee when cancelling a PROCESSING order
 
     GEMINI_API_KEY:str|None=None
+    HUGGING_FACE_API_KEY:str|None=None
+    GROQ_API_KEY:str|None=None
 
     @property
     def cors_origins_list(self) -> List[str]:

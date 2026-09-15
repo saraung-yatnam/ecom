@@ -2,20 +2,23 @@ import uuid
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks
-from sqlmodel import Session
+from sqlmodel import Session,select
 from pydantic import BaseModel, EmailStr
 
 from app.api.deps import SessionDep, CurrentUser, CurrentUser
 from app.schemas.google_auth import GoogleAuthRequest
 from app.schemas.user import UserCreate, UserRead, UserLogin, SetPasswordRequest, UserUpdateProfile
 from app.schemas.token import TokenPair, RefreshRequest
+from app.schemas.otp import OTPInitiateRequest,OTPVerifyRequest
 from app.repositories import user as user_repo
 from app.repositories import token as token_repo
 from app.core.security import verify_password, create_access_token, hash_password, generate_reset_token
 from app.services.email_service import email_service
 from app.services.google_auth_service import google_auth_service
+from app.services.otp_service import create_otp,verify_otp,increment_otp_attempts,get_otp_attempts
 from app.core.config import settings
 from app.models.user import User
+from app.models.otp import OTP
 from app.models.password_reset import PasswordResetToken
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -39,16 +42,110 @@ class ChangePasswordRequest(BaseModel):
 
 # ========== Authentication Endpoints ==========
 
-@router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def register(data: UserCreate, session: SessionDep):
-    if user_repo.get_user_by_email(session, data.email):
-        raise HTTPException(status_code=400, detail="Email already registered")
-    if user_repo.get_user_by_username(session, data.username):
-        raise HTTPException(status_code=400, detail="Username already taken")
+# @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+# def register(data: UserCreate, session: SessionDep):
+#     if user_repo.get_user_by_email(session, data.email):
+#         raise HTTPException(status_code=400, detail="Email already registered")
+#     if user_repo.get_user_by_username(session, data.username):
+#         raise HTTPException(status_code=400, detail="Username already taken")
     
-    user = user_repo.create_user(session, data)
+#     user = user_repo.create_user(session, data)
     
-    # Send welcome email
+#     # Send welcome email
+#     if settings.SENDGRID_API_KEY:
+#         try:
+#             email_service.send_welcome_email(user)
+#             print(f"✅ Welcome email sent to {user.email}")
+#         except Exception as e:
+#             print(f"❌ Failed to send welcome email: {str(e)}")
+    
+#     return user
+
+@router.post("/register/initiate")
+def initiate_registration(
+    request: OTPInitiateRequest,
+    session: SessionDep,
+):
+    """
+    Step 1: Send OTP to user's email for verification.
+    """
+    # ✅ Check if email already registered
+    existing_user = user_repo.get_user_by_email(session, request.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # ✅ Check rate limiting (max 3 attempts per hour)
+    from datetime import datetime, timedelta
+    statement = select(OTP).where(
+        OTP.email == request.email,
+        OTP.created_at > datetime.now() - timedelta(hours=1)
+    )
+    recent_otps = session.exec(statement).all()
+    if len(recent_otps) >= 3:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many OTP requests. Please wait 1 hour."
+        )
+    
+    # ✅ Generate and send OTP
+    create_otp(session, request.email, "signup")
+    
+    return {
+        "message": "OTP sent to your email",
+        "email": request.email,
+        "expires_in": "10 minutes"
+    }
+
+
+@router.post("/register/verify")
+def verify_registration(
+    request: OTPVerifyRequest,
+    session: SessionDep,
+):
+    """
+    Step 2: Verify OTP and create user account.
+    """
+    # ✅ Check if email already registered (double-check)
+    existing_user = user_repo.get_user_by_email(session, request.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # ✅ Check if username is taken
+    existing_username = user_repo.get_user_by_username(session, request.username)
+    if existing_username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already taken"
+        )
+    
+    # ✅ Verify OTP
+    is_valid = verify_otp(session, request.email, request.otp_code, "signup")
+    if not is_valid:
+        # ✅ Increment failed attempts
+        increment_otp_attempts(session, request.email)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OTP"
+        )
+    
+    # ✅ OTP verified - Create user
+    user_data = UserCreate(
+        email=request.email,
+        username=request.username,
+        password=request.password,
+        full_name=request.full_name,
+        phone=request.phone,
+    )
+    
+    user = user_repo.create_user(session, user_data)
+    
+    # ✅ Send welcome email
     if settings.SENDGRID_API_KEY:
         try:
             email_service.send_welcome_email(user)
@@ -56,7 +153,42 @@ def register(data: UserCreate, session: SessionDep):
         except Exception as e:
             print(f"❌ Failed to send welcome email: {str(e)}")
     
-    return user
+    return {
+        "message": "Account created successfully",
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "username": user.username,
+            "full_name": user.full_name,
+        }
+    }
+
+
+@router.post("/register/resend-otp")
+def resend_otp(
+    request: OTPInitiateRequest,
+    session: SessionDep,
+):
+    """
+    Resend OTP for registration.
+    """
+    # ✅ Check if email already registered
+    existing_user = user_repo.get_user_by_email(session, request.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # ✅ Generate and send new OTP
+    create_otp(session, request.email, "signup")
+    
+    return {
+        "message": "OTP resent to your email",
+        "email": request.email,
+        "expires_in": "10 minutes"
+    }
+
 
     
 @router.post("/login", response_model=TokenPair)
@@ -136,6 +268,12 @@ def update_profile(
     
     if profile_data.phone is not None:
         current_user.phone = profile_data.phone
+    
+    if profile_data.push_notifications_enabled is not None:
+        current_user.push_notifications_enabled = profile_data.push_notifications_enabled
+    
+    if profile_data.email_notifications_enabled is not None:
+        current_user.email_notifications_enabled = profile_data.email_notifications_enabled
     
     session.add(current_user)
     session.commit()
@@ -253,7 +391,7 @@ def set_password(
 def forgot_password(
     request: ForgotPasswordRequest,
     session: SessionDep,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks, 
 ):
     """
     Request password reset link.

@@ -11,6 +11,28 @@ class DiscountType(str, Enum):
     FIXED = "fixed"
 
 
+class CouponType(str, Enum):
+    """How a coupon reaches the customer's cart.
+
+    - MANUAL: the customer types the code at checkout (existing flow).
+    - AUTOMATIC: the backend applies the coupon by itself when the
+      configured trigger condition is met — no code entry involved.
+    """
+
+    MANUAL = "manual"
+    AUTOMATIC = "automatic"
+
+
+class TriggerType(str, Enum):
+    """Trigger conditions that make an AUTOMATIC coupon apply itself."""
+
+    NONE = "none"
+    MIN_CART_VALUE = "min_cart_value"
+    MIN_ITEM_COUNT = "min_item_count"
+    CATEGORY_SPEND = "category_spend"
+    FIRST_ORDER = "first_order"
+
+
 class Coupon(SQLModel, table=True):
     __tablename__ = "coupons"
 
@@ -18,7 +40,28 @@ class Coupon(SQLModel, table=True):
     code: str = Field(unique=True, index=True, max_length=50)
     discount_type: DiscountType = Field(default=DiscountType.PERCENTAGE)
     value: Decimal = Field(max_digits=12, decimal_places=2)
-    
+
+    # Manual vs automatic
+    coupon_type: CouponType = Field(default=CouponType.MANUAL)
+
+    # Trigger configuration (only meaningful for AUTOMATIC coupons)
+    trigger_type: TriggerType = Field(default=TriggerType.NONE)
+    trigger_min_cart_value: Decimal | None = Field(
+        default=None,
+        max_digits=12,
+        decimal_places=2,
+    )
+    trigger_min_item_count: int | None = None
+    trigger_category_id: UUID | None = Field(
+        default=None,
+        foreign_key="categories.id",
+    )
+    trigger_category_spend: Decimal | None = Field(
+        default=None,
+        max_digits=12,
+        decimal_places=2,
+    )
+
     min_order_value: Decimal | None = Field(
         default=None, 
         max_digits=12, 

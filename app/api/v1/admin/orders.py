@@ -4,13 +4,15 @@ from datetime import date
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.api.deps import SessionDep, require_role
 from app.models.user import User, UserRole
 from app.models.order import OrderStatus
+from app.models.product import ProductVariant
 from app.repositories import order as order_repo
 from app.repositories import notification as notification_repo
+from app.repositories import product_image as product_image_repo
 from app.schemas.order import OrderRead, OrderStatusUpdate, OrderListRead
 from app.services.email_service import email_service
 from app.services.refund_service import restore_stock
@@ -196,6 +198,37 @@ def get_order_detail(
             detail="Order not found"
         )
     
+    # Resolve product + first product image for each order item.
+    # Order items are variant snapshots: item -> variant -> product -> images
+    variant_ids = [item.variant_id for item in (order.items or [])]
+    variants = (
+        session.exec(
+            select(ProductVariant).where(ProductVariant.id.in_(variant_ids))
+        ).all()
+        if variant_ids
+        else []
+    )
+    variant_to_product = {variant.id: variant.product_id for variant in variants}
+    first_images = product_image_repo.get_first_images_for_products(
+        session, list(set(variant_to_product.values()))
+    )
+    
+    items_payload = []
+    for item in (order.items or []):
+        product_id = variant_to_product.get(item.variant_id)
+        items_payload.append({
+            "id": str(item.id),
+            "product_id": str(product_id) if product_id else None,
+            "product_image": first_images.get(product_id),
+            "product_name": item.product_name,
+            "variant_sku": item.variant_sku,
+            "variant_attributes": item.variant_attributes,
+            "quantity": item.quantity,
+            "unit_price": float(item.unit_price),
+            "line_total": float(item.line_total),
+            "created_at": item.created_at.isoformat() if item.created_at else None
+        })
+    
     # Build response manually
     return {
         "id": str(order.id),
@@ -250,6 +283,12 @@ def get_order_detail(
         "shipping_total": float(order.shipping_total),
         "grand_total": float(order.grand_total),
         
+        # Payment transaction details
+        "transaction_id": order.transaction_id,
+        "payment_provider": getattr(order.succeeded_payment, "provider", None) if order.succeeded_payment else None,
+        "payment_method": getattr(order.succeeded_payment, "payment_method", None) if order.succeeded_payment else None,
+        "paid_at": getattr(order.succeeded_payment, "paid_at", None).isoformat() if order.succeeded_payment and getattr(order.succeeded_payment, "paid_at", None) else None,
+        
         # Status
         "status": order.status.value if hasattr(order.status, 'value') else str(order.status),
         "payment_status": order.payment_status,
@@ -268,19 +307,7 @@ def get_order_detail(
         "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
         
         # Items
-        "items": [
-            {
-                "id": str(item.id),
-                "product_name": item.product_name,
-                "variant_sku": item.variant_sku,
-                "variant_attributes": item.variant_attributes,
-                "quantity": item.quantity,
-                "unit_price": float(item.unit_price),
-                "line_total": float(item.line_total),
-                "created_at": item.created_at.isoformat() if item.created_at else None
-            }
-            for item in (order.items or [])
-        ]
+        "items": items_payload
     }
 
 

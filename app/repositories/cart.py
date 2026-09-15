@@ -5,6 +5,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
 from app.models.cart import Cart, CartItem
+from app.models.coupon import CouponType
 from app.models.product import ProductVariant
 from app.models.product_image import ProductImage
 
@@ -195,6 +196,12 @@ def apply_coupon_to_cart(
     coupon = coupon_repo.get_coupon_by_code(session, coupon_code)
     if not coupon:
         raise ValueError("Coupon not found")
+    
+    # Automatic coupons apply themselves — they cannot be typed in as codes
+    if coupon.coupon_type == CouponType.AUTOMATIC:
+        raise ValueError(
+            "This coupon is applied automatically and cannot be entered as a code"
+        )
     
     # Calculate cart subtotal
     subtotal = sum(item.price_at_add * item.quantity for item in cart.items)

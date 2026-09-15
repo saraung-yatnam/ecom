@@ -41,6 +41,8 @@ class UserRead(BaseModel):
     is_active: bool
     email_verified: bool
     auth_provider: str = "email"
+    push_notifications_enabled: bool = True
+    email_notifications_enabled: bool = True
     created_at: datetime
     updated_at: datetime
 
@@ -65,6 +67,8 @@ class UserUpdateProfile(BaseModel):
     full_name: str | None = None
     phone: str | None = None
     username: str | None = None
+    push_notifications_enabled: bool | None = None
+    email_notifications_enabled: bool | None = None
 
     @field_validator("username")
     @classmethod

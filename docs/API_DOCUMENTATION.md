@@ -2,7 +2,7 @@
 
 > **Handover document for Frontend Developers**
 > Framework: FastAPI (Python 3.12) + SQLModel + PostgreSQL
-> Last updated: 2026-09-02 — generated from source code (`app/api/v1/**`, `app/schemas/**`)
+> Last updated: 2026-09-10 — generated from source code (`app/api/v1/**`, `app/schemas/**`)
 
 ---
 
@@ -28,17 +28,18 @@
 18. [Email — `/email`](#18-email--email)
 19. [Analytics — `/analytics`](#19-analytics--analytics)
 20. [Chat — `/chat`](#20-chat--chat)
-21. [Admin — `/admin/*`](#21-admin--admin)
-22. [Enums & Status Values Reference](#22-enums--status-values-reference)
-23. [Business Rules (Pricing / COD / Refunds)](#23-business-rules-pricing--cod--refunds)
-24. [Typical Frontend Flows](#24-typical-frontend-flows)
-25. [Endpoint Quick-Reference Table](#25-endpoint-quick-reference-table)
+21. [Notifications — `/notifications`](#21-notifications--notifications)
+22. [Admin — `/admin/*`](#22-admin--admin)
+23. [Enums & Status Values Reference](#23-enums--status-values-reference)
+24. [Business Rules (Pricing / COD / Refunds)](#24-business-rules-pricing--cod--refunds)
+25. [Typical Frontend Flows](#25-typical-frontend-flows)
+26. [Endpoint Quick-Reference Table](#26-endpoint-quick-reference-table)
 
 ---
 
 ## 1. Overview & Base URL
 
-This is a full e-commerce backend: auth (email + Google), catalog, cart (guest + user), checkout, online payments (Razorpay) + Cash-on-Delivery, orders with cancellation/refunds, reviews, wishlist, coupons, an AI customer-support chatbot (Google Gemini), analytics, and an admin suite.
+This is a full e-commerce backend: auth (email + Google OTP), catalog, cart (guest + user), checkout, online payments (Razorpay) + Cash-on-Delivery, orders with cancellation/refunds, reviews, wishlist, coupons, an AI customer-support chatbot (Google Gemini), in-app notifications (REST + WebSocket), analytics, and an admin suite.
 
 | Item | Value |
 |---|---|
@@ -200,7 +201,7 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 | Code | Meaning |
 |---|---|
 | 200 | OK (default) |
-| 201 | Created (register, create product/category/address/order/coupon…) |
+| 201 | Created (create product/category/address/order/coupon, add to cart…) |
 | 204 | No Content — **empty body** (logout, deletes) |
 | 400 | Bad request / business rule violated (body `detail` explains) |
 | 401 | Missing/invalid/expired token, bad credentials, invalid refresh token |
@@ -208,19 +209,53 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 | 404 | Resource not found |
 | 409 | Conflict — duplicate slug/SKU (categories, variants) |
 | 422 | Request body/query failed schema validation |
+| 429 | Rate limit exceeded (OTP: max 3 emails/hour per address) |
 | 500 | Unhandled server error |
 
 ---
 
 ## 5. Auth Module — `/auth`
 
-### 5.1 `POST /auth/register` — Create account 🔓 Public
+### 5.1 Registration (OTP flow) 🔓 Public
 
-**Request body** (`UserCreate`):
+Registration is now **OTP-verified** (the old single `POST /auth/register` call was removed). There are **three steps**:
+
+```
+Step 1 ─▶ POST /auth/register/initiate   { email }                ─▶ OTP sent to inbox
+Step 2 ─▶ POST /auth/register/verify     { email, otp_code, username, password, full_name?, phone? } ─▶ account created ✅
+Optional ─▶ POST /auth/register/resend-otp { email }              ─▶ new OTP sent
+```
+
+#### 5.1.1 `POST /auth/register/initiate` — Request signup OTP
+
+**Request body** (`OTPInitiateRequest`):
+
+```json
+{ "email": "user@example.com" }
+```
+
+**Response `200`:**
+
+```json
+{
+  "message": "OTP sent to your email",
+  "email": "user@example.com",
+  "expires_in": "10 minutes"
+}
+```
+
+**Errors:**
+- `400 Email already registered`
+- `429 Too many OTP requests. Please wait 1 hour.` (max **3 OTP emails per hour** per address)
+
+#### 5.1.2 `POST /auth/register/verify` — Verify OTP & create account
+
+**Request body** (`OTPVerifyRequest`):
 
 ```json
 {
   "email": "user@example.com",
+  "otp_code": "123456",
   "username": "john_doe",
   "password": "min-8-chars",
   "full_name": "John Doe",
@@ -230,21 +265,35 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 
 | Field | Type | Rules |
 |---|---|---|
-| `email` | string | valid email, unique |
+| `email` | string | valid email, unique, must match the one from initiate |
+| `otp_code` | string | the 6-digit code from the email |
 | `username` | string | unique; only letters, numbers, underscore |
 | `password` | string | **min 8 characters** |
 | `full_name` | string? | optional |
 | `phone` | string? | optional |
 
-**Response `201`** (`UserRead`) — same shape as `GET /auth/me` below. New users get `role: "customer"`.
+OTPs expire after **10 minutes** and are **single-use**; a wrong attempt also counts against a failed-attempt limiter.
 
-**Errors:** `400 Email already registered` · `400 Username already taken` · `422` validation
+**Response `200`:**
 
-> A welcome email is sent automatically (if SendGrid is configured).
+```json
+{
+  "message": "Account created successfully",
+  "user": { "id": "uuid", "email": "user@example.com", "username": "john_doe", "full_name": "John Doe" }
+}
+```
+
+New users get `role: "customer"`. A welcome email is sent automatically (if SendGrid is configured).
+
+**Errors:** `400 Email already registered` · `400 Username already taken` · `400 Invalid or expired OTP` · `422` validation
+
+#### 5.1.3 `POST /auth/register/resend-otp` — Resend signup OTP
+
+Same body as initiate — `{ "email": "…" }`. **Response `200`** with the same shape as 5.1.1 (`"OTP resent to your email"`). Same rate limit (`429`) applies.
 
 ---
 
-### 5.2 `POST /auth/login` — Email + password 🔓 Public
+### 5.4 `POST /auth/login` — Email + password 🔓 Public
 
 **Request body** (`UserLogin`):
 
@@ -261,7 +310,7 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 
 ---
 
-### 5.3 `POST /auth/refresh` — Rotate tokens 🔓 Public
+### 5.5 `POST /auth/refresh` — Rotate tokens 🔓 Public
 
 **Request body:**
 
@@ -275,7 +324,7 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 
 ---
 
-### 5.4 `POST /auth/logout` — Revoke session 🔓 Public (token of that session)
+### 5.6 `POST /auth/logout` — Revoke session 🔓 Public (token of that session)
 
 **Request body:** same as refresh — `{ "refresh_token": "…" }`
 
@@ -285,7 +334,7 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 
 ---
 
-### 5.5 `GET /auth/me` — Current user 🔒 Bearer
+### 5.7 `GET /auth/me` — Current user 🔒 Bearer
 
 **Response `200`** (`UserRead`):
 
@@ -311,7 +360,7 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 
 ---
 
-### 5.6 `PUT /auth/profile` — Update profile 🔒 Bearer
+### 5.8 `PUT /auth/profile` — Update profile 🔒 Bearer
 
 **Request body** (`UserUpdateProfile`) — all fields optional:
 
@@ -325,7 +374,7 @@ CORS headers are always attached — even on 500s — so the browser shows the r
 
 ---
 
-### 5.7 `POST /auth/google` — Sign in with Google 🔓 Public
+### 5.9 `POST /auth/google` — Sign in with Google 🔓 Public
 
 Frontend gets a Google **ID token** (e.g. via Google Identity Services / "Sign in with Google" button), then exchanges it here.
 
@@ -341,7 +390,7 @@ Frontend gets a Google **ID token** (e.g. via Google Identity Services / "Sign i
 
 ---
 
-### 5.8 `POST /auth/set-password` — Google users add a password 🔒 Bearer
+### 5.10 `POST /auth/set-password` — Google users add a password 🔒 Bearer
 
 Only for users who have **no password yet** (Google-only).
 
@@ -361,7 +410,7 @@ Only for users who have **no password yet** (Google-only).
 
 ---
 
-### 5.9 `POST /auth/forgot-password` — Request reset link 🔓 Public
+### 5.11 `POST /auth/forgot-password` — Request reset link 🔓 Public
 
 **Request body:**
 
@@ -379,7 +428,7 @@ Only for users who have **no password yet** (Google-only).
 
 ---
 
-### 5.10 `POST /auth/reset-password` — Set new password with token 🔓 Public
+### 5.12 `POST /auth/reset-password` — Set new password with token 🔓 Public
 
 **Request body** (`ResetPasswordRequest`):
 
@@ -397,7 +446,7 @@ Only for users who have **no password yet** (Google-only).
 
 ---
 
-### 5.11 `POST /auth/change-password` — Change password (logged in) 🔒 Bearer
+### 5.13 `POST /auth/change-password` — Change password (logged in) 🔒 Bearer
 
 **Request body** (`ChangePasswordRequest`):
 
@@ -650,7 +699,7 @@ Cart works **with or without login** (see §2.4). Every cart endpoint returns th
 }
 ```
 
-Totals rules: `subtotal` = Σ(price_at_add × qty) · tax = **18% GST** on (subtotal − discount) · shipping = **free ≥ ₹1000** else **₹50** · `total` = subtotal − discount + tax + shipping (see §23).
+Totals rules: `subtotal` = Σ(price_at_add × qty) · tax = **18% GST** on (subtotal − discount) · shipping = **free ≥ ₹1000** else **₹50** · `total` = subtotal − discount + tax + shipping (see §24).
 
 ### 9.1 `GET /cart` — Get cart 🍪/🔒 optional auth
 
@@ -885,13 +934,18 @@ All endpoints 🔒 Bearer. Users only see **their own** orders.
       "quantity": 2,
       "unit_price": "1299.00",
       "line_total": "2598.00",
-      "created_at": "…"
+      "created_at": "…",
+      "product_id": "product-uuid",
+      "product_slug": "classic-white-t-shirt",
+      "product_image": "https://cdn.example.com/img-hero.jpg"
     }
   ]
 }
 ```
 
 > **Note:** `cod_fee` is present on the checkout response but not in this list schema; `restocking_fee_percentage` (float, e.g. 5.0) is returned inside refund responses only.
+>
+> **Item product fields:** order items are purchase-time snapshots, so `product_id`, `product_slug` and `product_image` are resolved live from the item's variant → product. `product_image` is the product's **first image** (lowest `sort_order`). All three are `null` if the catalog product/variant was removed after purchase.
 
 ### 12.1 `GET /orders` — My orders
 Query: `?skip=0&limit=20`. **Response `200`:** array of `OrderRead`.
@@ -904,7 +958,7 @@ Query: `?skip=0&limit=20`. **Response `200`:** array of `OrderRead`.
 
 ### 12.4 `POST /orders/{order_id}/cancel` — Cancel order 🔒 Bearer
 
-Allowed while status is `pending`, `confirmed` or `processing`. Stock is restored. COD orders are simply cancelled; paid online orders get a Razorpay refund minus a **restocking fee** (0% pending / 5% confirmed / 15% processing — see §23).
+Allowed while status is `pending`, `confirmed` or `processing`. Stock is restored. COD orders are simply cancelled; paid online orders get a Razorpay refund minus a **restocking fee** (0% pending / 5% confirmed / 15% processing — see §24).
 
 **Request body** (`CancelOrderRequest`) — optional:
 
@@ -1203,9 +1257,82 @@ AI customer-support chatbot powered by **Google Gemini** (`GEMINI_API_KEY`; mode
 
 ---
 
-## 21. Admin — `/admin/*`
+## 21. Notifications — `/notifications`
 
-### 21.1 Dashboard — `GET /admin/dashboard` 🔒 manager/admin
+Persisted in-app notification feed (`notifications` table, backed by a WebSocket for real-time).
+- **Admins/managers** receive `order_placed` / `order_cancelled` events.
+- **Customers** receive `order_status` updates (from the admin lifecycle) and **promotions** (from admin broadcasts, §22.6).
+
+**NotificationRead shape:**
+
+```json
+{
+  "id": "uuid",
+  "type": "order_status",
+  "title": "Order shipped",
+  "message": "Your order ORD-20260902-1234 has been shipped.",
+  "link": "/orders/3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "order_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "is_read": false,
+  "created_at": "2026-09-10T12:00:00.000000+00:00"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | string | `order_placed` · `order_cancelled` · `order_status` · `promotion` |
+| `title` | string | short heading |
+| `message` | string? | body text, may be null |
+| `link` | string? | deep-link for the frontend to navigate to |
+| `order_id` | UUID? | present on order-related notifications |
+| `is_read` | bool | `false` by default |
+
+All REST endpoints below 🔒 Bearer — the feed is the source of truth; the WebSocket is real-time sugar on top of the same table.
+
+### 21.1 `GET /notifications` — Notification feed
+
+Query: `?skip=0&limit=20&unread_only=false`. Newest first.
+
+**Response `200`** (`NotificationListResponse`):
+
+```json
+{
+  "items": [ { "<NotificationRead>" } ],
+  "total": 42,
+  "unread_count": 5
+}
+```
+
+### 21.2 `GET /notifications/unread-count` — Unread count
+
+**Response `200`:** `{ "count": 5 }`
+
+### 21.3 `PUT /notifications/mark-all-read` — Mark all as read
+
+**Response `200`:** `{ "updated": 42 }`
+
+### 21.4 `PUT /notifications/{notification_id}/read` — Mark one as read
+
+**Response `200`:** `NotificationRead` (with `is_read: true`).
+**Errors:** `404 Notification not found`
+
+### 21.5 `DELETE /notifications/{notification_id}` — Delete a notification
+
+**Response `200`:** `{ "ok": true }`. **Errors:** `404 Notification not found`
+
+### 21.6 WebSocket `/notifications/ws` — Real-time feed 🔒 JWT query param
+
+- URL: `ws://…/api/v1/notifications/ws?token=<jwt>`
+- Browsers can't set `Authorization` headers on WebSockets, so pass the **access token as the `?token=` query param**.
+- On connect the server replies `{ "type": "connected", "user_id": "…", "message": "Successfully registered" }`.
+- **Keep-alive:** client sends `ping` → server replies `pong`. Any other client frame is ignored.
+- **Close code `4401`** = missing / invalid / unknown-or-inactive-user token → refresh the token and reconnect.
+
+---
+
+## 22. Admin — `/admin/*`
+
+### 22.1 Dashboard — `GET /admin/dashboard` 🔒 manager/admin
 
 **Response `200`:**
 
@@ -1215,12 +1342,12 @@ AI customer-support chatbot powered by **Google Gemini** (`GEMINI_API_KEY`; mode
   "orders":    { "total_orders": 0, "pending_orders": 0, "confirmed_orders": 0, "processing_orders": 0, "shipped_orders": 0, "delivered_orders": 0, "cancelled_orders": 0, "refunded_orders": 0, "total_revenue": 0.0 },
   "revenue":   { "today": {...}, "this_week": {...}, "this_month": {...}, "total": {...} },
   "total_products": 0,
-  "recent_orders": [ { "...order fields as in §21.2 items..." } ],
+  "recent_orders": [ { "...order fields as in §22.2 items..." } ],
   "timestamp": "2026-08-29T12:00:00.000000"
 }
 ```
 
-### 21.2 Admin Orders 🔒 manager/admin — `/admin/orders`
+### 22.2 Admin Orders 🔒 manager/admin — `/admin/orders`
 
 **`GET /admin/orders`** — query: `page=1`, `limit=20` (≤100), `status` (order status string), `search` (order number / customer), `from_date`, `to_date` (`YYYY-MM-DD`).
 
@@ -1265,9 +1392,9 @@ AI customer-support chatbot powered by **Google Gemini** (`GEMINI_API_KEY`; mode
 - **`400 Order cannot be cancelled. Current status: shipped|delivered`** when trying to cancel an order that has shipped.
 - ⚠️ Setting `refunded` here only changes the label — no money moves. Use the user-cancel flow (`POST /orders/{id}/cancel`) for real Razorpay refunds.
 
-### 21.3 Admin Users 🔒 **admin** — `/admin/users`
+### 22.3 Admin Users 🔒 **admin** — `/admin/users`
 
-**`AdminUserRead` shape** (same fields as `UserRead` in §5.5):
+**`AdminUserRead` shape** (same fields as `UserRead` in §5.7):
 
 ```json
 { "id": "uuid", "email": "…", "username": "…", "role": "customer", "full_name": "…", "phone": "…", "is_active": true, "email_verified": true, "auth_provider": "email", "created_at": "…", "updated_at": "…" }
@@ -1277,6 +1404,8 @@ AI customer-support chatbot powered by **Google Gemini** (`GEMINI_API_KEY`; mode
 |---|---|---|
 | `GET /admin/users` | `?page=1&limit=20&search=&role=customer&is_active=true` | `{ "users": [AdminUserRead…], "total": 0, "page": 1, "limit": 20, "total_pages": 0 }` |
 | `GET /admin/users/stats` | — | `{ "total_users": 0, "active_users": 0, "inactive_users": 0, "admin_users": 0, "staff_users": 0, "manager_users": 0, "customer_users": 0, "google_users": 0, "email_users": 0, "both_users": 0 }` |
+| `GET /admin/users/{user_id}/stats` | — | `{ "user_id": "uuid", "total_orders": 0, "total_spent": 0.0, "gross_total": 0.0, "refunded_total": 0.0, "average_order_value": 0.0, "total_items_purchased": 0, "first_order": null, "last_order": null, "status_breakdown": { "pending": 0, "confirmed": 0, "processing": 0, "shipped": 0, "delivered": 0, "cancelled": 0, "refunded": 0 }, "most_ordered_product": null }` / `404 User not found` |
+| `GET /admin/users/{user_id}/addresses` | — | `[AddressRead…]` (same shape as §11) / `404 User not found` |
 | `GET /admin/users/{user_id}` | — | `AdminUserRead` / `404 User not found` |
 | `PUT /admin/users/{user_id}/role` | `{ "role": "staff" }` (also accepts `full_name`, `phone`) | `AdminUserRead` / `400 Cannot change your own role` |
 | `PUT /admin/users/{user_id}/status` | `{ "is_active": false }` | `AdminUserRead` / `400 Cannot deactivate your own account` |
@@ -1284,7 +1413,22 @@ AI customer-support chatbot powered by **Google Gemini** (`GEMINI_API_KEY`; mode
 
 `role` ∈ `customer | staff | manager | admin`.
 
-### 21.4 Admin Products 🔒 — `/admin/products`
+**Per-user lifetime stats** — `GET /admin/users/{user_id}/stats` (🔒 **admin**):
+
+- `total_orders` — all orders ever placed by this user.
+- `total_spent` — sum of `grand_total` for orders **excluding** `cancelled` / `refunded` (this is the number to show in a "Total Spent" card).
+- `gross_total` — sum of `grand_total` across *every* order (incl. cancelled/refunded).
+- `refunded_total` — sum of `refund_amount` refunded so far.
+- `average_order_value` — `total_spent / total_orders` (0.0 if no orders).
+- `total_items_purchased` — sum of item quantities across all orders.
+- `first_order` / `last_order` — ISO timestamps, `null` when the user has **no orders** ("Last Order: Never").
+- `most_ordered_product` — snapshot product name with the highest total quantity ordered.
+
+> 💡 Money fields here are **numbers** (`float`), matching the raw-dict admin/analytics convention.
+
+**Per-user addresses** — `GET /admin/users/{user_id}/addresses` (🔒 **admin**): returns the target user's saved addresses as an array of `AddressRead` (same shape as the customer-facing `GET /addresses`, §11.1). ⚠️ Do **not** try `GET /addresses?user_id=…` — that endpoint ignores `user_id` and only returns the *current* user's own addresses.
+
+### 22.4 Admin Products 🔒 — `/admin/products`
 
 | Endpoint | Auth | Query / Body | Response |
 |---|---|---|---|
@@ -1296,7 +1440,7 @@ AI customer-support chatbot powered by **Google Gemini** (`GEMINI_API_KEY`; mode
 
 Both bulk endpoints return `400 No product IDs provided` when the list is empty.
 
-### 21.5 Admin COD (Cash on Delivery) 🔒 manager/admin — `/admin/cod`
+### 22.5 Admin COD (Cash on Delivery) 🔒 manager/admin — `/admin/cod`
 
 COD lifecycle: checkout (`payment_method=cod`) → order `status=confirmed`, `payment_status=cod_pending` → cash collected on delivery → `POST /admin/cod/orders/{id}/collect` → `payment_status=paid`.
 
@@ -1334,9 +1478,60 @@ COD lifecycle: checkout (`payment_method=cod`) → order `status=confirmed`, `pa
 
 **Errors:** `404 Order not found` · `400 Order was not placed with Cash on Delivery` · `400 COD payment already collected` · `400 Cannot collect COD for order with payment_status '…'` · `400 Cannot collect COD for a cancelled order`
 
+### 22.6 Admin Notifications 🔒 manager/admin — `/admin/notifications`
+
+Promotional broadcasts push a notification into **every active customer's** feed (type `promotion`, visible via the customer feed in §21).
+
+**`POST /admin/notifications/promotional`** — send a message to all active customers:
+
+**Request body** (`PromotionBroadcastRequest`):
+
+```json
+{
+  "title": "Big Sale — 40% off",
+  "message": "Use code BIG40 at checkout. Ends Sunday!",
+  "link": "/collections/sale"
+}
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `title` | string | required, 1–120 chars |
+| `message` | string | required, 1–500 chars |
+| `link` | string? | optional, ≤300 chars |
+
+**Response `200`** (`PromotionBroadcastResponse`):
+
+```json
+{
+  "broadcast_id": "uuid",
+  "title": "Big Sale — 40% off",
+  "message": "Use code BIG40 at checkout. Ends Sunday!",
+  "link": "/collections/sale",
+  "recipients_count": 512,
+  "created_at": "2026-09-10T10:00:00.000000+00:00"
+}
+```
+
+**`GET /admin/notifications/promotional`** — history of broadcasts:
+
+Query: `?skip=0&limit=20`. **Response `200`** — array of `PromotionHistoryItem` (newest first):
+
+```json
+[
+  { "id": "uuid", "title": "Big Sale — 40% off", "message": "…", "link": "/collections/sale", "recipients_count": 512, "created_at": "…" }
+]
+```
+
+**`DELETE /admin/notifications/promotional/{broadcast_id}`** — retract a broadcast (manager+). Deletes every recipient's `promotion` notification belonging to the broadcast and removes it from the history. **Response `200`** (`PromotionRetractResponse`):
+
+```json
+{ "deleted_count": 512 }
+```
+
 ---
 
-## 22. Enums & Status Values Reference
+## 23. Enums & Status Values Reference
 
 | Enum | Values |
 |---|---|
@@ -1363,7 +1558,7 @@ pending ──(payment confirmed)──▶ confirmed ──▶ processing ──
 
 ---
 
-## 23. Business Rules (Pricing / COD / Refunds)
+## 24. Business Rules (Pricing / COD / Refunds)
 
 Server-side configuration the frontend should not hardcode (ask backend for changes):
 
@@ -1384,26 +1579,29 @@ Server-side configuration the frontend should not hardcode (ask backend for chan
 
 ---
 
-## 24. Typical Frontend Flows
+## 25. Typical Frontend Flows
 
-### 24.1 Authentication flow
+### 25.1 Authentication flow
 
 ```
-Register ─▶ POST /auth/register ─▶ redirect to login
+Register (OTP):
+  1. POST /auth/register/initiate  { email } → OTP email
+  2. POST /auth/register/verify    { email, otp_code, username, password, full_name?, phone? } → account created
+  3. (resend if needed) POST /auth/register/resend-otp { email }
 Login     ─▶ POST /auth/login ─▶ save TokenPair
 Google    ─▶ Google button → id_token ─▶ POST /auth/google ─▶ save TokenPair
 Any 401   ─▶ POST /auth/refresh ─▶ save new pair ─▶ retry original call (401 again? → logout)
 Logout    ─▶ POST /auth/logout ─▶ clear tokens
 ```
 
-### 24.2 Guest → user cart
+### 25.2 Guest → user cart
 
 ```
 Guest: generate X-Cart-Session-ID, POST /cart/items …
 Login: tokens stored; subsequent cart calls (Bearer) resolve the user's cart.
 ```
 
-### 24.3 Checkout — online payment (Razorpay)
+### 25.3 Checkout — online payment (Razorpay)
 
 ```
 1. POST /addresses             (if needed)
@@ -1414,14 +1612,14 @@ Login: tokens stored; subsequent cart calls (Bearer) resolve the user's cart.
 6. GET /orders/{id} to show the confirmed order
 ```
 
-### 24.4 Checkout — Cash on Delivery
+### 25.4 Checkout — Cash on Delivery
 
 ```
 1. POST /checkout {…, payment_method:"cod"} → 201 (status:"confirmed", payment_status:"cod_pending", cod_fee added)
 2. Done — no payment calls. Show "Pay ₹X on delivery".
 ```
 
-### 24.5 Cancel & refund
+### 25.5 Cancel & refund
 
 ```
 POST /orders/{id}/cancel {reason?} → CancelOrderResponse (refund.processed = true for paid online orders)
@@ -1430,107 +1628,120 @@ Poll GET /orders/{id}/refund-status → display response.message
 
 ---
 
-## 25. Endpoint Quick-Reference Table
+## 26. Endpoint Quick-Reference Table
 
 | # | Method & Path | Auth | Purpose |
 |---|---|---|---|
-| 1 | `POST /auth/register` | 🔓 | Create account |
-| 2 | `POST /auth/login` | 🔓 | Email login → TokenPair |
-| 3 | `POST /auth/refresh` | 🔓 | Rotate tokens |
-| 4 | `POST /auth/logout` | 🔓 | Revoke refresh token (204) |
-| 5 | `GET /auth/me` | 🔒 | Current user |
-| 6 | `PUT /auth/profile` | 🔒 | Update profile |
-| 7 | `POST /auth/google` | 🔓 | Google sign-in |
-| 8 | `POST /auth/set-password` | 🔒 | Google user adds password |
-| 9 | `POST /auth/forgot-password` | 🔓 | Send reset link |
-| 10 | `POST /auth/reset-password` | 🔓 | Reset with token |
-| 11 | `POST /auth/change-password` | 🔒 | Change password |
-| 12 | `GET /products/` | 🔓 | List products (filters/sort/page) |
-| 13 | `GET /products/{slug}` | 🔓 | Product detail |
-| 14 | `POST /products/` | staff+ | Create product |
-| 15 | `PUT /products/{id}` | staff+ | Update product |
-| 16 | `DELETE /products/{id}` | staff+ | Delete product (204) |
-| 17 | `GET /products/{id}/variants` | 🔓 | List variants |
-| 18 | `POST /products/{id}/variants` | staff+ | Create variant |
-| 19 | `PUT /products/{id}/variants/{vid}` | staff+ | Update variant |
-| 20 | `DELETE /products/{id}/variants/{vid}` | staff+ | Delete variant (204) |
-| 21 | `GET /products/{id}/images` | 🔓 | List images |
-| 22 | `POST /products/{id}/images` | staff+ | Add image |
-| 23 | `PUT /products/{id}/images/{iid}` | staff+ | Update image |
-| 24 | `DELETE /products/{id}/images/{iid}` | staff+ | Delete image (204) |
-| 25 | `POST /products/{id}/images/reorder` | staff+ | Reorder (query params) |
-| 26 | `GET /categories` | 🔓 | List categories |
-| 27 | `GET /categories/{id}` | 🔓 | Category detail |
-| 28 | `POST /categories` | mgr+ | Create category |
-| 29 | `PUT /categories/{id}` | mgr+ | Update category |
-| 30 | `DELETE /categories/{id}` | mgr+ | Delete category (204) |
-| 31 | `GET /cart` | opt | Get cart (guest session or user) |
-| 32 | `POST /cart/items` | opt | Add item (201) |
-| 33 | `PUT /cart/items/{item_id}` | opt | Update quantity |
-| 34 | `DELETE /cart/items/{item_id}` | opt | Remove item |
-| 35 | `DELETE /cart` | opt | Clear cart |
-| 36 | `POST /cart/coupon` | opt | Apply coupon |
-| 37 | `DELETE /cart/coupon` | opt | Remove coupon |
-| 38 | `POST /checkout` | 🔒 | Cart → order (201) |
-| 39 | `GET /checkout/config` | 🔓 | Checkout pricing config (COD fee/limits, shipping, tax rate) |
-| 40 | `GET /addresses` | 🔒 | List my addresses |
-| 41 | `POST /addresses` | 🔒 | Create address (201) |
-| 42 | `PUT /addresses/{id}` | 🔒 | Update address |
-| 43 | `DELETE /addresses/{id}` | 🔒 | Delete address (204) |
-| 44 | `POST /addresses/default/{id}` | 🔒 | Set default |
-| 45 | `GET /orders` | 🔒 | My orders |
-| 46 | `GET /orders/{id}` | 🔒 | Order detail |
-| 47 | `GET /orders/number/{order_number}` | 🔒 | Order by number |
-| 48 | `POST /orders/{id}/cancel` | 🔒 | Cancel (+ refund) |
-| 49 | `GET /orders/{id}/refund-status` | 🔒 | Refund status |
-| 50 | `POST /payments/create-intent` | 🔒 | Start online payment |
-| 51 | `POST /payments/confirm` | 🔒 | Confirm payment |
-| 52 | `POST /webhooks/payment` | signature | Razorpay only — not frontend |
-| 53 | `POST /reviews/{product_id}` | 🔒 | Create review |
-| 54 | `GET /reviews/products/{id}` | 🔓 | Product reviews |
-| 55 | `GET /reviews/product/{id}/rating` | 🔓 | Average rating |
-| 56 | `GET /reviews/my-reviews` | 🔒 | My reviews |
-| 57 | `PUT /reviews/{review_id}` | 🔒 | Update my review |
-| 58 | `DELETE /reviews/{review_id}` | 🔒 | Delete my review (204) |
-| 59 | `GET /wishlist` | 🔒 | My wishlist |
-| 60 | `POST /wishlist/{product_id}` | 🔒 | Add to wishlist (201) |
-| 61 | `DELETE /wishlist/{product_id}` | 🔒 | Remove (204) |
-| 62 | `GET /wishlist/check/{product_id}` | 🔒 | In wishlist? |
-| 63 | `POST /coupons/validate` | 🔓 | Validate code |
-| 64 | `GET /coupons` | mgr+ | List coupons |
-| 65 | `GET /coupons/{id}` | mgr+ | Coupon detail |
-| 66 | `POST /coupons` | mgr+ | Create coupon (201) |
-| 67 | `PUT /coupons/{id}` | mgr+ | Update coupon |
-| 68 | `DELETE /coupons/{id}` | mgr+ | Delete coupon (204) |
-| 69 | `POST /coupons/generate` | mgr+ | Generate code |
-| 70 | `POST /email/test` | mgr+ | Send test email |
-| 71 | `GET /analytics/dashboard` | mgr+ | Dashboard stats |
-| 72 | `GET /analytics/sales` | mgr+ | Sales report |
-| 73 | `GET /analytics/top-products` | mgr+ | Top products |
-| 74 | `GET /analytics/orders` | mgr+ | Order stats |
-| 75 | `GET /analytics/revenue` | mgr+ | Revenue report |
-| 76 | `GET /analytics/customers` | mgr+ | Customer summary |
-| 77 | `GET /admin/dashboard` | mgr+ | Admin overview |
-| 78 | `GET /admin/orders` | mgr+ | All orders (paginated) |
-| 79 | `GET /admin/orders/stats` | mgr+ | Order stats |
-| 80 | `GET /admin/orders/{id}` | mgr+ | Order detail |
-| 81 | `PUT /admin/orders/{id}/status` | mgr+ | Update status |
-| 82 | `GET /admin/users` | admin | All users (paginated) |
-| 83 | `GET /admin/users/stats` | admin | User stats |
-| 84 | `GET /admin/users/{id}` | admin | User detail |
-| 85 | `PUT /admin/users/{id}/role` | admin | Change role |
-| 86 | `PUT /admin/users/{id}/status` | admin | Activate/deactivate |
-| 87 | `DELETE /admin/users/{id}` | admin | Delete user (204) |
-| 88 | `GET /admin/products` | mgr+ | All products (paginated) |
-| 89 | `GET /admin/products/export` | admin | Export JSON |
-| 90 | `GET /admin/products/{id}` | mgr+ | Product detail |
-| 91 | `POST /admin/products/bulk-delete` | admin | Bulk delete (query params) |
-| 92 | `POST /admin/products/bulk-update-status` | admin | Bulk active toggle (query params) |
-| 93 | `GET /admin/cod/pending` | mgr+ | COD awaiting collection |
-| 94 | `POST /admin/cod/orders/{id}/collect` | mgr+ | Mark COD collected |
-| 95 | `POST /chat` | 🔓 | AI chatbot reply |
-| 96 | `GET /chat/history` | 🔓 | Chat history (stateless — `[]`) |
-| 97 | `DELETE /chat/history` | 🔓 | Clear history |
+| 1 | `POST /auth/register/initiate` | 🔓 | Step 1: request signup OTP |
+| 2 | `POST /auth/register/verify` | 🔓 | Step 2: verify OTP & create account |
+| 3 | `POST /auth/register/resend-otp` | 🔓 | Resend signup OTP |
+| 4 | `POST /auth/login` | 🔓 | Email login → TokenPair |
+| 5 | `POST /auth/refresh` | 🔓 | Rotate tokens |
+| 6 | `POST /auth/logout` | 🔓 | Revoke refresh token (204) |
+| 7 | `GET /auth/me` | 🔒 | Current user |
+| 8 | `PUT /auth/profile` | 🔒 | Update profile |
+| 9 | `POST /auth/google` | 🔓 | Google sign-in |
+| 10 | `POST /auth/set-password` | 🔒 | Google user adds password |
+| 11 | `POST /auth/forgot-password` | 🔓 | Send reset link |
+| 12 | `POST /auth/reset-password` | 🔓 | Reset with token |
+| 13 | `POST /auth/change-password` | 🔒 | Change password |
+| 14 | `GET /products/` | 🔓 | List products (filters/sort/page) |
+| 15 | `GET /products/{slug}` | 🔓 | Product detail |
+| 16 | `POST /products/` | staff+ | Create product |
+| 17 | `PUT /products/{id}` | staff+ | Update product |
+| 18 | `DELETE /products/{id}` | staff+ | Delete product (204) |
+| 19 | `GET /products/{id}/variants` | 🔓 | List variants |
+| 20 | `POST /products/{id}/variants` | staff+ | Create variant |
+| 21 | `PUT /products/{id}/variants/{vid}` | staff+ | Update variant |
+| 22 | `DELETE /products/{id}/variants/{vid}` | staff+ | Delete variant (204) |
+| 23 | `GET /products/{id}/images` | 🔓 | List images |
+| 24 | `POST /products/{id}/images` | staff+ | Add image |
+| 25 | `PUT /products/{id}/images/{iid}` | staff+ | Update image |
+| 26 | `DELETE /products/{id}/images/{iid}` | staff+ | Delete image (204) |
+| 27 | `POST /products/{id}/images/reorder` | staff+ | Reorder (query params) |
+| 28 | `GET /categories` | 🔓 | List categories |
+| 29 | `GET /categories/{id}` | 🔓 | Category detail |
+| 30 | `POST /categories` | mgr+ | Create category |
+| 31 | `PUT /categories/{id}` | mgr+ | Update category |
+| 32 | `DELETE /categories/{id}` | mgr+ | Delete category (204) |
+| 33 | `GET /cart` | opt | Get cart (guest session or user) |
+| 34 | `POST /cart/items` | opt | Add item (201) |
+| 35 | `PUT /cart/items/{item_id}` | opt | Update quantity |
+| 36 | `DELETE /cart/items/{item_id}` | opt | Remove item |
+| 37 | `DELETE /cart` | opt | Clear cart |
+| 38 | `POST /cart/coupon` | opt | Apply coupon |
+| 39 | `DELETE /cart/coupon` | opt | Remove coupon |
+| 40 | `POST /checkout` | 🔒 | Cart → order (201) |
+| 41 | `GET /checkout/config` | 🔓 | Checkout pricing config (COD fee/limits, shipping, tax rate) |
+| 42 | `GET /addresses` | 🔒 | List my addresses |
+| 43 | `POST /addresses` | 🔒 | Create address (201) |
+| 44 | `PUT /addresses/{id}` | 🔒 | Update address |
+| 45 | `DELETE /addresses/{id}` | 🔒 | Delete address (204) |
+| 46 | `POST /addresses/default/{id}` | 🔒 | Set default |
+| 47 | `GET /orders` | 🔒 | My orders |
+| 48 | `GET /orders/{id}` | 🔒 | Order detail |
+| 49 | `GET /orders/number/{order_number}` | 🔒 | Order by number |
+| 50 | `POST /orders/{id}/cancel` | 🔒 | Cancel (+ refund) |
+| 51 | `GET /orders/{id}/refund-status` | 🔒 | Refund status |
+| 52 | `POST /payments/create-intent` | 🔒 | Start online payment |
+| 53 | `POST /payments/confirm` | 🔒 | Confirm payment |
+| 54 | `POST /webhooks/payment` | signature | Razorpay only — not frontend |
+| 55 | `POST /reviews/{product_id}` | 🔒 | Create review |
+| 56 | `GET /reviews/products/{id}` | 🔓 | Product reviews |
+| 57 | `GET /reviews/product/{id}/rating` | 🔓 | Average rating |
+| 58 | `GET /reviews/my-reviews` | 🔒 | My reviews |
+| 59 | `PUT /reviews/{review_id}` | 🔒 | Update my review |
+| 60 | `DELETE /reviews/{review_id}` | 🔒 | Delete my review (204) |
+| 61 | `GET /wishlist` | 🔒 | My wishlist |
+| 62 | `POST /wishlist/{product_id}` | 🔒 | Add to wishlist (201) |
+| 63 | `DELETE /wishlist/{product_id}` | 🔒 | Remove (204) |
+| 64 | `GET /wishlist/check/{product_id}` | 🔒 | In wishlist? |
+| 65 | `POST /coupons/validate` | 🔓 | Validate code |
+| 66 | `GET /coupons` | mgr+ | List coupons |
+| 67 | `GET /coupons/{id}` | mgr+ | Coupon detail |
+| 68 | `POST /coupons` | mgr+ | Create coupon (201) |
+| 69 | `PUT /coupons/{id}` | mgr+ | Update coupon |
+| 70 | `DELETE /coupons/{id}` | mgr+ | Delete coupon (204) |
+| 71 | `POST /coupons/generate` | mgr+ | Generate code |
+| 72 | `POST /email/test` | mgr+ | Send test email |
+| 73 | `GET /analytics/dashboard` | mgr+ | Dashboard stats |
+| 74 | `GET /analytics/sales` | mgr+ | Sales report |
+| 75 | `GET /analytics/top-products` | mgr+ | Top products |
+| 76 | `GET /analytics/orders` | mgr+ | Order stats |
+| 77 | `GET /analytics/revenue` | mgr+ | Revenue report |
+| 78 | `GET /analytics/customers` | mgr+ | Customer summary |
+| 79 | `GET /admin/dashboard` | mgr+ | Admin overview |
+| 80 | `GET /admin/orders` | mgr+ | All orders (paginated) |
+| 81 | `GET /admin/orders/stats` | mgr+ | Order stats |
+| 82 | `GET /admin/orders/{id}` | mgr+ | Order detail |
+| 83 | `PUT /admin/orders/{id}/status` | mgr+ | Update status |
+| 84 | `GET /admin/users` | admin | All users (paginated) |
+| 85 | `GET /admin/users/stats` | admin | User stats |
+| 86 | `GET /admin/users/{id}/stats` | admin | Per-user order stats (orders, spent, last order) |
+| 87 | `GET /admin/users/{id}/addresses` | admin | User's saved addresses |
+| 88 | `GET /admin/users/{id}` | admin | User detail |
+| 89 | `PUT /admin/users/{id}/role` | admin | Change role |
+| 90 | `PUT /admin/users/{id}/status` | admin | Activate/deactivate |
+| 91 | `DELETE /admin/users/{id}` | admin | Delete user (204) |
+| 92 | `GET /admin/products` | mgr+ | All products (paginated) |
+| 93 | `GET /admin/products/export` | admin | Export JSON |
+| 94 | `GET /admin/products/{id}` | mgr+ | Product detail |
+| 95 | `POST /admin/products/bulk-delete` | admin | Bulk delete (query params) |
+| 96 | `POST /admin/products/bulk-update-status` | admin | Bulk active toggle (query params) |
+| 97 | `GET /admin/cod/pending` | mgr+ | COD awaiting collection |
+| 98 | `POST /admin/cod/orders/{id}/collect` | mgr+ | Mark COD collected |
+| 99 | `POST /admin/notifications/promotional` | mgr+ | Send promotional broadcast |
+| 100 | `GET /admin/notifications/promotional` | mgr+ | Broadcast history |
+| 101 | `DELETE /admin/notifications/promotional/{broadcast_id}` | mgr+ | Retract a broadcast |
+| 101 | `GET /notifications` | 🔒 | Notification feed |
+| 102 | `GET /notifications/unread-count` | 🔒 | Unread count |
+| 103 | `PUT /notifications/mark-all-read` | 🔒 | Mark all read |
+| 104 | `PUT /notifications/{id}/read` | 🔒 | Mark one read |
+| 105 | `DELETE /notifications/{id}` | 🔒 | Delete a notification |
+| 106 | `POST /chat` | 🔓 | AI chatbot reply |
+| 107 | `GET /chat/history` | 🔓 | Chat history (stateless — `[]`) |
+| 108 | `DELETE /chat/history` | 🔓 | Clear history |
+| WS | `WS /notifications/ws?token=<jwt>` | 🔒 | Real-time notification feed |
 
 **Legend:** 🔓 public · 🔒 Bearer token · opt — optional auth (guest session or Bearer) · staff+ / mgr+ / admin — minimum role required.
 

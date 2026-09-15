@@ -39,6 +39,21 @@ class CartItemRead(BaseModel):
     product_image: str | None = None
 
 
+class AutomaticCouponRead(BaseModel):
+    """Server-decided automatic coupon for the storefront (display only).
+
+    The backend evaluates every trigger and decides whether this coupon
+    applies and how much it is worth — the frontend only renders it.
+    """
+
+    code: str
+    discount_type: str
+    value: Decimal
+    discount_amount: Decimal
+    trigger_type: str
+    description: str
+
+
 class CartRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
@@ -46,6 +61,7 @@ class CartRead(BaseModel):
     items: list[CartItemRead] = Field(default_factory=list)
     subtotal: Decimal = Field(default=Decimal("0.00"))
     coupon_code: str | None = None
+    automatic_coupon: AutomaticCouponRead | None = None
     discount_total: Decimal = Field(default=Decimal("0.00"))
     tax_total: Decimal = Field(default=Decimal("0.00"))
     shipping_total: Decimal = Field(default=Decimal("0.00"))

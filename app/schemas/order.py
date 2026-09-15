@@ -3,9 +3,9 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 from enum import Enum
-from typing import Optional, List
+from typing import Any, Optional, List
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 # =========================================================
@@ -58,9 +58,15 @@ class AdminOrderAddressRead(OrderAddressRead):
 
 
 class OrderItemRead(BaseModel):
-    """Order item schema"""
+    """Order item schema
+
+    ``product_id``, ``product_slug`` and ``product_image`` are NOT stored on
+    the order-item snapshot — they are resolved live from the linked variant's
+    product (item -> variant -> product -> images) while serializing.
+    ``product_image`` is the product's first image (lowest ``sort_order``).
+    """
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: UUID
     product_name: str
     variant_sku: str
@@ -69,6 +75,51 @@ class OrderItemRead(BaseModel):
     unit_price: Decimal
     line_total: Decimal
     created_at: datetime
+
+    # Product info resolved from the variant's product (not part of the snapshot)
+    product_id: Optional[UUID] = None
+    product_slug: Optional[str] = None
+    product_image: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_product_info(cls, data: Any) -> Any:
+        """Resolve product slug + first image when validating an ORM OrderItem.
+
+        Order items are purchase-time snapshots (name / sku / attributes); the
+        slug and images live on the parent product, so they are read through
+        the relationship chain item -> variant -> product -> images.
+        """
+        if isinstance(data, dict):
+            return data  # plain dicts are used as-is (tests / manual payloads)
+
+        item: dict = {
+            "id": getattr(data, "id", None),
+            "product_name": getattr(data, "product_name", None),
+            "variant_sku": getattr(data, "variant_sku", None),
+            "variant_attributes": getattr(data, "variant_attributes", None),
+            "quantity": getattr(data, "quantity", None),
+            "unit_price": getattr(data, "unit_price", None),
+            "line_total": getattr(data, "line_total", None),
+            "created_at": getattr(data, "created_at", None),
+            # Defaults — stay None when the variant/product is missing
+            "product_id": None,
+            "product_slug": None,
+            "product_image": None,
+        }
+
+        variant = getattr(data, "variant", None)
+        product = getattr(variant, "product", None) if variant is not None else None
+        if product is not None:
+            item["product_id"] = product.id
+            item["product_slug"] = product.slug
+            images = getattr(product, "images", None) or []
+            if images:
+                # "First" image = lowest sort_order (oldest created_at breaks ties)
+                first = min(images, key=lambda img: (img.sort_order, img.created_at))
+                item["product_image"] = first.url
+
+        return item
 
 
 # =========================================================
@@ -117,6 +168,9 @@ class OrderRead(BaseModel):
     tax_total: Decimal
     shipping_total: Decimal
     grand_total: Decimal
+    
+    # Payment transaction
+    transaction_id: Optional[str] = None
     
     # Status
     status: str

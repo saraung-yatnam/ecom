@@ -57,3 +57,8 @@ class Payment(SQLModel, table=True):
     
     # Relationship
     order: "Order" = Relationship(back_populates="payments")
+
+    @property
+    def transaction_id(self) -> str | None:
+        """Payment transaction ID: the pay_xxx once captured, else the order id."""
+        return self.provider_payment_intent or self.provider_payment_id
