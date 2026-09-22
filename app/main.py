@@ -1,12 +1,62 @@
+from contextlib import asynccontextmanager
+
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import Session
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import settings
 from app.api.v1.router import api_router
+from app.db.database import engine
+from app.services.order_expiry import expire_stale_pending_orders
 
-app = FastAPI(title=settings.PROJECT_NAME)
+
+def _sweep_expired_orders() -> None:
+    """APScheduler job: auto-cancel abandoned unpaid online orders."""
+    try:
+        with Session(engine) as session:
+            result = expire_stale_pending_orders(session)
+        if result["cancelled"]:
+            print(
+                f"🧹 Auto-cancelled {result['cancelled']} abandoned order(s): "
+                f"{', '.join(result['order_numbers']) or '-'}"
+            )
+    except Exception as e:
+        print(f"❌ Order-expiry sweep failed: {e}")
+
+
+_scheduler = BackgroundScheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Disabled during tests (or when a sqlite test DB is in use) so a stray
+    # interval job never touches the database.
+    started = False
+    uses_test_db = settings.DATABASE_URL.startswith("sqlite")
+    if settings.ENVIRONMENT != "test" and not uses_test_db:
+        _scheduler.add_job(
+            _sweep_expired_orders,
+            "interval",
+            minutes=settings.PENDING_ORDER_EXPIRY_JOB_MINUTES,
+            id="expire_pending_orders",
+            replace_existing=True,
+        )
+        _scheduler.start()
+        started = True
+        print(
+            f"🧹 Order-expiry sweep started: every "
+            f"{settings.PENDING_ORDER_EXPIRY_JOB_MINUTES} min "
+            f"(auto-cancel after {settings.PENDING_ORDER_EXPIRY_MINUTES} min)"
+        )
+    yield
+    if started:
+        _scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 
 
 class CatchAllExceptionsMiddleware:

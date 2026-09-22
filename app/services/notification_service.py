@@ -141,7 +141,7 @@ class EcommerceNotificationService:
         
         print(f"📊 Results - Sent: {sent_count}, Failed: {failed_count}")
         
-        return {+
+        return {
             "sent_count": sent_count,
             "failed_count": failed_count,
             "total_connected_users": len(self.connections)

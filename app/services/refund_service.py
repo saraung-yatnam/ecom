@@ -20,6 +20,19 @@ RESTOCKING_FEE_MAP = {
     OrderStatus.PROCESSING: lambda: settings.RESTOCKING_FEE_PROCESSING,  # 15%
 }
 
+# Provider refund-status values that mean "refund was accepted and is in flight"
+# (Razorpay: processed/pending · Stripe: succeeded/processing/requires_action · dummy: processed)
+REFUND_ACCEPTED_STATUSES = {
+    "processed",
+    "pending",
+    "succeeded",
+    "processing",
+    "requires_action",
+}
+
+# Provider refund-status values that mean the money has arrived back
+REFUND_COMPLETED_STATUSES = {"processed", "succeeded"}
+
 
 def _money(value: Decimal) -> Decimal:
     """Round to 2 decimal places (currency)."""
@@ -141,7 +154,7 @@ def process_refund(
         },
     )
 
-    if result.get("status") in ("processed", "pending"):
+    if result.get("status") in REFUND_ACCEPTED_STATUSES:
         now = datetime.now(timezone.utc)
 
         order.refund_amount = (order.refund_amount or Decimal(0)) + refund_amount
@@ -169,7 +182,7 @@ def process_refund(
         #                          webhook confirmed the money reached the bank
         # ------------------------------------------------------------------
         provider_status = result.get("status")
-        if provider_status == "processed":
+        if provider_status in REFUND_COMPLETED_STATUSES:
             order.payment_status = "refund_completed"
             print(f"✅ Refund COMPLETED for order {order.order_number} (provider returned processed)")
         else:

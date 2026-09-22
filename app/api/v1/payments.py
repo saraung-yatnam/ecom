@@ -59,9 +59,10 @@ def create_payment_intent(
     payment = payment_repo.create_payment(
         session=session,
         order_id=order.id,
-        provider="dummy" if result.get("is_dummy", False) else "razorpay",
+        provider="dummy" if result.get("is_dummy", False) else settings.PAYMENT_PROVIDER,
         provider_payment_id=result["payment_intent_id"],
         amount=result["amount"],
+        currency=result.get("currency") or settings.PAYMENT_CURRENCY,
         payment_method=order.payment_method or request.payment_method,
     )
     
@@ -71,6 +72,7 @@ def create_payment_intent(
         order_id=result["order_id"],
         amount=result["amount"],
         currency=result["currency"],
+        provider=result.get("provider") or ("dummy" if result.get("is_dummy", False) else settings.PAYMENT_PROVIDER),
         is_dummy=result.get("is_dummy", True),
     )
 

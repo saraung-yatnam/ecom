@@ -27,9 +27,13 @@ class Settings(BaseSettings):
 
     # Payment
     PAYMENT_PROVIDER: str = "dummy"
+    PAYMENT_CURRENCY: str = "INR"
     RAZORPAY_KEY_ID: str | None = None
     RAZORPAY_KEY_SECRET: str | None = None
     RAZORPAY_WEBHOOK_SECRET: str | None = None
+    STRIPE_SECRET_KEY: str | None = None
+    STRIPE_PUBLISHABLE_KEY: str | None = None
+    STRIPE_WEBHOOK_SECRET: str | None = None
 
     # Email (SendGrid)
     SENDGRID_API_KEY: str | None = None
@@ -58,6 +62,14 @@ class Settings(BaseSettings):
     RESTOCKING_FEE_PENDING: float = 0.0       # % fee when cancelling a PENDING order
     RESTOCKING_FEE_CONFIRMED: float = 5.0     # % fee when cancelling a CONFIRMED order
     RESTOCKING_FEE_PROCESSING: float = 15.0   # % fee when cancelling a PROCESSING order
+
+    # ========== Abandoned unpaid online orders ==========
+    # Online orders that are still PENDING/payment_status "pending" longer than
+    # PENDING_ORDER_EXPIRY_MINUTES get auto-cancelled by the sweep job (stock
+    # restored, provider PaymentIntent cancelled, customer emailed).
+    PENDING_ORDER_EXPIRY_MINUTES: int = 30
+    # How often the sweep job runs (seconds between runs via APScheduler)
+    PENDING_ORDER_EXPIRY_JOB_MINUTES: int = 2
 
     GEMINI_API_KEY:str|None=None
     HUGGING_FACE_API_KEY:str|None=None

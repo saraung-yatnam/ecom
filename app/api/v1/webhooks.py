@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request, HTTPException
@@ -11,12 +10,14 @@ from app.services.email_service import email_service
 from app.repositories import order as order_repo
 from app.repositories import payment as payment_repo
 from app.services.payment_service import get_payment_service
+from app.services.refund_service import process_refund
+from app.services.order_expiry import cancel_pending_online_order, notify_order_cancelled
 
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
 
-def _handle_refund_webhook(
+def _handle_refund_webhook( 
     session: Session,
     event_type: str,
     refund_entity: dict,
@@ -103,6 +104,23 @@ def _settle_payment(session: Session, payment, instrument: str | None, provider_
 
     order = order_repo.get_order_by_id(session, payment.order_id)
     if order:
+        # A payment arriving for an already-CANCELLED order (e.g. the customer
+        # paid right as the expiry sweep cancelled it) must be refunded
+        # automatically — never hold money for a cancelled order.
+        if order.status == OrderStatus.CANCELLED:
+            try:
+                process_refund(
+                    session,
+                    order,
+                    OrderStatus.PENDING,  # 0% restocking fee
+                    reason="Paid after the order was cancelled",
+                )
+                print(f"♻️ Auto-refunded cancelled order {order.order_number}")
+            except Exception as e:
+                session.rollback()
+                print(f"⚠️ Auto-refund failed for cancelled order {order.order_number}: {e}")
+            return payment
+
         if order.status == OrderStatus.PENDING:
             order.status = OrderStatus.CONFIRMED
         order.payment_status = "paid"
@@ -127,19 +145,21 @@ async def payment_webhook(
     session: SessionDep,
 ):
     """
-    Payment webhook — configure this URL in the Razorpay dashboard.
+    Payment webhook — works for any provider configured via PAYMENT_PROVIDER.
 
     - URL:      https://<your-domain>/api/v1/webhooks/payment
-    - Secret:   must match RAZORPAY_WEBHOOK_SECRET in .env
-    - Security: Razorpay signs the RAW body (HMAC-SHA256) in the
-                X-Razorpay-Signature header; verified before any state change.
-                Invalid/missing signatures are rejected with 400.
-    - Events handled: payment.captured, order.paid   (payment + order -> paid)
-                      refund.processed, refund.failed   (refund state transitions)
+    - Security: each provider signs the RAW body with its own signature and
+                header; verification happens inside the provider service
+                (Stripe-Signature for Stripe, X-Razorpay-Signature for
+                Razorpay). Invalid/missing signatures are rejected with 400.
+    - Events handled (normalized):
+                  payment.succeeded   -> payment + order paid
+                  refund.processed    -> refund state transition
+                  refund.failed       -> refund state transition
     - All other events are acknowledged with 200 and ignored.
     """
     raw_body = (await request.body()).decode("utf-8", errors="replace")
-    signature = request.headers.get("x-razorpay-signature", "")
+    signature = request.headers.get("stripe-signature") or request.headers.get("x-razorpay-signature", "")
 
     payment_service = get_payment_service()
 
@@ -150,48 +170,44 @@ async def payment_webhook(
 
     event_type = event.get("event_type", "unknown")
 
-    # Bad signature / unparseable body -> 400 so Razorpay retries with a valid one
+    # Bad signature / unparseable body -> 400 so the provider retries with a valid one
     if event_type in ("invalid_signature", "invalid"):
         raise HTTPException(400, "Invalid webhook signature")
 
-    # ---------------- Dummy mode (local testing, PAYMENT_PROVIDER=dummy) ----------------
-    if event.get("is_dummy"):
-        try:
-            body = json.loads(raw_body)
-        except json.JSONDecodeError:
-            body = {}
-        pid = body.get("payment_intent_id") or body.get("razorpay_order_id")
-        if event_type == "payment.succeeded" and pid:
-            payment = payment_repo.get_payment_by_provider_id(session, pid)
+    # ---------------- Payment succeeded ----------------
+    if event_type == "payment.succeeded":
+        payment_id = event.get("payment_id") or (event.get("data") or {}).get("payment_intent_id")
+        if payment_id:
+            payment = payment_repo.get_payment_by_provider_id(session, payment_id)
             if payment and payment.status != "succeeded":
-                _settle_payment(session, payment, None, None)
-        elif event_type in ("refund.processed", "refund.failed"):
-            # Dummy/test webhook: body carries the refund entity directly
-            _handle_refund_webhook(session, event_type, body.get("refund") or body)
-        return {"status": "received", "mode": "dummy", "event_type": event_type}
-
-    # ---------------- Razorpay mode ----------------
-    payload = event.get("data") or {}
-
-    if event_type == "payment.captured":
-        entity = (payload.get("payment") or {}).get("entity") or {}
-        rzp_order_id = entity.get("order_id")   # == our stored provider_payment_id
-        if rzp_order_id:
-            payment = payment_repo.get_payment_by_provider_id(session, rzp_order_id)
-            if payment and payment.status != "succeeded":
-                _settle_payment(session, payment, entity.get("method"), entity.get("id"))
-
-    elif event_type == "order.paid":
-        entity = (payload.get("order") or {}).get("entity") or {}
-        pay_entity = (payload.get("payment") or {}).get("entity") or {}
-        if entity.get("id"):
-            payment = payment_repo.get_payment_by_provider_id(session, entity["id"])
-            if payment and payment.status != "succeeded":
-                _settle_payment(session, payment, pay_entity.get("method"), pay_entity.get("id"))
+                _settle_payment(
+                    session,
+                    payment,
+                    event.get("payment_method"),
+                    event.get("transaction_id"),
+                )
 
     elif event_type in ("refund.processed", "refund.failed"):
-        # Refund events: payload.refund.entity contains the rfnd_xxx with its status
-        _handle_refund_webhook(session, event_type, (payload.get("refund") or {}).get("entity") or {})
+        refund_id = event.get("refund_id")
+        if refund_id:
+            _handle_refund_webhook(session, event_type, {"id": refund_id})
 
-    # Any other event (payment.failed, refund.created, ...) — acknowledged, no action
+    # ---------------- Payment abandoned / failed (webhook reconciliation) ----
+    elif event_type in ("payment.cancelled", "payment.failed"):
+        payment_id = event.get("payment_id") or (event.get("data") or {}).get("payment_intent_id")
+        if payment_id:
+            payment = payment_repo.get_payment_by_provider_id(session, payment_id)
+            if payment:
+                order = order_repo.get_order_by_id(session, payment.order_id)
+                if order:
+                    cancelled = cancel_pending_online_order(
+                        session,
+                        order,
+                        reason="Payment was cancelled or failed before it completed — order cancelled.",
+                    )
+                    if cancelled:
+                        notify_order_cancelled(session, order)
+                        print(f"🗑️ Order {order.order_number} cancelled (webhook {event_type})")
+
+    # Any other event — acknowledged, no action
     return {"status": "received", "event_type": event_type}

@@ -63,4 +63,5 @@ class PaymentIntentResponse(BaseModel):
     order_id: UUID
     amount: Decimal
     currency: str
+    provider: str | None = None
     is_dummy: bool = True

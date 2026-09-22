@@ -59,7 +59,7 @@ class RazorpayPaymentService(PaymentService):
             
             razorpay_order = self.client.order.create({
                 "amount": amount_in_paise,
-                "currency": "INR",
+                "currency": (settings.PAYMENT_CURRENCY or "INR").upper(),
                 "receipt": order.order_number,
                 "payment_capture": 1,
                 "notes": {
@@ -75,7 +75,7 @@ class RazorpayPaymentService(PaymentService):
                 "payment_intent_id": razorpay_order["id"],
                 "order_id": str(order.id),
                 "amount": float(order.grand_total),
-                "currency": "INR",
+                "currency": (settings.PAYMENT_CURRENCY or "INR").upper(),
                 "is_dummy": False,
                 "razorpay_order": razorpay_order,
             }
@@ -142,10 +142,63 @@ class RazorpayPaymentService(PaymentService):
         try:
             import json
             event = json.loads(payload)
-            return {"event_type": event.get("event"), "data": event.get("payload", {}), "is_dummy": False}
+            return self._normalize_event(event.get("event"), event.get("payload", {}))
         except Exception as e:
             print(f"❌ Razorpay webhook payload parse failed: {str(e)}")
             return {"event_type": "invalid", "data": {}, "is_dummy": False, "error": str(e)}
+
+    def _normalize_event(self, event_type, payload) -> dict:
+        """Map a Razorpay event into the shared normalized webhook schema."""
+        if event_type in ("payment.captured", "order.paid"):
+            order_entity = (payload.get("order") or {}).get("entity") or {}
+            pay_entity = (payload.get("payment") or {}).get("entity") or {}
+            order_id = order_entity.get("id") or pay_entity.get("order_id")
+            return {
+                "event_type": "payment.succeeded",
+                "payment_id": order_id,
+                "transaction_id": pay_entity.get("id"),
+                "payment_method": pay_entity.get("method"),
+                "refund_id": None,
+                "is_dummy": False,
+                "data": payload,
+            }
+
+        if event_type in ("refund.processed", "refund.failed"):
+            refund_entity = (payload.get("refund") or {}).get("entity") or {}
+            return {
+                "event_type": event_type,
+                "payment_id": refund_entity.get("payment_id"),
+                "transaction_id": None,
+                "payment_method": None,
+                "refund_id": refund_entity.get("id"),
+                "is_dummy": False,
+                "data": payload,
+            }
+
+        # Failed payment → webhooks.py cancels the unpaid order & restocks
+        if event_type in ("payment.failed", "order.payment.failed"):
+            pay_entity = (payload.get("payment") or {}).get("entity") or {}
+            order_entity = (payload.get("order") or {}).get("entity") or {}
+            return {
+                "event_type": "payment.failed",
+                "payment_id": pay_entity.get("order_id") or order_entity.get("id"),
+                "transaction_id": pay_entity.get("id"),
+                "payment_method": pay_entity.get("method"),
+                "refund_id": None,
+                "is_dummy": False,
+                "data": payload,
+            }
+
+        # Any other event — acknowledged, no action
+        return {
+            "event_type": event_type or "unknown",
+            "payment_id": None,
+            "transaction_id": None,
+            "payment_method": None,
+            "refund_id": None,
+            "is_dummy": False,
+            "data": payload,
+        }
     
     def refund_payment(self, payment_id):
         """Refund Razorpay payment"""
@@ -232,3 +285,8 @@ class RazorpayPaymentService(PaymentService):
         except Exception as e:
             print(f"⚠️ Could not fetch payments for Razorpay order {razorpay_order_id}: {e}")
         return None
+
+    def cancel_payment_intent(self, payment_intent_id: str) -> dict:
+        """Razorpay has no public "cancel order" API — unpaid orders expire on
+        their side and raise payment.failed webhooks. Nothing to do here."""
+        return {"status": "skipped", "payment_intent_id": payment_intent_id, "is_dummy": False}

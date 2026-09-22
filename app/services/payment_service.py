@@ -39,6 +39,15 @@ class PaymentService(ABC):
         """Fetch the status of a refund."""
         pass
 
+    def cancel_payment_intent(self, payment_intent_id: str) -> dict:
+        """Best-effort cancel of an unpaid provider PaymentIntent.
+
+        Called by the abandoned-order sweep / failure webhooks so funds are
+        never captured for an order we already cancelled. Providers without a
+        cancel API (Razorpay orders auto-expire) simply skip.
+        """
+        return {"status": "skipped", "payment_intent_id": payment_intent_id, "is_dummy": False}
+
     def get_payment_id_for_order(self, razorpay_order_id: str) -> str | None:
         """Resolve the provider payment (pay_xxx) for an order id.
 
@@ -95,11 +104,23 @@ class DummyPaymentService(PaymentService):
             body = payload
 
         event_type = body.get("event") or body.get("event_type") or "payment.succeeded"
-        return {
+        result = {
             "event_type": event_type,
             "data": body,
             "is_dummy": True,
         }
+        if event_type == "payment.succeeded":
+            result["payment_id"] = body.get("payment_intent_id")
+            result["transaction_id"] = None
+            result["payment_method"] = None
+            result["refund_id"] = None
+        elif event_type in ("refund.processed", "refund.failed"):
+            refund_entity = body.get("refund") or body
+            result["refund_id"] = refund_entity.get("id") if isinstance(refund_entity, dict) else None
+            result["payment_id"] = refund_entity.get("payment_intent_id") if isinstance(refund_entity, dict) else None
+            result["transaction_id"] = None
+            result["payment_method"] = None
+        return result
     
     def refund_payment(self, payment_id: str) -> dict:
         return {
@@ -177,13 +198,25 @@ def get_payment_service() -> PaymentService:
             return DummyPaymentService()
 
     elif provider == "stripe":
-        if is_production:
-            raise RuntimeError("PAYMENT_PROVIDER='stripe' is not supported in production. Use 'razorpay'.")
         try:
             from app.services.stripe_service import StripePaymentService
-            return StripePaymentService()
-        except ImportError:
-            print("Stripe not installed. Falling back to dummy.")
+            service = StripePaymentService()
+            if hasattr(service, 'is_configured') and service.is_configured:
+                print("✅ Using STRIPE payment service")
+                return service
+            if is_production:
+                raise RuntimeError(
+                    "Stripe is not configured but ENVIRONMENT=production. "
+                    "Refusing to fall back to dummy payments."
+                )
+            print("⚠️ Stripe not configured. Falling back to DUMMY.")
+            return DummyPaymentService()
+        except RuntimeError:
+            raise
+        except Exception as e:
+            if is_production:
+                raise RuntimeError(f"Failed to initialize Stripe: {str(e)}")
+            print(f"❌ Error initializing Stripe: {str(e)}")
             return DummyPaymentService()
 
     else:

@@ -286,7 +286,7 @@ class EmailService:
                     ✅ Payment Received — {self.format_currency(order.grand_total)}
                 </p>
                 <p style="margin:0; font-size:14px; color:#166534;">
-                    Paid online securely via Razorpay. Your order is being processed.
+                    Paid online securely. Your order is being processed.
                 </p>
             </div>
             """
@@ -324,7 +324,7 @@ class EmailService:
 
                 <p class="meta"><strong>Order Number:</strong> #{order.order_number}</p>
                 <p class="meta"><strong>Order Date:</strong> {order.placed_at.strftime('%B %d, %Y')}</p>
-                <p class="meta"><strong>Payment Method:</strong> {'💵 Cash on Delivery' if is_cod else '💳 Paid Online (Razorpay)'}</p>
+                <p class="meta"><strong>Payment Method:</strong> {'💵 Cash on Delivery' if is_cod else '💳 Paid Online'}</p>
                 
                 <h3>Order Items</h3>
                 <table>
