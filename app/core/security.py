@@ -19,12 +19,47 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 
-def create_access_token(subject: str, role: str) -> str:
+def create_access_token(
+    subject: str,
+    role: str,
+    permissions: list[str] | None = None,
+) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
     )
-    payload = {"sub": subject, "role": role, "exp": expire, "type": "access"}
+    payload = {
+        "sub": subject,
+        "role": role,
+        "permissions": permissions or [],
+        "exp": expire,
+        "type": "access",
+    }
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+# OTP step-up for privileged logins: the challenge token proves "password OK,
+# OTP pending". Short-lived, single-purpose — it can only be exchanged at
+# POST /auth/login/verify-otp, never used as an API credential.
+CHALLENGE_TOKEN_EXPIRE_MINUTES = 5
+
+
+def create_login_challenge(subject: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=CHALLENGE_TOKEN_EXPIRE_MINUTES
+    )
+    payload = {"sub": subject, "exp": expire, "type": "challenge"}
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def verify_login_challenge(token: str) -> str | None:
+    """Return the challenged email, or None if invalid/expired/wrong type."""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        if payload.get("type") != "challenge":
+            return None
+        return payload.get("sub")
+    except JWTError:
+        return None
 
 
 def create_refresh_token_value() -> str:

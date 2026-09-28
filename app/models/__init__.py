@@ -1,4 +1,5 @@
 from app.models.user import User
+from app.models.rbac import Permission, Role, RolePermissionLink, UserRoleLink
 from app.models.product import Product, ProductVariant
 from app.models.product_image import ProductImage
 from app.models.refresh_token import RefreshToken
@@ -16,6 +17,10 @@ from app.models.otp import OTP
 
 __all__ = [
     "User",
+    "Permission",
+    "Role",
+    "RolePermissionLink",
+    "UserRoleLink",
     "Product",
     "ProductVariant",
     "ProductImage",

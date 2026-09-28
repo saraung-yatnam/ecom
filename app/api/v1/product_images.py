@@ -3,10 +3,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, require_role
+from app.api.deps import SessionDep, require_perm
 from app.repositories import product_image as image_repo
 from app.repositories import product as product_repo
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.schemas.product_image import (
     ProductImageCreate,
     ProductImageRead,
@@ -42,7 +42,7 @@ def add_image(
     image_data: ProductImageCreate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.staff, UserRole.manager, UserRole.admin)
+        require_perm("product_images.manage")
     ),
 ):
     """Add an image to a product"""
@@ -67,7 +67,7 @@ def update_image(
     image_data: ProductImageUpdate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.staff, UserRole.manager, UserRole.admin)
+        require_perm("product_images.manage")
     ),
 ):
     """Update an image"""
@@ -94,7 +94,7 @@ def delete_image(
     image_id: UUID,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.staff, UserRole.manager, UserRole.admin)
+        require_perm("product_images.manage")
     ),
 ):
     """Delete an image"""
@@ -121,7 +121,7 @@ def reorder_images(
     image_ids: list[UUID],
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.staff, UserRole.manager, UserRole.admin)
+        require_perm("product_images.manage")
     ),
 ):
     """Reorder images for a product"""

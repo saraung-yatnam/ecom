@@ -1,18 +1,22 @@
 import uuid
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Request
 from sqlmodel import Session,select
 from pydantic import BaseModel, EmailStr
 
 from app.api.deps import SessionDep, CurrentUser, CurrentUser
+from app.core.rate_limit import limiter
 from app.schemas.google_auth import GoogleAuthRequest
 from app.schemas.user import UserCreate, UserRead, UserLogin, SetPasswordRequest, UserUpdateProfile
 from app.schemas.token import TokenPair, RefreshRequest
 from app.schemas.otp import OTPInitiateRequest,OTPVerifyRequest
 from app.repositories import user as user_repo
 from app.repositories import token as token_repo
+from app.repositories import rbac as rbac_repo
 from app.core.security import verify_password, create_access_token, hash_password, generate_reset_token
+from app.core.security import create_login_challenge, verify_login_challenge
+from app.services import otp_service
 from app.services.email_service import email_service
 from app.services.google_auth_service import google_auth_service
 from app.services.otp_service import create_otp,verify_otp,increment_otp_attempts,get_otp_attempts
@@ -22,6 +26,87 @@ from app.models.otp import OTP
 from app.models.password_reset import PasswordResetToken
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _issue_access_token(session: SessionDep, user: User) -> str:
+    """Access token carrying legacy role + dynamic permission set."""
+    role_value = getattr(user.role, "value", user.role) or "customer"
+    try:
+        permissions = rbac_repo.get_user_permissions(session, user.id)
+    except Exception:
+        # RBAC tables may not exist yet on old databases — degrade to
+        # a role-only token instead of failing login.
+        permissions = []
+    return create_access_token(
+        subject=user.email, role=role_value, permissions=permissions
+    )
+
+
+def _mask_email(email: str) -> str:
+    """a***@example.com — enough to reassure, useless to an attacker."""
+    try:
+        local, domain = email.split("@", 1)
+    except ValueError:
+        return "***"
+    if len(local) <= 1:
+        masked = "*"
+    else:
+        masked = local[0] + "***"
+    return f"{masked}@{domain}"
+
+
+def _privileged_or_tokens(session: SessionDep, user: User) -> TokenPair | dict:
+    """Step-up gate for privileged accounts (any non-customer permission).
+
+    - Shoppers (no permissions): session tokens immediately.
+    - Staff/managers/admins: password is verified by the caller, then an OTP
+      challenge is issued — tokens are only minted at /login/verify-otp.
+    """
+    try:
+        permissions = rbac_repo.get_user_permissions(session, user.id)
+    except Exception:
+        permissions = []
+    if not permissions:
+        access = _issue_access_token(session, user)
+        refresh = token_repo.issue_refresh_token(session, user.id)
+        return TokenPair(access_token=access, refresh_token=refresh)
+
+    otp_service.create_otp(session, user.email, "admin_login")
+    return {
+        "otp_required": True,
+        "challenge_token": create_login_challenge(user.email),
+        "expires_in_minutes": 5,
+        "email_masked": _mask_email(user.email),
+    }
+
+
+def _assign_default_role(session: SessionDep, user: User) -> None:
+    """Link a freshly registered user to the customer system role.
+
+    Best-effort: registration must never fail because of RBAC — the legacy
+    ``User.role`` default already covers authorization fallback.
+    """
+    try:
+        if rbac_repo.get_user_roles(session, user.id):
+            return
+        customer = rbac_repo.get_role_by_slug(session, "customer")
+        if customer is not None:
+            rbac_repo.set_user_roles(session, user, [customer])
+    except Exception as e:
+        print(f"⚠️ Could not assign default role to {user.email}: {e}")
+
+
+def _user_read_with_security(
+    session: SessionDep, user: User
+) -> dict:
+    """UserRead payload enriched with dynamic roles/permissions."""
+    data = UserRead.model_validate(user).model_dump()
+    try:
+        data.update(rbac_repo.user_security_profile(session, user))
+    except Exception:
+        legacy = getattr(user.role, "value", user.role) or "customer"
+        data.update({"roles": [str(legacy)], "permissions": []})
+    return data
 
 
 # ========== Request Schemas ==========
@@ -38,6 +123,15 @@ class ResetPasswordRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class VerifyLoginOtpRequest(BaseModel):
+    challenge_token: str
+    otp_code: str
+
+
+class ResendLoginOtpRequest(BaseModel):
+    challenge_token: str
 
 
 # ========== Authentication Endpoints ==========
@@ -76,6 +170,15 @@ def initiate_registration(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered"
         )
+    
+    # ✅ Check if username is taken before sending OTP
+    if request.username:
+        existing_username = user_repo.get_user_by_username(session, request.username)
+        if existing_username:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already taken"
+            )
     
     # ✅ Check rate limiting (max 3 attempts per hour)
     from datetime import datetime, timedelta
@@ -144,6 +247,7 @@ def verify_registration(
     )
     
     user = user_repo.create_user(session, user_data)
+    _assign_default_role(session, user)
     
     # ✅ Send welcome email
     if settings.SENDGRID_API_KEY:
@@ -191,8 +295,9 @@ def resend_otp(
 
 
     
-@router.post("/login", response_model=TokenPair)
-def login(data: UserLogin, session: SessionDep):
+@router.post("/login")
+@limiter.limit("10/minute")
+def login(request: Request, data: UserLogin, session: SessionDep):
     user = user_repo.get_user_by_email(session, data.email)
     
     if not user:
@@ -212,9 +317,85 @@ def login(data: UserLogin, session: SessionDep):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
 
-    access = create_access_token(subject=user.email, role=user.role)
+    # Privileged accounts stop here until the OTP challenge is completed;
+    # shoppers receive tokens immediately.
+    return _privileged_or_tokens(session, user)
+
+
+@router.post("/login/verify-otp", response_model=TokenPair)
+@limiter.limit("10/minute")
+def verify_login_otp(
+    request: Request, data: VerifyLoginOtpRequest, session: SessionDep
+):
+    """Exchange a login challenge + email OTP for session tokens.
+
+    The challenge token proves the password step; the OTP proves inbox
+    control. Wrong codes count against the attempt budget — burned codes
+    must be re-requested via /login/resend-otp.
+    """
+    email = verify_login_challenge(data.challenge_token)
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Challenge expired. Please sign in again.",
+        )
+    user = user_repo.get_user_by_email(session, email)
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Challenge expired. Please sign in again.",
+        )
+
+    if not otp_service.verify_otp(session, email, data.otp_code, "admin_login"):
+        otp_service.increment_otp_attempts(session, email)
+        remaining = otp_service.remaining_otp_attempts(
+            session, email, "admin_login"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid or expired code. "
+                f"{remaining} attempt(s) remaining."
+                if remaining
+                else "Code locked after too many attempts. Request a new code."
+            ),
+        )
+
+    access = _issue_access_token(session, user)
     refresh = token_repo.issue_refresh_token(session, user.id)
     return TokenPair(access_token=access, refresh_token=refresh)
+
+
+@router.post("/login/resend-otp")
+@limiter.limit("3/minute")
+def resend_login_otp(request: Request, data: ResendLoginOtpRequest, session: SessionDep):
+    """Re-send the admin-login OTP for a live challenge (60s cooldown)."""
+    email = verify_login_challenge(data.challenge_token)
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Challenge expired. Please sign in again.",
+        )
+    user = user_repo.get_user_by_email(session, email)
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Challenge expired. Please sign in again.",
+        )
+
+    wait = otp_service.resend_cooldown_remaining(session, email, "admin_login")
+    if wait:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Please wait {wait} second(s) before requesting a new code.",
+        )
+
+    otp_service.create_otp(session, email, "admin_login")
+    return {
+        "message": "A new code was sent",
+        "email_masked": _mask_email(email),
+        "expires_in": "10 minutes",
+    }
 
 
 @router.post("/refresh", response_model=TokenPair)
@@ -225,7 +406,7 @@ def refresh(data: RefreshRequest, session: SessionDep):
 
     user = session.get(User, record.user_id)
     new_refresh = token_repo.rotate_token(session, record)
-    access = create_access_token(subject=user.email, role=user.role)
+    access = _issue_access_token(session, user)
     return TokenPair(access_token=access, refresh_token=new_refresh)
 
 
@@ -238,8 +419,8 @@ def logout(data: RefreshRequest, session: SessionDep):
 
 
 @router.get("/me", response_model=UserRead)
-def me(current_user: CurrentUser):
-    return current_user
+def me(session: SessionDep, current_user: CurrentUser):
+    return _user_read_with_security(session, current_user)
 
 
 @router.put("/profile", response_model=UserRead)
@@ -279,19 +460,24 @@ def update_profile(
     session.commit()
     session.refresh(current_user)
     
-    return current_user
+    return _user_read_with_security(session, current_user)
 
 
-@router.post("/google", response_model=TokenPair)
+@router.post("/google")
+@limiter.limit("10/minute")
 def google_auth(
-    request: GoogleAuthRequest,
+    request: Request,
+    request_data: GoogleAuthRequest,
     session: SessionDep,
 ):
     """
     Authenticate with Google ID token.
+
+    Privileged accounts (any admin permission) must still complete the
+    email OTP challenge — a compromised Google account alone is not enough.
     """
     # Verify Google token
-    google_user = google_auth_service.verify_id_token(request.id_token)
+    google_user = google_auth_service.verify_id_token(request_data.id_token)
     if not google_user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -324,6 +510,7 @@ def google_auth(
         session.add(user)
         session.commit()
         session.refresh(user)
+        _assign_default_role(session, user)
         
         if settings.SENDGRID_API_KEY:
             try:
@@ -348,11 +535,9 @@ def google_auth(
                 detail="Account disabled"
             )
     
-    # Generate tokens
-    access = create_access_token(subject=user.email, role=user.role)
-    refresh = token_repo.issue_refresh_token(session, user.id)
-    
-    return TokenPair(access_token=access, refresh_token=refresh)
+    # Privileged accounts stop here until the OTP challenge is completed;
+    # shoppers receive tokens immediately.
+    return _privileged_or_tokens(session, user)
 
 
 @router.post("/set-password", response_model=dict)

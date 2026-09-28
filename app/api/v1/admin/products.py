@@ -4,9 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
-from app.api.deps import SessionDep, require_role
+from app.api.deps import SessionDep, require_perm
 from app.models.product import Product
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.repositories import product as product_repo
 from app.schemas.product import ProductRead
 
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/admin/products", tags=["Admin Products"])
 @router.get("", response_model=dict)
 def get_all_products_admin(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("products.view")),
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=20, ge=1, le=100),
     search: str | None = None,
@@ -50,7 +50,7 @@ def get_all_products_admin(
 @router.get("/export", response_model=dict)
 def export_products(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.admin)),
+    current_user: User = Depends(require_perm("products.export")),
     format: str = Query(default="json"),
 ):
     """
@@ -111,7 +111,7 @@ def export_products(
 def get_product_admin(
     product_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("products.view")),
 ):
     """
     Get product by ID (Admin only).
@@ -129,10 +129,10 @@ def get_product_admin(
 def bulk_delete_products(
     product_ids: list[UUID],
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.admin)),
+    current_user: User = Depends(require_perm("products.delete")),
 ):
     """
-    Bulk delete products (Admin only).
+    Bulk delete products (requires products.delete permission).
     """
     if not product_ids:
         raise HTTPException(
@@ -153,7 +153,10 @@ def bulk_update_product_status(
     product_ids: list[UUID],
     is_active: bool,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.admin)),
+    # Bulk status flips use the same grant as single-product updates
+    # (legacy code restricted this to admin; managers/staff could already
+    # flip products one by one, so products.update is the honest mapping).
+    current_user: User = Depends(require_perm("products.update")),
 ):
     """
     Bulk update product status (Admin only).

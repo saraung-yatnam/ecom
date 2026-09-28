@@ -45,25 +45,28 @@ def get_all_users(
     skip: int = 0,
     limit: int = 20,
     search: str | None = None,
-    role: UserRole | None = None,
+    role: UserRole | str | None = None,
     is_active: bool | None = None,
 ) -> tuple[list[User], int]:
     """
     Get all users with filters and pagination.
-    
+
     Args:
         session: Database session
         skip: Number of records to skip
         limit: Maximum records to return
         search: Search by email, username, or full_name
-        role: Filter by role
+        role: Legacy role enum member/value OR a dynamic role slug
+            (e.g. "packer") — slugs are matched via the user_roles table.
         is_active: Filter by active status
-    
+
     Returns:
         tuple: (list of users, total count)
     """
+    from app.models.rbac import Role, UserRoleLink
+
     statement = select(User)
-    
+
     # Apply filters
     if search:
         statement = statement.where(
@@ -71,9 +74,20 @@ def get_all_users(
             (User.username.ilike(f"%{search}%")) |
             (User.full_name.ilike(f"%{search}%"))
         )
-    
+
     if role:
-        statement = statement.where(User.role == role)
+        role_value = getattr(role, "value", role)
+        legacy_values = {r.value for r in UserRole}
+        if role_value in legacy_values:
+            statement = statement.where(User.role == UserRole(role_value))
+        else:
+            # Dynamic (custom) role slug → match via role assignments.
+            statement = (
+                statement.join(
+                    UserRoleLink, UserRoleLink.user_id == User.id
+                ).join(Role, Role.id == UserRoleLink.role_id)
+                .where(Role.slug == role_value)
+            )
     
     if is_active is not None:
         statement = statement.where(User.is_active == is_active)

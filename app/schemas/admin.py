@@ -21,6 +21,9 @@ class AdminUserRead(BaseModel):
     email: EmailStr
     username: str
     role: UserRole
+    # Dynamic RBAC role slugs (populated from user_roles).
+    roles: list[str] = []
+    permissions: list[str] = []
     full_name: str | None
     phone: str | None
     is_active: bool

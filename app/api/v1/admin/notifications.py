@@ -11,8 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from uuid import UUID
 
 from app.api.deps import SessionDep
-from app.api.deps import require_role
-from app.models.user import User, UserRole
+from app.api.deps import require_perm
+from app.models.user import User
 from app.repositories import notification as notification_repo
 from app.schemas.notification import (
     PromotionBroadcastRequest,
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/admin/notifications", tags=["Admin Notifications"])
 def send_promotional_broadcast(
     payload: PromotionBroadcastRequest,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("promotions.send")),
 ):
     """Send a promotional message to every active customer's notification feed."""
     broadcast_id, recipients = notification_repo.broadcast_promotion(
@@ -52,7 +52,7 @@ def send_promotional_broadcast(
 @router.get("/promotional", response_model=list[PromotionHistoryItem])
 def promotional_history(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("promotions.send")),
     skip: int = 0,
     limit: int = 20,
 ):
@@ -64,7 +64,7 @@ def promotional_history(
 def retract_promotional_broadcast(
     broadcast_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("promotions.send")),
 ):
     """Retract a broadcast — delete it from every recipient's feed."""
     deleted = notification_repo.retract_broadcast(session, broadcast_id)

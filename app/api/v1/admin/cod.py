@@ -15,8 +15,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, require_role
-from app.models.user import User, UserRole
+from app.api.deps import SessionDep, require_perm
+from app.models.user import User
 from app.models.order import Order
 from app.models.payment import Payment, PaymentProvider, PaymentStatus
 from app.repositories import order as order_repo
@@ -27,14 +27,10 @@ router = APIRouter(prefix="/admin/cod", tags=["Admin COD"])
 @router.get("/pending")
 def get_pending_cod_orders(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("orders.update")),
 ):
     """
     List all COD orders waiting for cash collection.
-    
-    Allowed:
-        manager
-        admin
     """
     statement = (
         select(Order)
@@ -76,17 +72,13 @@ def get_pending_cod_orders(
 def collect_cod_payment(
     order_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("orders.update")),
 ):
     """
     Mark a COD order's cash as COLLECTED ON DELIVERY.
-    
+
     - Creates a COD payment record (status=succeeded)
     - Flips the order to payment_status="paid"
-    
-    Allowed:
-        manager
-        admin
     """
     order = order_repo.get_order_by_id(session, order_id)
     if not order:

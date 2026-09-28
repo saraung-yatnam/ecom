@@ -2,8 +2,8 @@ from datetime import datetime
 from fastapi import APIRouter, Depends
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, require_role
-from app.models.user import User, UserRole
+from app.api.deps import SessionDep, require_perm
+from app.models.user import User
 from app.repositories import user as user_repo  # 👈 Use existing user repo
 from app.repositories import order as order_repo
 from app.repositories import analytics as analytics_repo
@@ -15,13 +15,10 @@ router = APIRouter(prefix="/admin/dashboard", tags=["Admin Dashboard"])
 @router.get("", response_model=dict)
 def get_admin_dashboard(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.admin,UserRole.manager)),
+    current_user: User = Depends(require_perm("dashboard.view")),
 ):
     """
-    Get admin dashboard summary.
-    
-    Allowed:
-        admin
+    Get admin dashboard summary (requires dashboard.view permission).
     """
     # User stats
     user_stats = user_repo.get_user_stats(session)

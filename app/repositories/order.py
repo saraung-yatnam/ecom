@@ -99,6 +99,38 @@ def get_order_by_number(session: Session, order_number: str) -> Order | None:
     return result.scalar_one_or_none()
 
 
+def get_order_by_awb(session: Session, awb_code: str) -> Order | None:
+    """Get order by AWB code"""
+    statement = (
+        select(Order)
+        .where(Order.awb_code == awb_code)
+        .options(
+            _ORDER_ITEM_PRODUCT_LOAD,
+            selectinload(Order.user),
+            selectinload(Order.shipping_address),
+            selectinload(Order.payments),
+        )
+    )
+    result = session.execute(statement)
+    return result.scalars().first()
+
+
+def get_order_by_shiprocket_order_id(session: Session, sr_order_id: str) -> Order | None:
+    """Get order by Shiprocket Order ID"""
+    statement = (
+        select(Order)
+        .where(Order.shiprocket_order_id == sr_order_id)
+        .options(
+            _ORDER_ITEM_PRODUCT_LOAD,
+            selectinload(Order.user),
+            selectinload(Order.shipping_address),
+            selectinload(Order.payments),
+        )
+    )
+    result = session.execute(statement)
+    return result.scalars().first()
+
+
 def get_verified_purchase_order_id(
     session: Session,
     user_id: UUID,

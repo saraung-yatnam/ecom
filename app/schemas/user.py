@@ -36,6 +36,10 @@ class UserRead(BaseModel):
     email: EmailStr
     username: str
     role: UserRole
+    # Dynamic RBAC: populated by /auth/me from user_roles + grants.
+    # Defaults keep old clients working when the RBAC tables are missing.
+    roles: list[str] = []
+    permissions: list[str] = []
     full_name: str | None
     phone: str | None
     is_active: bool

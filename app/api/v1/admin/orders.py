@@ -1,14 +1,16 @@
 # app/api/v1/admin/orders.py
 from uuid import UUID
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
-from app.api.deps import SessionDep, require_role
-from app.models.user import User, UserRole
-from app.models.order import OrderStatus
+from app.api.deps import SessionDep, require_perm
+from app.api.v1.webhooks import process_tracking_event
+from app.models.user import User
+from app.models.order import Order, OrderStatus
 from app.models.product import ProductVariant
 from app.repositories import order as order_repo
 from app.repositories import notification as notification_repo
@@ -16,6 +18,11 @@ from app.repositories import product_image as product_image_repo
 from app.schemas.order import OrderRead, OrderStatusUpdate, OrderListRead
 from app.services.email_service import email_service
 from app.services.refund_service import restore_stock
+from app.services.shipping_status import (
+    build_tracking_webhook_payload,
+    normalize_location,
+    shipment_stage_payload,
+)
 from app.core.config import settings
 
 router = APIRouter(prefix="/admin/orders", tags=["Admin Orders"])
@@ -24,7 +31,7 @@ router = APIRouter(prefix="/admin/orders", tags=["Admin Orders"])
 @router.get("", response_model=dict)
 def get_all_orders_admin(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("orders.view")),
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=20, ge=1, le=100),
     status: str | None = None,
@@ -124,6 +131,12 @@ def get_all_orders_admin(
             "status": order.status.value if hasattr(order.status, 'value') else str(order.status),
             "payment_status": order.payment_status,
             "coupon_code": order.coupon_code,
+            # Shipping / Shiprocket
+            "awb_code": order.awb_code,
+            "courier_name": order.courier_name,
+            "shipment_status": order.shipment_status,
+            "shiprocket_order_id": order.shiprocket_order_id,
+
             
             # Cancellation
             "cancellation_reason": order.cancellation_reason,
@@ -166,7 +179,7 @@ def get_all_orders_admin(
 @router.get("/stats", response_model=dict)
 def get_order_stats(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("orders.view")),
 ):
     """
     Get order statistics.
@@ -182,7 +195,7 @@ def get_order_stats(
 def get_order_detail(
     order_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("orders.view")),
 ):
     """
     Get detailed order information.
@@ -300,6 +313,26 @@ def get_order_detail(
         "cancellation_reason": order.cancellation_reason,
         "cancelled_at": order.cancelled_at.isoformat() if order.cancelled_at else None,
         
+        # Shipping / Shiprocket
+        "shiprocket_order_id": order.shiprocket_order_id,
+        "shiprocket_shipment_id": order.shiprocket_shipment_id,
+        "awb_code": order.awb_code,
+        "courier_name": order.courier_name,
+        "courier_id": order.courier_id,
+        "shipping_label_url": order.shipping_label_url,
+        "manifest_url": order.manifest_url,
+        "shipment_status": order.shipment_status,
+        "pickup_scheduled_date": order.pickup_scheduled_date.isoformat() if order.pickup_scheduled_date else None,
+        "tracking_data": order.tracking_data,
+        # Presentable fulfilment stage (label/step/tone) so the admin UI does not
+        # have to re-derive it from raw courier strings in every screen.
+        "shipment_stage": shipment_stage_payload(
+            has_awb=bool(order.awb_code),
+            pickup_scheduled=bool(order.pickup_scheduled_date),
+            shipment_status=order.shipment_status,
+            order_status=order.status.value if hasattr(order.status, "value") else order.status,
+        ),
+
         # Timestamps
         "placed_at": order.placed_at.isoformat() if order.placed_at else None,
         "updated_at": order.updated_at.isoformat() if order.updated_at else None,
@@ -316,7 +349,7 @@ def update_order_status_admin(
     order_id: UUID,
     status_data: OrderStatusUpdate,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("orders.update")),
 ):
     """
     Update order status.
@@ -394,3 +427,566 @@ def update_order_status_admin(
         print(f"Failed to create status notifications: {str(e)}")
 
     return order
+
+
+
+# =========================================================
+# SHIPROCKET / SHIPPING MANAGEMENT ENDPOINTS
+# =========================================================
+
+from fastapi.responses import HTMLResponse
+from app.services.shiprocket_service import (
+    estimate_delivery_date,
+    get_shipping_service,
+)
+from app.schemas.order import (
+    CheckServiceabilityResponse,
+    AssignAWBRequest,
+    ShiprocketCreateResponse,
+    OrderTrackingResponse,
+    SimulatorTriggerWebhookRequest,
+)
+
+
+@router.get("/{order_id}/shipping/serviceability", response_model=CheckServiceabilityResponse)
+def check_order_shipping_serviceability(
+    order_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Check courier serviceability and rates for this order's destination."""
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    shipping_address = order.shipping_address
+    if not shipping_address or not shipping_address.postal_code:
+        raise HTTPException(status_code=400, detail="Order does not have a valid shipping address or postal code")
+
+    shipping_service = get_shipping_service()
+    pickup_pincode = getattr(settings, "SHIPROCKET_PICKUP_PINCODE", "110001")
+    delivery_pincode = shipping_address.postal_code
+
+    is_cod = (order.payment_method == "cod")
+    couriers = shipping_service.check_serviceability(
+        pickup_pincode=pickup_pincode,
+        delivery_pincode=delivery_pincode,
+        weight=0.5,
+        cod=is_cod,
+    )
+    return CheckServiceabilityResponse(
+        pickup_pincode=pickup_pincode,
+        delivery_pincode=delivery_pincode,
+        available_couriers=couriers,
+    )
+
+
+@router.post("/{order_id}/shipping/create", response_model=ShiprocketCreateResponse)
+def create_shiprocket_order_endpoint(
+    order_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Push order to Shiprocket (or simulator)."""
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status in (OrderStatus.CANCELLED, OrderStatus.REFUNDED):
+        raise HTTPException(status_code=400, detail="Cannot ship a cancelled or refunded order")
+
+    shipping_service = get_shipping_service()
+    res = shipping_service.create_order(order)
+
+    order.shiprocket_order_id = str(res.get("order_id"))
+    order.shiprocket_shipment_id = str(res.get("shipment_id"))
+    order.shipment_status = "ORDER_CREATED"
+    if order.status == OrderStatus.PENDING or order.status == OrderStatus.CONFIRMED:
+        order.status = OrderStatus.PROCESSING
+
+    session.add(order)
+    session.commit()
+    session.refresh(order)
+
+    return ShiprocketCreateResponse(
+        order_id=order.id,
+        shiprocket_order_id=order.shiprocket_order_id,
+        shiprocket_shipment_id=order.shiprocket_shipment_id,
+        status="ORDER_CREATED",
+        message=res.get("message", "Order successfully created on Shiprocket"),
+    )
+
+
+
+@router.post("/{order_id}/shipping/assign-awb", response_model=dict)
+def assign_order_awb_endpoint(
+    order_id: UUID,
+    data: AssignAWBRequest,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Assign courier partner and generate AWB."""
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not order.shiprocket_shipment_id:
+        raise HTTPException(status_code=400, detail="Order has not been created on Shiprocket yet")
+
+    shipping_service = get_shipping_service()
+    res = shipping_service.assign_awb(order.shiprocket_shipment_id, courier_id=data.courier_id)
+
+    order.awb_code = res.get("awb_code")
+    order.courier_name = res.get("courier_name")
+    order.courier_id = res.get("courier_company_id")
+    # Persist the courier ETD + ETA date at the moment the courier is
+    # chosen — the customer "Arriving by …" banner reads these.
+    # The dispatch modal posts the selected courier's ETD along with the
+    # courier_id; when absent we still store a +7-day fallback ETA so the
+    # UI never shows a blank date on a shipped order.
+    order.courier_etd = (data.etd or res.get("etd") or None)
+    order.expected_delivery_date = estimate_delivery_date(order.courier_etd)
+    order.shipment_status = "AWB_ASSIGNED"
+
+    session.add(order)
+    session.commit()
+    session.refresh(order)
+
+    return {
+        "order_id": str(order.id),
+        "awb_code": order.awb_code,
+        "courier_name": order.courier_name,
+        "courier_etd": order.courier_etd,
+        "expected_delivery_date": order.expected_delivery_date.isoformat() if order.expected_delivery_date else None,
+        "shipment_status": order.shipment_status,
+        "message": res.get("message", "AWB successfully assigned"),
+    }
+
+
+@router.post("/{order_id}/shipping/request-pickup", response_model=dict)
+def request_order_pickup_endpoint(
+    order_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Schedule courier pickup from warehouse."""
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not order.shiprocket_shipment_id or not order.awb_code:
+        raise HTTPException(status_code=400, detail="AWB must be assigned before requesting pickup")
+
+    shipping_service = get_shipping_service()
+    res = shipping_service.request_pickup(order.shiprocket_shipment_id)
+
+    order.pickup_scheduled_date = datetime.now(timezone.utc)
+    order.shipment_status = "PICKUP_SCHEDULED"
+
+    session.add(order)
+    session.commit()
+    session.refresh(order)
+
+    return {
+        "order_id": str(order.id),
+        "shipment_status": order.shipment_status,
+        "pickup_scheduled_date": order.pickup_scheduled_date.isoformat(),
+        "message": res.get("message", "Pickup requested successfully"),
+    }
+
+
+@router.get("/{order_id}/shipping/label", response_model=dict)
+def get_order_shipping_label(
+    order_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Get shipping label URL."""
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not order.shiprocket_shipment_id:
+        raise HTTPException(status_code=400, detail="Shipment has not been created yet")
+
+    shipping_service = get_shipping_service()
+    res = shipping_service.generate_label(order.shiprocket_shipment_id)
+    label_url = res.get("label_url")
+
+    order.shipping_label_url = label_url
+    session.add(order)
+    session.commit()
+
+    return {"label_url": label_url, "is_simulated": res.get("is_simulated", False)}
+
+
+
+@router.get("/{order_id}/shipping/manifest", response_model=dict)
+def get_order_shipping_manifest(
+    order_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Get shipping manifest URL."""
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not order.shiprocket_shipment_id:
+        raise HTTPException(status_code=400, detail="Shipment has not been created yet")
+
+    shipping_service = get_shipping_service()
+    res = shipping_service.generate_manifest(order.shiprocket_shipment_id)
+    manifest_url = res.get("manifest_url")
+
+    order.manifest_url = manifest_url
+    session.add(order)
+    session.commit()
+
+    return {"manifest_url": manifest_url, "is_simulated": res.get("is_simulated", False)}
+
+
+@router.get("/{order_id}/shipping/tracking", response_model=OrderTrackingResponse)
+def get_order_shipping_tracking(
+    order_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Get tracking timeline and milestone scans."""
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    scans = []
+    if isinstance(order.tracking_data, list):
+        scans = list(order.tracking_data)
+    elif isinstance(order.tracking_data, dict) and "scans" in order.tracking_data:
+        scans = list(order.tracking_data["scans"])
+
+    # Only pull from the courier when we have no webhook scans yet, and dedupe
+    # against what we already hold. Webhook scans are the source of truth: they
+    # are what actually moved the order, so a poll must never contradict them.
+    if order.awb_code and not scans:
+        shipping_service = get_shipping_service()
+        try:
+            live = shipping_service.get_tracking(order.awb_code)
+            sr_scans = live.get("tracking_data", {}).get("shipment_track", [])
+            for s in sr_scans:
+                scans.append({
+                    "date": s.get("date", ""),
+                    "activity": s.get("activity", ""),
+                    # Shiprocket's tracking API nests location as an object;
+                    # flatten it or the admin timeline renders [object Object].
+                    "location": normalize_location(s.get("location")),
+                    "status": s.get("sr-status-label") or s.get("status", ""),
+                })
+        except Exception:
+            pass
+
+    stage = shipment_stage_payload(
+        has_awb=bool(order.awb_code),
+        pickup_scheduled=bool(order.pickup_scheduled_date),
+        shipment_status=order.shipment_status,
+        order_status=order.status.value if hasattr(order.status, "value") else order.status,
+    )
+
+    return OrderTrackingResponse(
+        order_id=order.id,
+        order_number=order.order_number,
+        awb_code=order.awb_code,
+        courier_name=order.courier_name,
+        # Human label ("Pickup Scheduled"), not the raw courier token
+        # ("PICKUP_SCHEDULED") — the raw value is kept in raw_status.
+        current_status=stage["label"],
+        raw_status=stage["raw_status"],
+        stage=stage,
+        # Shiprocket's tracking API does not return a reliable ETA, so this is
+        # None rather than a fabricated promise we cannot keep. The UI hides the
+        # field entirely when absent.
+        etd=None,
+        scans=scans,
+        tracking_url=f"https://shiprocket.co/tracking/{order.awb_code}" if order.awb_code else None,
+    )
+
+
+
+# --- Visual Simulator Printable Label & Manifest HTML helpers ---
+
+@router.get("/shipping/simulated-label/{shipment_id}")
+def view_simulated_label(shipment_id: str, session: SessionDep):
+    """Returns a printable mock Shiprocket Shipping Label in HTML/CSS."""
+    statement = select(Order).where(Order.shiprocket_shipment_id == shipment_id)
+    order = session.execute(statement).scalars().first()
+    if not order:
+        return HTMLResponse("<h3>Shipment not found</h3>", status_code=404)
+
+    shipping = order.shipping_address
+    html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Shipping Label - {order.awb_code or shipment_id}</title>
+        <style>
+            body {{ font-family: monospace, sans-serif; margin: 20px; }}
+            .label-box {{ width: 380px; border: 2px solid #000; padding: 15px; margin: auto; }}
+            .header {{ display: flex; justify-content: space-between; border-bottom: 2px solid #000; padding-bottom: 8px; }}
+            .barcode {{ text-align: center; margin: 15px 0; font-family: monospace; font-size: 22px; letter-spacing: 5px; }}
+            .section {{ border-bottom: 1px solid #000; padding: 8px 0; font-size: 13px; }}
+            .bold {{ font-weight: bold; }}
+            @media print {{ body {{ margin: 0; }} .no-print {{ display: none; }} }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align: center; margin-bottom: 15px;">
+            <button onclick="window.print()" style="padding: 8px 16px; cursor: pointer; font-weight: bold;">🖨️ Print Shipping Label</button>
+        </div>
+        <div class="label-box">
+            <div class="header">
+                <div>
+                    <span class="bold">SHIPROCKET</span> (SIMULATOR)<br/>
+                    <span>{order.courier_name or 'DELHIVERY'}</span>
+                </div>
+                <div style="text-align: right;">
+                    <span class="bold">{'COD: ₹' + str(order.grand_total) if order.payment_method == 'cod' else 'PREPAID'}</span>
+                </div>
+            </div>
+            <div class="barcode">
+                |||||| | |||||||| |||| | ||||||<br/>
+                <span style="font-size: 14px; letter-spacing: 2px;">{order.awb_code or 'SR-AWB-998877'}</span>
+            </div>
+            <div class="section">
+                <span class="bold">Ship To:</span><br/>
+                {order.user.full_name if order.user else 'Customer'}<br/>
+                {shipping.line1 if shipping else ''}<br/>
+                {shipping.city if shipping else ''}, {shipping.state if shipping else ''} - <span class="bold">{shipping.postal_code if shipping else ''}</span><br/>
+                Phone: {order.user.phone if order.user and order.user.phone else 'N/A'}
+            </div>
+            <div class="section">
+                <span class="bold">Order No:</span> {order.order_number}<br/>
+                <span class="bold">Date:</span> {order.placed_at.strftime('%d-%b-%Y')}<br/>
+                <span class="bold">Dimensions:</span> 10x10x10 cm | 0.50 kg
+            </div>
+            <div style="font-size: 11px; margin-top: 10px; color: #555; text-align: center;">
+                Return Address: Warehouse Primary Hub, Industrial Area, New Delhi - 110001
+            </div>
+        </div>
+    </body>
+    </html>"""
+    return HTMLResponse(content=html)
+
+
+
+@router.get("/shipping/simulated-manifest/{shipment_id}")
+def view_simulated_manifest(shipment_id: str, session: SessionDep):
+    """Returns a printable mock Shiprocket Pickup Manifest in HTML/CSS."""
+    statement = select(Order).where(Order.shiprocket_shipment_id == shipment_id)
+    order = session.execute(statement).scalars().first()
+    if not order:
+        return HTMLResponse("<h3>Shipment not found</h3>", status_code=404)
+
+    html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Pickup Manifest - {shipment_id}</title>
+        <style>
+            body {{ font-family: sans-serif; margin: 30px; font-size: 13px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            th, td {{ border: 1px solid #333; padding: 8px; text-align: left; }}
+            th {{ background: #eee; }}
+            .header {{ display: flex; justify-content: space-between; border-bottom: 2px solid #000; padding-bottom: 10px; }}
+            @media print {{ .no-print {{ display: none; }} }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="margin-bottom: 15px;">
+            <button onclick="window.print()" style="padding: 8px 16px; cursor: pointer; font-weight: bold;">🖨️ Print Manifest</button>
+        </div>
+        <div class="header">
+            <div>
+                <h2>SHIPROCKET COURIER MANIFEST</h2>
+                <p>Courier Partner: <b>{order.courier_name or 'Delhivery'}</b></p>
+            </div>
+            <div style="text-align: right;">
+                <p>Date: <b>{datetime.now().strftime('%d-%m-%Y')}</b></p>
+                <p>Manifest ID: <b>MNF-{shipment_id}</b></p>
+            </div>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>AWB Number</th>
+                    <th>Order Number</th>
+                    <th>Destination Pincode</th>
+                    <th>Payment</th>
+                    <th>Weight</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>1</td>
+                    <td><b>{order.awb_code or 'N/A'}</b></td>
+                    <td>{order.order_number}</td>
+                    <td>{order.shipping_address.postal_code if order.shipping_address else 'N/A'}</td>
+                    <td>{'COD (₹' + str(order.grand_total) + ')' if order.payment_method == 'cod' else 'PREPAID'}</td>
+                    <td>0.50 kg</td>
+                </tr>
+            </tbody>
+        </table>
+        <div style="margin-top: 50px; display: flex; justify-content: space-between;">
+            <div>__________________________<br/>Merchant Signature</div>
+            <div>__________________________<br/>Courier Executive Signature</div>
+        </div>
+    </body>
+    </html>"""
+    return HTMLResponse(content=html)
+
+
+
+# =========================================================
+# SIMULATOR TAB ENDPOINTS (ADMIN TOOLS)
+# =========================================================
+
+@router.get("/shipping/simulator/shipments", response_model=dict)
+def get_simulator_shipments(
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """Retrieve all orders that have shipment records for the Simulator Control Panel."""
+    statement = (
+        select(Order)
+        .where(Order.shiprocket_order_id.is_not(None))
+        .order_by(Order.updated_at.desc())
+        .options(
+            selectinload(Order.user),
+            selectinload(Order.shipping_address),
+        )
+    )
+    orders = session.execute(statement).scalars().all()
+    results = []
+    for o in orders:
+        results.append({
+            "order_id": str(o.id),
+            "order_number": o.order_number,
+            "user_name": o.user.full_name if o.user else "Customer",
+            "shiprocket_order_id": o.shiprocket_order_id,
+            "shiprocket_shipment_id": o.shiprocket_shipment_id,
+            "awb_code": o.awb_code,
+            "courier_name": o.courier_name,
+            "order_status": o.status.value,
+            "payment_status": o.payment_status,
+            "shipment_status": o.shipment_status,
+            "shipment_stage": shipment_stage_payload(
+                has_awb=bool(o.awb_code),
+                pickup_scheduled=bool(o.pickup_scheduled_date),
+                shipment_status=o.shipment_status,
+                order_status=o.status.value if hasattr(o.status, "value") else o.status,
+            ),
+            "updated_at": o.updated_at.isoformat() if o.updated_at else None,
+            "tracking_scans_count": len(o.tracking_data) if isinstance(o.tracking_data, list) else 0,
+        })
+    return {"shipments": results, "count": len(results), "provider": getattr(settings, "SHIPPING_PROVIDER", "simulator")}
+
+
+#: Simulator event name -> the real Shiprocket ``current_status`` it emits.
+#: Keys are the friendly names the admin UI sends; values are what Shiprocket
+#: would actually POST. Keeping this table explicit (rather than upper-casing the
+#: event name) is what makes the simulator emit genuine courier statuses —
+#: including the tricky ones like "RTO IN TRANSIT" that a naive mapping gets
+#: wrong.
+SIMULATOR_EVENTS: dict[str, str] = {
+    # Pre-pickup paperwork — order stays "processing".
+    "awaiting_pickup": "AWAITING PICKUP SCHEDULE",
+    "label_generated": "LABEL GENERATED",
+    "manifest_generated": "MANIFEST GENERATED",
+    "pickup_scheduled": "PICKUP SCHEDULED",
+    "pickup_attempted": "PICKUP ATTEMPTED",
+    # The parcel has physically left the warehouse -> shipped.
+    "picked_up": "PICKED UP",
+    "in_transit": "IN TRANSIT",
+    "shipped": "IN TRANSIT",
+    "dispatched": "DISPATCHED",
+    # Last mile.
+    "out_for_delivery": "OUT FOR DELIVERY",
+    "appointment_booked": "CUSTOMER APPOINTMENT BOOKED",
+    "delivered": "DELIVERED",
+    # Return to origin. Shiprocket emits these as three separate events.
+    "rto_initiated": "RTO INITIATED",
+    "rto_in_transit": "RTO IN TRANSIT",
+    "rto_dispatched": "RTO DISPATCHED",
+    "rto": "RTO IN TRANSIT",
+    "rto_delivered": "RTO DELIVERED",
+    # Exceptions: recorded on the timeline, order status untouched.
+    "noc": "NOC",
+    "undelivered": "NOC",
+    "exception": "NOC",
+    "lost": "LOST",
+    "damaged": "DAMAGED",
+    "missorted": "3PL MISSORT",
+    "on_hold": "ON HOLD",
+}
+
+
+@router.post("/{order_id}/shipping/simulator/trigger-event", response_model=dict)
+def trigger_simulator_event(
+    order_id: UUID,
+    data: SimulatorTriggerWebhookRequest,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("shipping.manage")),
+):
+    """
+    Simulate a Shiprocket tracking webhook hitting the backend.
+
+    Builds a payload in Shiprocket's real wire format (top-level ``data`` key,
+    numeric ``shipment_status``, boolean flags) and feeds it through
+    ``process_tracking_event`` — the exact function the public
+    ``/webhooks/shiprocket`` endpoint calls.
+
+    That shared path is the whole point: the simulator cannot pass while
+    production would fail. If Shiprocket changes its payload shape, the simulator
+    breaks immediately instead of live shipments going silently missing.
+    """
+    order = order_repo.get_order_by_id(session, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not order.awb_code:
+        raise HTTPException(
+            status_code=400, detail="Shipment does not have an AWB assigned yet"
+        )
+
+    event_type = data.event.strip().lower()
+    shiprocket_status = SIMULATOR_EVENTS.get(event_type)
+    if shiprocket_status is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown simulator event '{data.event}'. Valid events: "
+                + ", ".join(sorted(SIMULATOR_EVENTS))
+            ),
+        )
+
+    payload = build_tracking_webhook_payload(
+        awb=order.awb_code,
+        current_status=shiprocket_status,
+        location=data.location or "Regional Processing Hub",
+        activity=data.activity or f"Shipment status: {shiprocket_status}",
+        order_id=order.id.int if hasattr(order.id, "int") else None,
+        is_return=1 if "RTO" in shiprocket_status else 0,
+    )
+
+    result = process_tracking_event(session, payload)
+    session.refresh(order)
+
+    return {
+        "success": True,
+        "order_id": str(order.id),
+        "event_triggered": event_type,
+        "shiprocket_status": shiprocket_status,
+        # The exact body Shiprocket would POST — surfaced in the admin UI so the
+        # wire format is inspectable, not just assumed.
+        "simulated_payload": payload,
+        "order_status": order.status.value,
+        "shipment_status": order.shipment_status,
+        "payment_status": order.payment_status,
+        "status_changed": result.get("status_changed", False),
+    }

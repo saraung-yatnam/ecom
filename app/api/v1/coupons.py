@@ -3,10 +3,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, require_role
+from app.api.deps import SessionDep, require_perm
 from app.models.category import Category
 from app.models.coupon import CouponType, TriggerType
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.repositories import coupon as coupon_repo
 from app.schemas.coupon import (
     CouponCreate,
@@ -77,7 +77,7 @@ def validate_coupon_public(
 def get_coupons(
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("coupons.view")
     ),
     is_active: bool | None = None,
     coupon_type: CouponType | None = None,
@@ -99,7 +99,7 @@ def get_coupon(
     coupon_id: UUID,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("coupons.view")
     ),
 ):
     """
@@ -120,7 +120,7 @@ def create_coupon(
     coupon_data: CouponCreate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("coupons.manage")
     ),
 ):
     """
@@ -172,7 +172,7 @@ def update_coupon(
     coupon_data: CouponUpdate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("coupons.manage")
     ),
 ):
     """
@@ -267,7 +267,7 @@ def delete_coupon(
     coupon_id: UUID,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("coupons.manage")
     ),
 ):
     """
@@ -289,7 +289,7 @@ def delete_coupon(
 def generate_coupon(
     length: int = 8,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("coupons.manage")
     ),
 ):
     """

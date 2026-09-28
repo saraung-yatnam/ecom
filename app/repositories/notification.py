@@ -14,10 +14,26 @@ from sqlalchemy import func
 from sqlmodel import Session, select, col
 
 from app.models.notification import Notification, NotificationType
-from app.models.order import Order
+from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 
 ADMIN_ROLES = (UserRole.manager, UserRole.admin)
+
+
+def order_status_label(status: str | OrderStatus) -> str:
+    """Human-readable order status for customer-facing copy.
+
+    "out_for_delivery" -> "Out for Delivery" (never the raw snake_case value, and
+    never "Rto" from str.capitalize()). Unknown values degrade gracefully.
+
+    ⚠️ Accepts a raw value ("out_for_delivery") or an OrderStatus member — note
+    str(OrderStatus.RTO) is "OrderStatus.RTO", so members are unwrapped first.
+    """
+    value = status.value if isinstance(status, OrderStatus) else str(status)
+    try:
+        return OrderStatus(value).label
+    except ValueError:
+        return value.replace("_", " ").title()
 
 
 def _insert(
@@ -98,12 +114,13 @@ def notify_admins_order_cancelled(session: Session, order: Order) -> int:
 
 def notify_customer_status_changed(session: Session, order: Order, new_status: str) -> int:
     """Notify the customer that their order status changed (user app feed)."""
+    label = order_status_label(new_status)
     _insert(
         session,
         order.user_id,
         NotificationType.ORDER_STATUS,
-        title=f"Order #{order.order_number} {new_status.capitalize()}",
-        message=f"Your order #{order.order_number} is now {new_status}.",
+        title=f"Order #{order.order_number} {label}",
+        message=f"Your order #{order.order_number} is now {label}.",
         link=f"/orders/{order.id}",
         order_id=order.id,
     )

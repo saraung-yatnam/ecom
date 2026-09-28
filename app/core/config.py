@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     # How often the sweep job runs (seconds between runs via APScheduler)
     PENDING_ORDER_EXPIRY_JOB_MINUTES: int = 2
 
+    # ========== Shiprocket / Shipping Provider Settings ==========
+    SHIPPING_PROVIDER: str = "simulator"  # "simulator" or "shiprocket"
+    SHIPROCKET_EMAIL: str | None = None
+    SHIPROCKET_PASSWORD: str | None = None
+    SHIPROCKET_PICKUP_LOCATION: str = "Primary"
+    SHIPROCKET_PICKUP_PINCODE: str = "110001"
+    SHIPROCKET_WEBHOOK_TOKEN: str | None = None
+
     GEMINI_API_KEY:str|None=None
     HUGGING_FACE_API_KEY:str|None=None
     GROQ_API_KEY:str|None=None

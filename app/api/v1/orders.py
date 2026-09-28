@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
 from app.api.deps import SessionDep,CurrentUser
-from app.models.order import OrderStatus
+from app.models.order import Order, OrderStatus
 from app.models.user import User
 from app.repositories import order as order_repo
 from app.schemas.order import (
@@ -18,11 +18,37 @@ from app.schemas.order import (
 )
 from app.services.email_service import email_service
 from app.services.refund_service import fetch_refund_status, process_refund, restore_stock
+from app.services.shipping_status import shipment_stage_payload
 from app.repositories import notification as notification_repo
 from app.core.config import settings
 
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
+
+
+def _with_shipment_stage(order: Order) -> Order:
+    """Attach the customer-facing fulfilment stage before serialisation.
+
+    ``OrderRead`` is built with ``from_attributes``, so a plain attribute set
+    here flows into the response. Deriving the stage server-side means the
+    customer's tracking card can never contradict the status that triggered
+    their notification email.
+
+    ``shipment_stage`` is a response-only concern — it is not a column on the
+    ``orders`` table — and SQLModel/Pydantic rejects unknown attribute
+    assignment on a table model, hence ``object.__setattr__``.
+    """
+    object.__setattr__(
+        order,
+        "shipment_stage",
+        shipment_stage_payload(
+            has_awb=bool(order.awb_code),
+            pickup_scheduled=bool(order.pickup_scheduled_date),
+            shipment_status=order.shipment_status,
+            order_status=order.status.value if hasattr(order.status, "value") else order.status,
+        ),
+    )
+    return order
 
 
 @router.get("", response_model=list[OrderRead])
@@ -33,7 +59,8 @@ def get_orders(
     limit: int = 20,
 ):
     """Get all orders for current user"""
-    return order_repo.get_orders_by_user(session, current_user.id, skip, limit)
+    orders = order_repo.get_orders_by_user(session, current_user.id, skip, limit)
+    return [_with_shipment_stage(o) for o in orders]
 
 
 @router.get("/{order_id}", response_model=OrderRead)
@@ -50,7 +77,7 @@ def get_order(
     if order.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    return order
+    return _with_shipment_stage(order)
 
 
 # =========================================================
@@ -252,4 +279,4 @@ def get_order_by_number(
     if order.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    return order
+    return _with_shipment_stage(order)

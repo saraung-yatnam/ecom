@@ -17,8 +17,10 @@ class OrderStatusEnum(str, Enum):
     CONFIRMED = "confirmed"
     PROCESSING = "processing"
     SHIPPED = "shipped"
+    OUT_FOR_DELIVERY = "out_for_delivery"
     DELIVERED = "delivered"
     CANCELLED = "cancelled"
+    RTO = "rto"
     REFUNDED = "refunded"
 
 
@@ -144,6 +146,17 @@ class CancelOrderRequest(BaseModel):
 # RESPONSE SCHEMAS
 # =========================================================
 
+class ShipmentStage(BaseModel):
+    """Presentable fulfilment stage for the UI (see shipping_status.py)."""
+
+    stage: str
+    label: str
+    step: Optional[int] = None
+    tone: str = "neutral"
+    raw_status: Optional[str] = None
+    is_exception: bool = False
+
+
 class OrderRead(BaseModel):
     """Full order response with nested data"""
     model_config = ConfigDict(from_attributes=True)
@@ -189,6 +202,26 @@ class OrderRead(BaseModel):
     restocking_fee: Decimal = Decimal(0)
     refunded_at: Optional[datetime] = None
 
+    # Shiprocket / Shipping
+    shiprocket_order_id: Optional[str] = None
+    shiprocket_shipment_id: Optional[str] = None
+    awb_code: Optional[str] = None
+    courier_name: Optional[str] = None
+    courier_id: Optional[int] = None
+    #: Courier ETD text captured at dispatch ("3-4 Days").
+    courier_etd: Optional[str] = None
+    #: Estimated delivery date derived from the ETD at dispatch.
+    expected_delivery_date: Optional[datetime] = None
+    shipping_label_url: Optional[str] = None
+    manifest_url: Optional[str] = None
+    shipment_status: Optional[str] = None
+    pickup_scheduled_date: Optional[datetime] = None
+    tracking_data: Optional[Any] = None
+    #: Presentable fulfilment stage for the customer tracking UI. Computed
+    #: server-side (see services/shipping_status.py) so the customer's view can
+    #: never disagree with the status that drove their notification email.
+    shipment_stage: Optional[ShipmentStage] = None
+
     # Timestamps
     placed_at: datetime
     updated_at: datetime
@@ -213,6 +246,11 @@ class OrderListRead(BaseModel):
     placed_at: datetime
     item_count: int = 0
     
+    # Shipping info for list view
+    awb_code: Optional[str] = None
+    courier_name: Optional[str] = None
+    shipment_status: Optional[str] = None
+    
     # Nested user data for list view
     user: Optional[OrderUserRead] = None
 
@@ -231,6 +269,69 @@ class OrderUpdate(BaseModel):
     payment_status: Optional[str] = None
     shipping_address_id: Optional[UUID] = None
     billing_address_id: Optional[UUID] = None
+
+
+# =========================================================
+# SHIPPING / SHIPROCKET SCHEMAS
+# =========================================================
+
+class CourierRateOption(BaseModel):
+    courier_company_id: int
+    courier_name: str
+    rate: Decimal
+    etd: Optional[str] = None
+    rating: Optional[float] = None
+    cod: bool = True
+
+
+class CheckServiceabilityResponse(BaseModel):
+    pickup_pincode: str
+    delivery_pincode: str
+    available_couriers: List[CourierRateOption] = []
+
+
+class AssignAWBRequest(BaseModel):
+    courier_id: Optional[int] = None
+    #: ETD text of the selected courier ("3-4 Days"), forwarded by the
+    #: dispatch modal so the ETA date can be stored at assignment time.
+    etd: Optional[str] = None
+
+
+class ShiprocketCreateResponse(BaseModel):
+    order_id: UUID
+    shiprocket_order_id: str
+    shiprocket_shipment_id: str
+    status: str
+    message: str
+
+
+class TrackingMilestone(BaseModel):
+    date: str
+    activity: str
+    location: str
+    status: Optional[str] = None
+
+
+class OrderTrackingResponse(BaseModel):
+    order_id: UUID
+    order_number: str
+    awb_code: Optional[str] = None
+    courier_name: Optional[str] = None
+    #: Human label, e.g. "Pickup Scheduled" — never the raw courier token.
+    current_status: str
+    #: The courier's own status string, e.g. "PICKUP_SCHEDULED". Kept for
+    #: support/dispute conversations; may be None before the first scan.
+    raw_status: Optional[str] = None
+    stage: Optional[ShipmentStage] = None
+    etd: Optional[str] = None
+    scans: List[TrackingMilestone] = []
+    tracking_url: Optional[str] = None
+
+
+class SimulatorTriggerWebhookRequest(BaseModel):
+    event: str  # e.g., "in_transit", "out_for_delivery", "delivered", "rto", "exception"
+    location: Optional[str] = "Hub - Delhi"
+    activity: Optional[str] = None
 
 
 # =========================================================

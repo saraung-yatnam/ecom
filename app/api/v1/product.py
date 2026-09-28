@@ -3,8 +3,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.api.deps import SessionDep, require_role
-from app.models.user import User, UserRole
+from app.api.deps import SessionDep, require_perm
+from app.models.user import User
 from app.repositories import product as product_repo
 from app.schemas.product import (
     ProductCreate,
@@ -249,11 +249,7 @@ def create_product(
     product_data: ProductCreate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(
-            UserRole.staff,
-            UserRole.manager,
-            UserRole.admin,
-        )
+        require_perm("products.create")
     ),
 ):
     """
@@ -339,11 +335,7 @@ def update_product(
     product_data: ProductUpdate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(
-            UserRole.staff,
-            UserRole.manager,
-            UserRole.admin,
-        )
+        require_perm("products.update")
     ),
 ):
     """
@@ -455,9 +447,7 @@ def delete_product(
     product_id: UUID,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(
-            UserRole.admin,
-        )
+        require_perm("products.delete")
     ),
 ):
     """
@@ -559,11 +549,7 @@ def create_product_variant(
     variant_data: ProductVariantCreate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(
-            UserRole.staff,
-            UserRole.manager,
-            UserRole.admin,
-        )
+        require_perm("products.create")
     ),
 ):
     """
@@ -635,11 +621,7 @@ def update_product_variant(
     variant_data: ProductVariantUpdate,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(
-            UserRole.staff,
-            UserRole.manager,
-            UserRole.admin,
-        )
+        require_perm("products.update")
     ),
 ):
     """
@@ -737,11 +719,9 @@ def delete_product_variant(
     variant_id: UUID,
     session: SessionDep,
     current_user: User = Depends(
-        require_role(
-            UserRole.staff,
-            UserRole.manager,
-            UserRole.admin,
-        )
+        # Variant deletion keeps the legacy staff+ access: it is part of
+        # day-to-day catalog work, covered by products.update.
+        require_perm("products.update")
     ),
 ):
     """

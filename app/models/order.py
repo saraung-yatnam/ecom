@@ -8,14 +8,36 @@ from sqlalchemy import Column, JSON
 from sqlmodel import Field, Relationship, SQLModel
 
 
+#: Customer-facing labels for every OrderStatus value (single source of truth).
+#: Mirrors ORDER_STATUS_LABELS in the web apps, which render these strings.
+_ORDER_STATUS_LABELS: dict[str, str] = {
+    "pending": "Pending",
+    "confirmed": "Confirmed",
+    "processing": "Processing",
+    "shipped": "Shipped",
+    "out_for_delivery": "Out for Delivery",
+    "delivered": "Delivered",
+    "cancelled": "Cancelled",
+    "rto": "Returned to Origin",
+    "refunded": "Refunded",
+}
+
+
 class OrderStatus(str, Enum):
     PENDING = "pending"
     CONFIRMED = "confirmed"
     PROCESSING = "processing"
     SHIPPED = "shipped"
+    OUT_FOR_DELIVERY = "out_for_delivery"
     DELIVERED = "delivered"
     CANCELLED = "cancelled"
+    RTO = "rto"
     REFUNDED = "refunded"
+
+    @property
+    def label(self) -> str:
+        """Human-readable label for customer-facing copy ("out_for_delivery" -> "Out for Delivery")."""
+        return _ORDER_STATUS_LABELS[self.value]
 
 
 class Order(SQLModel, table=True):
@@ -75,6 +97,25 @@ class Order(SQLModel, table=True):
     refund_reason: str | None = None
     restocking_fee: Decimal = Field(default=0, max_digits=12, decimal_places=2)
     refunded_at: datetime | None = None
+
+    # Shiprocket / Shipping Details
+    shiprocket_order_id: str | None = Field(default=None, index=True)
+    shiprocket_shipment_id: str | None = Field(default=None, index=True)
+    awb_code: str | None = Field(default=None, index=True)
+    courier_name: str | None = None
+    courier_id: int | None = None
+    # Courier ETD text captured at dispatch ("3-4 Days").
+    # Drives the customer-facing "Arriving by …" date.
+    courier_etd: str | None = None
+    expected_delivery_date: datetime | None = None
+    shipping_label_url: str | None = None
+    manifest_url: str | None = None
+    shipment_status: str | None = None
+    pickup_scheduled_date: datetime | None = None
+    tracking_data: list[dict] | dict | None = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True)
+    )
 
     # Timestamps
     placed_at: datetime = Field(

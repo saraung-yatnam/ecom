@@ -4,8 +4,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlmodel import Session
 
-from app.api.deps import SessionDep, require_role
-from app.models.user import User, UserRole
+from app.api.deps import SessionDep, require_perm
+from app.models.user import User
 from app.repositories import analytics as analytics_repo
 from app.schemas.analytics import (
     CustomerSummaryResponse,
@@ -24,15 +24,11 @@ router = APIRouter(prefix="/analytics", tags=["Analytics"])
 def get_dashboard_stats(
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("dashboard.view")
     ),
 ):
     """
     Get dashboard statistics.
-    
-    Allowed:
-        manager
-        admin
     """
     return analytics_repo.get_dashboard_stats(session)
 
@@ -41,7 +37,7 @@ def get_dashboard_stats(
 def get_sales_report(
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("reports.view")
     ),
     from_date: date = Query(default=...),
     to_date: date = Query(default=...),
@@ -66,7 +62,7 @@ def get_sales_report(
 @router.get("/top-products", response_model=list[TopProductItem])
 def get_top_products(
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),  # 👈 ADD THIS BACK
+    current_user: User = Depends(require_perm("reports.view")),  # 👈 ADD THIS BACK
     limit: int = Query(default=10, ge=1, le=100),
     from_date: Optional[date] = Query(default=None),
     to_date: Optional[date] = Query(default=None),
@@ -87,7 +83,7 @@ def get_top_products(
 def get_order_statistics(
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("reports.view")
     ),
     from_date: Optional[date] = Query(default=None),
     to_date: Optional[date] = Query(default=None),
@@ -106,7 +102,7 @@ def get_order_statistics(
 def get_revenue_report(
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("reports.view")
     ),
     from_date: date = Query(default=...),
     to_date: date = Query(default=...),
@@ -132,7 +128,7 @@ def get_revenue_report(
 def get_customer_summary(
     session: SessionDep,
     current_user: User = Depends(
-        require_role(UserRole.manager, UserRole.admin)
+        require_perm("reports.view")
     ),
     from_date: Optional[date] = Query(default=None),
     to_date: Optional[date] = Query(default=None),

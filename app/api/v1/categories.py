@@ -2,8 +2,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.api.deps import SessionDep, require_role
-from app.models.user import User, UserRole
+from app.api.deps import SessionDep, require_perm
+from app.models.user import User
 from app.repositories import category as category_repo
 from app.schemas.category import CategoryCreate, CategoryRead, CategoryUpdate
 
@@ -36,7 +36,7 @@ def get_category(
 def create_category(
     category_data: CategoryCreate,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("categories.manage")),
 ):
     """Create a category."""
     existing = category_repo.get_category_by_slug(session, category_data.slug)
@@ -51,7 +51,7 @@ def update_category(
     category_id: UUID,
     category_data: CategoryUpdate,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("categories.manage")),
 ):
     """Update a category."""
     category = category_repo.get_category_by_id(session, category_id)
@@ -70,7 +70,7 @@ def update_category(
 def delete_category(
     category_id: UUID,
     session: SessionDep,
-    current_user: User = Depends(require_role(UserRole.manager, UserRole.admin)),
+    current_user: User = Depends(require_perm("categories.manage")),
 ):
     """Delete a category."""
     category = category_repo.get_category_by_id(session, category_id)
