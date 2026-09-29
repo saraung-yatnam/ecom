@@ -93,6 +93,10 @@ class CouponCreate(BaseModel):
     valid_from: datetime | None = None
     valid_until: datetime | None = None
     is_active: bool = Field(default=True)
+    internal_only: bool = Field(
+        default=False,
+        description="Staff/test codes rejected at checkout validation",
+    )
 
     @model_validator(mode="after")
     def _validate_coupon_config(self):
@@ -133,6 +137,7 @@ class CouponUpdate(BaseModel):
     valid_from: datetime | None = None
     valid_until: datetime | None = None
     is_active: bool | None = None
+    internal_only: bool | None = None
 
 
 class CouponRead(BaseModel):
@@ -155,6 +160,7 @@ class CouponRead(BaseModel):
     valid_from: datetime
     valid_until: datetime
     is_active: bool
+    internal_only: bool = False
     created_by: UUID
     created_at: datetime
     updated_at: datetime

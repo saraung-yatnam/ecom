@@ -28,7 +28,13 @@ def _codes_match(provided: str, stored_hash: str) -> bool:
     return hmac.compare_digest(_hash_code(provided.strip()), stored_hash)
 
 
-def create_otp(session: Session, email: str, purpose: str) -> str:
+def create_otp(session: Session, email: str, purpose: str) -> tuple[str, bool]:
+    """Create + email an OTP. Returns (code, email_sent).
+
+    Callers MUST check ``email_sent`` — the UI must never claim "code sent"
+    when the provider rejected it (that strands users on a screen whose
+    codes can never arrive).
+    """
     statement = select(OTP).where(
         OTP.email == email,
         OTP.purpose == purpose,
@@ -52,9 +58,9 @@ def create_otp(session: Session, email: str, purpose: str) -> str:
     session.commit()
     session.refresh(new_otp)
 
-    send_otp_email(email, otp_code, purpose)
+    sent = send_otp_email(email, otp_code, purpose)
 
-    return otp_code
+    return otp_code, bool(sent)
 
 
 def verify_otp(session: Session, email: str, otp_code: str, purpose: str) -> bool:
@@ -98,8 +104,8 @@ def verify_otp(session: Session, email: str, otp_code: str, purpose: str) -> boo
     return True
 
 
-def send_otp_email(email: str, otp_code: str, purpose: str):
-    """Send OTP via email"""
+def send_otp_email(email: str, otp_code: str, purpose: str) -> bool:
+    """Send OTP via email. Returns True if the provider accepted it."""
     purpose_labels = {
         "signup": "account verification",
         "reset_password": "password reset",
@@ -138,8 +144,9 @@ def send_otp_email(email: str, otp_code: str, purpose: str):
     </div>
     """
 
-    # ✅ Use your existing email service
-    email_service.send_email(
+    # ✅ Use your existing email service (return value tells the caller
+    # whether the code can actually arrive).
+    return email_service.send_email(
         to=email,
         subject=subject,
         html_body=html_body

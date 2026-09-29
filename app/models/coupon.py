@@ -67,6 +67,9 @@ class Coupon(SQLModel, table=True):
         max_digits=12, 
         decimal_places=2
     )
+    # Internal/test codes are rejected at checkout validation — staff comps
+    # and QA codes can never leak onto public orders.
+    internal_only: bool = Field(default=False, index=True)
     max_uses: int | None = None
     max_uses_per_user: int = Field(default=1)
     times_used: int = Field(default=0)

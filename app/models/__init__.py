@@ -1,5 +1,8 @@
 from app.models.user import User
 from app.models.rbac import Permission, Role, RolePermissionLink, UserRoleLink
+from app.models.refund import Refund, RefundStatus
+from app.models.admin_audit import AdminAuditLog
+from app.models.staff_invite import StaffInvite
 from app.models.product import Product, ProductVariant
 from app.models.product_image import ProductImage
 from app.models.refresh_token import RefreshToken
@@ -21,6 +24,10 @@ __all__ = [
     "Role",
     "RolePermissionLink",
     "UserRoleLink",
+    "Refund",
+    "RefundStatus",
+    "AdminAuditLog",
+    "StaffInvite",
     "Product",
     "ProductVariant",
     "ProductImage",

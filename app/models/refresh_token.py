@@ -27,6 +27,13 @@ class RefreshToken(SQLModel, table=True):
         sa_column=Column(DateTime(timezone=True), nullable=False)
     )
 
+    # Which API this session may talk to ("admin" | "storefront"). Persisted so
+    # POST /auth/refresh re-issues with the SAME audience — without this a
+    # storefront session would mint an admin-capable token on every refresh.
+    # Defaults to "admin" so pre-existing rows keep working (they were all
+    # issued through the OTP-gated admin login).
+    scope: str = Field(default="admin", max_length=20, index=True)
+
     revoked: bool = Field(default=False)
 
     created_at: datetime = Field(

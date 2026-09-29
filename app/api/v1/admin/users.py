@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlmodel import Session, select
 
 from app.api.deps import SessionDep, require_perm
@@ -10,6 +10,7 @@ from app.models.order import Order
 from app.models.cart import Cart
 from app.repositories import user as user_repo
 from app.repositories import rbac as rbac_repo
+from app.repositories import audit as audit_repo
 from app.repositories import order as order_repo
 from app.repositories import address as address_repo
 from app.schemas.admin import (
@@ -169,6 +170,7 @@ def update_user_role(
     user_id: UUID,
     update_data: AdminUserUpdate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("users.manage_roles")),
 ):
     """
@@ -208,6 +210,12 @@ def update_user_role(
     if payload:
         user = user_repo.update_user_by_admin(session, user, payload)
 
+    audit_repo.log_and_commit(
+        session, action="user.role_assigned", entity="user", entity_id=user.id,
+        actor_id=current_user.id,
+        after={"roles": rbac_repo.get_user_role_slugs(session, user.id)},
+        ip_address=audit_repo.client_ip(request),
+    )
     return _admin_user_read(session, user)
 
 
@@ -216,6 +224,7 @@ def update_user_status(
     user_id: UUID,
     update_data: AdminUserUpdate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("users.manage")),
 ):
     """
@@ -235,12 +244,19 @@ def update_user_status(
             detail="Cannot deactivate your own account"
         )
     
+    before_active = user.is_active
     user = user_repo.update_user_by_admin(
         session,
         user,
         update_data.model_dump(exclude_unset=True)
     )
-    
+    audit_repo.log_and_commit(
+        session, action="user.status_changed", entity="user", entity_id=user.id,
+        actor_id=current_user.id,
+        before={"is_active": before_active},
+        after={"is_active": user.is_active},
+        ip_address=audit_repo.client_ip(request),
+    )
     return _admin_user_read(session, user)
 
 
@@ -248,6 +264,7 @@ def update_user_status(
 def delete_user(
     user_id: UUID,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("users.manage")),
 ):
     """
@@ -292,5 +309,11 @@ def delete_user(
         session.add(cart)
         session.commit()
     
+    snapshot = {"email": user.email, "username": user.username}
     user_repo.delete_user(session, user)
+    audit_repo.log_and_commit(
+        session, action="user.deleted", entity="user", entity_id=user_id,
+        actor_id=current_user.id, before=snapshot,
+        ip_address=audit_repo.client_ip(request),
+    )
     return None 

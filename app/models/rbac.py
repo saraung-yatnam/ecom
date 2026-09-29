@@ -12,6 +12,7 @@ Design decisions (single-tenant Phase 1):
   The source of truth for authorization is ``user_roles`` + ``role_permissions``.
 """
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlmodel import Field, SQLModel
@@ -46,6 +47,12 @@ class Role(SQLModel, table=True):
     # System roles (admin/manager/staff/customer) cannot be deleted,
     # only their permission sets can be edited.
     is_system: bool = Field(default=False)
+    # Max single-refund amount this role may execute WITHOUT a second
+    # admin's approval. None = unlimited. Above-limit (or self-order)
+    # refunds become pending_approval rows instead of executing.
+    max_refund_amount: Decimal | None = Field(
+        default=None, max_digits=12, decimal_places=2
+    )
     created_by: UUID | None = Field(default=None, foreign_key="users.id")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

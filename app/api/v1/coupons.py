@@ -1,9 +1,12 @@
 from uuid import UUID
+from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from app.repositories import audit as audit_repo
 from sqlmodel import Session
 
 from app.api.deps import SessionDep, require_perm
+from app.core.rate_limit import limiter
 from app.models.category import Category
 from app.models.coupon import CouponType, TriggerType
 from app.models.user import User
@@ -32,21 +35,29 @@ def _enum_value(field) -> str:
 # =========================================================
 
 @router.post("/validate", response_model=CouponValidateResponse)
+@limiter.limit("30/minute")
 def validate_coupon_public(
-    request: CouponValidateRequest,
+    request: Request,
+    request_data: CouponValidateRequest,
     session: SessionDep,
 ):
     """
-    Validate coupon code (public).
-    Check if coupon exists and is valid.
+    Validate coupon code (public, rate-limited).
+
+    Runs the same validity checks as checkout (active, window, usage caps,
+    internal-only) so the endpoint can't be used to enumerate live codes
+    beyond what checkout itself would accept. Per-user/cart checks
+    (min order value, per-user usage) still happen at checkout.
     """
-    coupon = coupon_repo.get_coupon_by_code(session, request.code)
+    from app.utils.coupon import validate_coupon as _validate_coupon
+
+    coupon = coupon_repo.get_coupon_by_code(session, request_data.code)
     if not coupon:
         return CouponValidateResponse(
             valid=False,
             message="Coupon not found"
         )
-    
+
     # Automatic coupons cannot be typed in — they apply themselves.
     if coupon.coupon_type == CouponType.AUTOMATIC:
         return CouponValidateResponse(
@@ -59,7 +70,15 @@ def validate_coupon_public(
             discount_type=coupon.discount_type,
             value=coupon.value,
         )
-    
+
+    valid, message = _validate_coupon(coupon, Decimal(0))
+    if not valid and "Minimum order value" not in message:
+        # Hide the specific cause for non-qualifying codes (enumeration
+        # resistance); min-order failures are shopper-actionable, keep them.
+        if "not valid" in message or "inactive" in message or "expired" in message or "maximum usage" in message:
+            return CouponValidateResponse(valid=False, message="Coupon not found")
+        return CouponValidateResponse(valid=False, message=message)
+
     return CouponValidateResponse(
         valid=True,
         message="Coupon is valid",
@@ -94,6 +113,42 @@ def get_coupons(
     return coupon_repo.get_all_coupons(session, skip, limit, is_active, coupon_type)
 
 
+@router.get("/risky", response_model=dict)
+def get_risky_coupons(
+    session: SessionDep,
+    current_user: User = Depends(
+        require_perm("coupons.view")
+    ),
+):
+    """Coupon hygiene report: live codes missing expiry, usage caps, or
+    granting 100% off (requires coupons.view)."""
+    from app.models.coupon import Coupon, DiscountType
+
+    coupons = coupon_repo.get_all_coupons(session, skip=0, limit=1000)
+    risky = []
+    for coupon in coupons:
+        if not coupon.is_active:
+            continue
+        reasons = []
+        if coupon.valid_until is None:
+            reasons.append("no_expiry")
+        if coupon.max_uses is None:
+            reasons.append("unlimited_uses")
+        if (
+            coupon.discount_type == DiscountType.PERCENTAGE
+            and (coupon.value or 0) >= 100
+        ):
+            reasons.append("full_discount")
+        if reasons:
+            risky.append({
+                "id": str(coupon.id),
+                "code": coupon.code,
+                "reasons": reasons,
+                "times_used": coupon.times_used,
+            })
+    return {"count": len(risky), "coupons": risky}
+
+
 @router.get("/{coupon_id}", response_model=CouponRead)
 def get_coupon(
     coupon_id: UUID,
@@ -119,6 +174,7 @@ def get_coupon(
 def create_coupon(
     coupon_data: CouponCreate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(
         require_perm("coupons.manage")
     ),
@@ -159,11 +215,19 @@ def create_coupon(
                 detail="Trigger category not found"
             )
     
-    return coupon_repo.create_coupon(
+    coupon = coupon_repo.create_coupon(
         session,
         create_data,
         current_user.id,
     )
+    audit_repo.log_and_commit(
+        session, action="coupon.created", entity="coupon", entity_id=coupon.id,
+        actor_id=current_user.id,
+        after={"code": coupon.code, "value": str(coupon.value),
+               "discount_type": str(coupon.discount_type)},
+        ip_address=audit_repo.client_ip(request),
+    )
+    return coupon
 
 
 @router.put("/{coupon_id}", response_model=CouponRead)
@@ -171,6 +235,7 @@ def update_coupon(
     coupon_id: UUID,
     coupon_data: CouponUpdate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(
         require_perm("coupons.manage")
     ),
@@ -254,18 +319,29 @@ def update_coupon(
                 detail="Trigger category not found"
             )
     
-    return coupon_repo.update_coupon(
+    before = {"code": coupon.code, "value": str(coupon.value),
+              "is_active": coupon.is_active}
+    updated = coupon_repo.update_coupon(
         session,
         coupon,
         update_data,
         none_fields,
     )
+    audit_repo.log_and_commit(
+        session, action="coupon.updated", entity="coupon", entity_id=coupon.id,
+        actor_id=current_user.id, before=before,
+        after={"code": updated.code, "value": str(updated.value),
+               "is_active": updated.is_active},
+        ip_address=audit_repo.client_ip(request),
+    )
+    return updated
 
 
 @router.delete("/{coupon_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_coupon(
     coupon_id: UUID,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(
         require_perm("coupons.manage")
     ),
@@ -281,7 +357,13 @@ def delete_coupon(
     if not coupon:
         raise HTTPException(status_code=404, detail="Coupon not found")
     
+    snapshot = {"code": coupon.code, "value": str(coupon.value)}
     coupon_repo.delete_coupon(session, coupon)
+    audit_repo.log_and_commit(
+        session, action="coupon.deleted", entity="coupon", entity_id=coupon_id,
+        actor_id=current_user.id, before=snapshot,
+        ip_address=audit_repo.client_ip(request),
+    )
     return None
 
 

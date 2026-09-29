@@ -56,10 +56,15 @@ def seed(session: Session) -> dict:
                 slug=slug,
                 description=spec["description"],
                 is_system=True,
+                max_refund_amount=spec.get("max_refund_amount"),
             )
             session.add(role)
             session.flush()
             new_roles += 1
+        # Sync the refund authority with the catalog (idempotent).
+        if role.max_refund_amount != spec.get("max_refund_amount"):
+            role.max_refund_amount = spec.get("max_refund_amount")
+            session.add(role)
         # Sync the permission set to the catalog (idempotent replace).
         wanted = set(spec["permissions"])
         current = set(

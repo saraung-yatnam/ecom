@@ -19,10 +19,19 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 
+# Token audiences. A storefront token is a strictly weaker credential: it can
+# only reach customer-scoped endpoints. ``require_perm`` (app/api/deps.py)
+# rejects anything that is not AUDIENCE_ADMIN, so a session started in the shop
+# can never be replayed against the admin API — not even after a refresh.
+AUDIENCE_ADMIN = "admin"
+AUDIENCE_STOREFRONT = "storefront"
+
+
 def create_access_token(
     subject: str,
     role: str,
     permissions: list[str] | None = None,
+    audience: str = AUDIENCE_ADMIN,
 ) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
@@ -33,6 +42,7 @@ def create_access_token(
         "permissions": permissions or [],
         "exp": expire,
         "type": "access",
+        "aud": audience,
     }
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
@@ -71,7 +81,17 @@ def create_refresh_token_value() -> str:
 
 def decode_access_token(token: str) -> dict[str, Any] | None:
     try:
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+            # We issue an "aud" claim (AUDIENCE_ADMIN / AUDIENCE_STOREFRONT) and
+            # enforce it ourselves in app/api/deps.py::_assert_admin_audience.
+            # python-jose would otherwise reject every token here, since it can
+            # only validate "aud" against one expected audience and this codebase
+            # accepts tokens from two different channels.
+            options={"verify_aud": False},
+        )
         if payload.get("type") != "access":
             return None
         return payload

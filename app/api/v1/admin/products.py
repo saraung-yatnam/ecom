@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
@@ -8,6 +8,7 @@ from app.api.deps import SessionDep, require_perm
 from app.models.product import Product
 from app.models.user import User
 from app.repositories import product as product_repo
+from app.repositories import audit as audit_repo
 from app.schemas.product import ProductRead
 
 router = APIRouter(prefix="/admin/products", tags=["Admin Products"])
@@ -50,6 +51,7 @@ def get_all_products_admin(
 @router.get("/export", response_model=dict)
 def export_products(
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("products.export")),
     format: str = Query(default="json"),
 ):
@@ -99,6 +101,12 @@ def export_products(
             ],
         })
     
+    audit_repo.log_and_commit(
+        session, action="product.exported", entity="product",
+        entity_id=None, actor_id=current_user.id,
+        after={"format": format, "count": len(export_data)},
+        ip_address=audit_repo.client_ip(request),
+    )
     return {
         "format": format,
         "count": len(export_data),
@@ -129,6 +137,7 @@ def get_product_admin(
 def bulk_delete_products(
     product_ids: list[UUID],
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("products.delete")),
 ):
     """
@@ -141,6 +150,13 @@ def bulk_delete_products(
         )
     
     deleted_count = product_repo.bulk_delete_products(session, product_ids)
+    audit_repo.log_and_commit(
+        session, action="product.bulk_deleted", entity="product",
+        entity_id=None, actor_id=current_user.id,
+        after={"ids": [str(i) for i in product_ids],
+               "deleted_count": deleted_count},
+        ip_address=audit_repo.client_ip(request),
+    )
     
     return {
         "deleted_count": deleted_count,
@@ -153,6 +169,7 @@ def bulk_update_product_status(
     product_ids: list[UUID],
     is_active: bool,
     session: SessionDep,
+    request: Request,
     # Bulk status flips use the same grant as single-product updates
     # (legacy code restricted this to admin; managers/staff could already
     # flip products one by one, so products.update is the honest mapping).
@@ -168,6 +185,13 @@ def bulk_update_product_status(
         )
     
     updated_count = product_repo.bulk_update_product_status(session, product_ids, is_active)
+    audit_repo.log_and_commit(
+        session, action="product.bulk_status", entity="product",
+        entity_id=None, actor_id=current_user.id,
+        after={"ids": [str(i) for i in product_ids],
+               "is_active": is_active, "updated_count": updated_count},
+        ip_address=audit_repo.client_ip(request),
+    )
     
     return {
         "updated_count": updated_count,

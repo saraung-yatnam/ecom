@@ -27,7 +27,9 @@ from app.models.user import User
 from app.repositories import payment as payment_repo
 from app.repositories import notification as notification_repo
 from app.services.email_service import email_service
-from app.services.payment_service import get_payment_service
+from app.services.payment_service import (
+    get_payment_service_for_payment,
+)
 from app.services.refund_service import restore_stock
 
 
@@ -52,7 +54,9 @@ def cancel_pending_online_order(
     for payment in payments or []:
         if payment.status == PaymentStatus.PENDING:
             try:
-                get_payment_service().cancel_payment_intent(payment.provider_payment_id)
+                get_payment_service_for_payment(
+                    payment
+                ).cancel_payment_intent(payment.provider_payment_id)
             except Exception as e:
                 print(f"⚠️ Could not cancel provider intent {payment.provider_payment_id}: {e}")
 

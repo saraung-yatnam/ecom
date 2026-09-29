@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     STRIPE_PUBLISHABLE_KEY: str | None = None
     STRIPE_WEBHOOK_SECRET: str | None = None
 
+    # Email provider: "gmail" (free SMTP, recommended) or "sendgrid".
+    # Unset = auto-detect (Gmail creds win when present).
+    EMAIL_PROVIDER: str | None = None
+    # Gmail SMTP (free, 500/day): address + 16-char App Password
+    # (Google Account → Security → 2-Step Verification → App passwords).
+    # Never use the real Gmail password here.
+    GMAIL_ADDRESS: str | None = None
+    GMAIL_APP_PASSWORD: str | None = None
+
     # Email (SendGrid)
     SENDGRID_API_KEY: str | None = None
     FROM_EMAIL: str = "noreply@yourstore.com"
@@ -45,6 +54,8 @@ class Settings(BaseSettings):
 
     # Password Reset Settings
     FRONTEND_URL: str = "http://localhost:5173"
+    # Admin panel URL (staff invite accept links point here).
+    ADMIN_FRONTEND_URL: str = "http://localhost:3001"
     RESET_TOKEN_EXPIRE_HOURS: int = 1
 
     # ========== NEW: Tax & Shipping Settings ==========

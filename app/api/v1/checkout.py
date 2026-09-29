@@ -8,13 +8,14 @@ from sqlmodel import Session
 from app.api.deps import SessionDep,CurrentUser
 from app.models.cart import Cart
 from app.models.order import Order, OrderItem, OrderStatus
+from app.models.product import ProductVariant
 from app.models.user import User
 from app.models.address import Address
 from app.repositories import cart as cart_repo
 from app.repositories import address as address_repo
 from app.repositories import coupon as coupon_repo
 from app.schemas.checkout import CheckoutConfigResponse, CheckoutRequest, OrderRead
-from app.models.coupon import CouponType
+from app.models.coupon import Coupon
 from app.utils.cart import validate_cart_items
 from app.services.pricing import resolve_cart_pricing
 from app.utils.order import generate_order_number
@@ -24,6 +25,17 @@ from app.core.config import settings
 
 
 router = APIRouter(prefix="/checkout", tags=["Checkout"])
+
+
+def _buyer_permissions(session, user) -> list[str]:
+    """Dynamic permission union for the checkout buyer (empty for shoppers)."""
+    try:
+        from app.repositories import rbac as rbac_repo
+
+        return rbac_repo.get_user_permissions(session, user.id)
+    except Exception:
+        legacy = getattr(user.role, "value", user.role) or "customer"
+        return [] if str(legacy) == "customer" else [str(legacy)]
 
 
 @router.get("/config", response_model=CheckoutConfigResponse)
@@ -157,11 +169,11 @@ def checkout(
         cod_fee = Decimal(str(settings.COD_FEE))
         grand_total += cod_fee
         print(f"COD order: fee={cod_fee}, payable on delivery={grand_total}")
-    
+
     # 10. Create order
     order_number = generate_order_number()
     print(f"Order number: {order_number}")
-    
+
     order = Order(
         order_number=order_number,
         user_id=current_user.id,
@@ -175,6 +187,12 @@ def checkout(
         grand_total=grand_total,
         coupon_code=coupon_code,
         payment_method=payment_method,
+        # Staff shopping on the storefront keep full customer rights, but
+        # the order is flagged for guardrails (self-dealing block,
+        # analytics/promo exclusion).
+        placed_by_staff=bool(
+            _buyer_permissions(session, current_user)
+        ),
         # COD orders are confirmed immediately (cash collected on delivery);
         # prepaid orders wait for the payment intent flow
         status=OrderStatus.CONFIRMED if payment_method == "cod" else OrderStatus.PENDING,
@@ -183,9 +201,34 @@ def checkout(
     session.add(order)
     session.flush()
     
-    # 11. Create order items & decrement stock
+    # 11. Create order items & decrement stock.
+    # Variants are row-locked (FOR UPDATE) and re-checked inside this
+    # transaction: cart validation ran earlier, and without the lock two
+    # concurrent checkouts could both pass validation and drive stock
+    # negative (classic oversell race).
+    from sqlalchemy import select as _select_variant
+
+    locked_variants = {
+        v.id: v
+        for v in session.execute(
+            _select_variant(ProductVariant)
+            .where(ProductVariant.id.in_(
+                [item.variant_id for item in cart_with_items.items]
+            ))
+            .with_for_update()
+        ).scalars().all()
+    }
     for item in cart_with_items.items:
-        variant = item.variant
+        variant = locked_variants.get(item.variant_id)
+        if variant is None:
+            raise HTTPException(
+                status_code=400, detail="A product variant is no longer available"
+            )
+        if variant.stock < item.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only {variant.stock} left in stock for {variant.sku}",
+            )
         product = variant.product
         
         order_item = OrderItem(
@@ -207,10 +250,24 @@ def checkout(
     # 12. Clear cart
     cart_repo.clear_cart(session, cart_with_items)
     
-    # 12b. Record usage of an AUTOMATIC winning coupon (manual coupons are
-    # counted when their code is applied to the cart — unchanged behavior).
-    if winner and winner.coupon.coupon_type == CouponType.AUTOMATIC:
-        coupon_repo.increment_coupon_usage(session, winner.coupon)
+    # 12b. Record usage of the winning coupon (manual AND automatic).
+    # Counted here at order placement — never at cart-apply time (abandoned
+    # carts must not burn max_uses budget). Row-locked + re-checked so two
+    # concurrent checkouts can't both consume the last use.
+    if winner:
+        from sqlalchemy import select as _select
+
+        locked = session.execute(
+            _select(Coupon)
+            .where(Coupon.id == winner.coupon.id)
+            .with_for_update()
+        ).scalars().one()
+        if locked.max_uses and locked.times_used >= locked.max_uses:
+            raise HTTPException(
+                status_code=400,
+                detail="Sorry, this coupon just reached its maximum usage limit",
+            )
+        coupon_repo.increment_coupon_usage(session, locked)
     
     # 13. Commit everything
     session.commit()

@@ -12,13 +12,16 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def issue_refresh_token(session: Session, user_id: uuid.UUID) -> str:
+def issue_refresh_token(
+    session: Session, user_id: uuid.UUID, scope: str = "admin"
+) -> str:
     raw = create_refresh_token_value()
     record = RefreshToken(
         user_id=user_id,
         token_hash=_hash(raw),
         expires_at=datetime.now(timezone.utc)
         + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        scope=scope,
     )
     session.add(record)
     session.commit()
@@ -41,6 +44,12 @@ def revoke_token(session: Session, record: RefreshToken) -> None:
 
 
 def rotate_token(session: Session, old_record: RefreshToken) -> str:
-    """Revoke old refresh token, issue a new one. Prevents replay of stolen tokens."""
+    """Revoke old refresh token, issue a new one. Prevents replay of stolen tokens.
+
+    The audience is copied from the record being rotated, so a refresh can never
+    widen a session's reach.
+    """
     revoke_token(session, old_record)
-    return issue_refresh_token(session, old_record.user_id)
+    return issue_refresh_token(
+        session, old_record.user_id, scope=old_record.scope or "admin"
+    )

@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
 
@@ -54,6 +55,10 @@ class UserRead(BaseModel):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    # Which API this login is for. "admin" (default) keeps the OTP step-up for
+    # privileged accounts; "storefront" issues a customer-scoped session so
+    # staff can shop without weakening the admin gate.
+    audience: Literal["admin", "storefront"] = "admin"
 
 
 class SetPasswordRequest(BaseModel):

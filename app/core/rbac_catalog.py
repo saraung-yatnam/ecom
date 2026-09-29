@@ -88,20 +88,27 @@ SYSTEM_ROLES: dict[str, dict] = {
         "name": "Admin",
         "description": "Full access to everything (system role)",
         "permissions": list(PERMISSION_KEYS),
+        # None = unlimited single-refund auto-approval.
+        "max_refund_amount": None,
     },
     "manager": {
         "name": "Manager",
         "description": "Manages catalog, orders, coupons and reports (system role)",
         "permissions": _MANAGER_PERMS,
+        "max_refund_amount": 5000,
     },
     "staff": {
         "name": "Staff",
         "description": "Handles products and views orders (system role)",
         "permissions": _STAFF_PERMS,
+        # 0 = may never execute a refund alone (holds no refund permission
+        # anyway); any refund they request needs a second admin.
+        "max_refund_amount": 0,
     },
     "customer": {
         "name": "Customer",
         "description": "Shopper account, no admin access (system role)",
         "permissions": [],
+        "max_refund_amount": 0,
     },
 }

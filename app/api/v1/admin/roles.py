@@ -8,12 +8,13 @@
 """
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.api.deps import SessionDep, require_perm
 from app.models.user import User
 from app.repositories import rbac as rbac_repo
 from app.repositories import user as user_repo
+from app.repositories import audit as audit_repo
 from app.schemas.rbac import (
     PermissionRead,
     RoleCreate,
@@ -33,6 +34,7 @@ def _role_read(session: SessionDep, role) -> RolePermissionRead:
         slug=role.slug,
         description=role.description,
         is_system=role.is_system,
+        max_refund_amount=role.max_refund_amount,
         permissions=rbac_repo.get_role_permission_keys(session, role.id),
         user_count=rbac_repo.count_role_users(session, role.id),
         created_at=role.created_at,
@@ -71,6 +73,7 @@ def list_roles(
 def create_role(
     data: RoleCreate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("roles.manage")),
 ):
     """Create a custom role from catalog permission keys."""
@@ -83,11 +86,19 @@ def create_role(
             description=data.description,
             permission_keys=data.permission_keys,
             created_by=current_user.id,
+            max_refund_amount=data.max_refund_amount,
         )
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         )
+    audit_repo.log_and_commit(
+        session, action="role.created", entity="role", entity_id=role.id,
+        actor_id=current_user.id,
+        after={"name": role.name, "slug": role.slug,
+               "permissions": data.permission_keys},
+        ip_address=audit_repo.client_ip(request),
+    )
     return _role_read(session, role)
 
 
@@ -112,6 +123,7 @@ def update_role(
     role_id: UUID,
     data: RoleUpdate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("roles.manage")),
 ):
     """Rename a role and/or REPLACE its permission set."""
@@ -120,6 +132,10 @@ def update_role(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Role not found"
         )
+    before = {
+        "name": role.name,
+        "permissions": rbac_repo.get_role_permission_keys(session, role.id),
+    }
 
     if data.name is not None:
         if not data.name.strip():
@@ -130,6 +146,8 @@ def update_role(
         role.name = data.name.strip()
     if data.description is not None:
         role.description = data.description
+    if "max_refund_amount" in data.model_fields_set:
+        role.max_refund_amount = data.max_refund_amount
     if data.permission_keys is not None:
         try:
             rbac_repo.set_role_permissions(
@@ -149,6 +167,16 @@ def update_role(
     session.add(role)
     session.commit()
     session.refresh(role)
+    audit_repo.log_and_commit(
+        session, action="role.updated", entity="role", entity_id=role.id,
+        actor_id=current_user.id,
+        before=before,
+        after={"name": role.name,
+               "permissions": rbac_repo.get_role_permission_keys(session, role.id),
+               "max_refund_amount": str(role.max_refund_amount)
+               if role.max_refund_amount is not None else None},
+        ip_address=audit_repo.client_ip(request),
+    )
     return _role_read(session, role)
 
 
@@ -156,6 +184,7 @@ def update_role(
 def delete_role(
     role_id: UUID,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("roles.manage")),
 ):
     """Delete a custom role (system roles and in-use roles are protected)."""
@@ -164,12 +193,18 @@ def delete_role(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Role not found"
         )
+    snapshot = {"name": role.name, "slug": role.slug}
     try:
         rbac_repo.delete_role(session, role)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         )
+    audit_repo.log_and_commit(
+        session, action="role.deleted", entity="role", entity_id=role_id,
+        actor_id=current_user.id, before=snapshot,
+        ip_address=audit_repo.client_ip(request),
+    )
     return None
 
 
@@ -195,9 +230,15 @@ def set_user_roles(
     user_id: UUID,
     data: UserRolesUpdate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(require_perm("users.manage_roles")),
 ):
-    """REPLACE a user's role set with existing role slugs."""
+    """REPLACE a user's role set with existing role slugs.
+
+    Guardrail: granting ``users.manage_roles``/``roles.manage`` (directly or
+    via any assigned role's permission set) requires the assigner to hold
+    that permission — same privilege-escalation block as the invite path.
+    """
     user = user_repo.get_user_by_id(session, user_id)
     if not user:
         raise HTTPException(
@@ -208,6 +249,7 @@ def set_user_roles(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot change your own roles",
         )
+    assigner_perms = set(rbac_repo.get_user_permissions(session, current_user.id))
     roles = []
     for slug in data.role_slugs:
         role = rbac_repo.get_role_by_slug(session, slug)
@@ -216,8 +258,26 @@ def set_user_roles(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unknown role: {slug}",
             )
+        role_keys = set(rbac_repo.get_role_permission_keys(session, role.id))
+        escalating = (role_keys & {"users.manage_roles", "roles.manage"}) - assigner_perms
+        if escalating:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Role '{slug}' grants {sorted(escalating)} which you do "
+                    "not hold — assignment blocked (privilege escalation)"
+                ),
+            )
         roles.append(role)
+    before = rbac_repo.get_user_role_slugs(session, user.id)
     rbac_repo.set_user_roles(
         session, user, roles, assigned_by=current_user.id
+    )
+    audit_repo.log_and_commit(
+        session, action="user.roles_assigned", entity="user", entity_id=user.id,
+        actor_id=current_user.id,
+        before={"roles": before},
+        after={"roles": [role.slug for role in roles]},
+        ip_address=audit_repo.client_ip(request),
     )
     return [role.slug for role in roles]

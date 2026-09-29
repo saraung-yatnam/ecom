@@ -1,11 +1,12 @@
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.api.deps import SessionDep, require_perm
 from app.models.user import User
 from app.repositories import product as product_repo
+from app.repositories import audit as audit_repo
 from app.schemas.product import (
     ProductCreate,
     ProductRead,
@@ -248,6 +249,7 @@ def get_product(
 def create_product(
     product_data: ProductCreate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(
         require_perm("products.create")
     ),
@@ -271,6 +273,13 @@ def create_product(
         session,
         product_data,
         current_user.id,
+    )
+    audit_repo.log_and_commit(
+        session, action="product.created", entity="product",
+        entity_id=product.id, actor_id=current_user.id,
+        after={"name": product.name, "slug": product.slug,
+               "price": str(product.price)},
+        ip_address=audit_repo.client_ip(request),
     )
 
     # ✅ Sync product to RAG after creation
@@ -334,6 +343,7 @@ def update_product(
     product_id: UUID,
     product_data: ProductUpdate,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(
         require_perm("products.update")
     ),
@@ -369,10 +379,24 @@ def update_product(
                 detail="Product with this slug already exists",
             )
 
+    before = {"name": product.name, "slug": product.slug,
+              "price": str(product.price),
+              "compare_at_price": str(product.compare_at_price),
+              "is_active": product.is_active}
     product = product_repo.update_product(
         session,
         product,
         product_data,
+    )
+    audit_repo.log_and_commit(
+        session, action="product.updated", entity="product",
+        entity_id=product.id, actor_id=current_user.id,
+        before=before,
+        after={"name": product.name, "slug": product.slug,
+               "price": str(product.price),
+               "compare_at_price": str(product.compare_at_price),
+               "is_active": product.is_active},
+        ip_address=audit_repo.client_ip(request),
     )
 
     # ✅ Sync product to RAG after update
@@ -446,6 +470,7 @@ def update_product(
 def delete_product(
     product_id: UUID,
     session: SessionDep,
+    request: Request,
     current_user: User = Depends(
         require_perm("products.delete")
     ),
@@ -465,9 +490,17 @@ def delete_product(
             detail="Product not found",
         )
 
+    snapshot = {"name": product.name, "slug": product.slug,
+                "price": str(product.price)}
     product_repo.delete_product(
         session,
         product,
+    )
+    audit_repo.log_and_commit(
+        session, action="product.deleted", entity="product",
+        entity_id=product_id, actor_id=current_user.id,
+        before=snapshot,
+        ip_address=audit_repo.client_ip(request),
     )
 
     # ✅ Remove product from RAG after deletion

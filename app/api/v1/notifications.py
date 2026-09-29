@@ -102,27 +102,57 @@ def list_notifications(
     skip: int = 0,
     limit: int = 20,
     unread_only: bool = False,
+    audience: str | None = None,
 ):
-    """Get the notification feed for the current user (newest first)."""
+    """Get the notification feed for the current user (newest first).
+
+    Pass ``audience=shopper`` on the storefront (own order updates +
+    promotions) or ``audience=staff`` in the admin panel (operational
+    alerts). Omitting it keeps the legacy unfiltered feed.
+    """
+    if audience is not None and audience not in ("shopper", "staff"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="audience must be 'shopper' or 'staff'",
+        )
     items, total, unread = notification_repo.list_for_user(
-        session, current_user.id, skip=skip, limit=limit, unread_only=unread_only
+        session, current_user.id, skip=skip, limit=limit,
+        unread_only=unread_only, audience=audience,
     )
     return NotificationListResponse(items=items, total=total, unread_count=unread)
 
 
 @router.get("/unread-count", response_model=UnreadCountResponse)
-def unread_count(session: SessionDep, current_user: CurrentUser):
+def unread_count(
+    session: SessionDep,
+    current_user: CurrentUser,
+    audience: str | None = None,
+):
     """Get the unread notification count for the current user."""
+    if audience is not None and audience not in ("shopper", "staff"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="audience must be 'shopper' or 'staff'",
+        )
     _, _, unread = notification_repo.list_for_user(
-        session, current_user.id, skip=0, limit=1
+        session, current_user.id, skip=0, limit=1, audience=audience
     )
     return UnreadCountResponse(count=unread)
 
 
 @router.put("/mark-all-read", response_model=MarkAllReadResponse)
-def mark_all_read(session: SessionDep, current_user: CurrentUser):
-    """Mark every notification of the current user as read."""
-    updated = notification_repo.mark_all_read(session, current_user.id)
+def mark_all_read(
+    session: SessionDep,
+    current_user: CurrentUser,
+    audience: str | None = None,
+):
+    """Mark notifications as read (optionally scoped to an audience)."""
+    if audience is not None and audience not in ("shopper", "staff"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="audience must be 'shopper' or 'staff'",
+        )
+    updated = notification_repo.mark_all_read(session, current_user.id, audience=audience)
     return MarkAllReadResponse(updated=updated)
 
 

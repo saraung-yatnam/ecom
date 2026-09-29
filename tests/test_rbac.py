@@ -186,7 +186,10 @@ def test_system_role_hierarchy_preserved():
 def test_login_token_carries_permissions(client):
     token = _admin_headers["Authorization"].split(" ", 1)[1]
     payload = jwt.decode(
-        token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+        token,
+        settings.JWT_SECRET_KEY,
+        algorithms=[settings.JWT_ALGORITHM],
+        audience="admin",
     )
     assert payload["role"] == "admin"
     assert "roles.manage" in payload["permissions"]
@@ -308,3 +311,58 @@ def test_legacy_role_endpoint_still_works(client):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["roles"] == ["staff"]
+
+
+def _put_roles(client, slugs: list[str]) -> dict:
+    """Assign role slugs and return the fresh AdminUserRead payload."""
+    resp = client.put(
+        f"/api/v1/admin/users/{_customer_id}/roles",
+        json={"role_slugs": slugs},
+        headers=_admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert set(resp.json()) == set(slugs)
+    read = client.get(
+        f"/api/v1/admin/users/{_customer_id}", headers=_admin_headers
+    ).json()
+    assert set(read["roles"]) == set(slugs)
+    return read
+
+
+def test_legacy_role_picks_highest_not_first(client):
+    """``users.role`` must not depend on the order roles were submitted.
+
+    The legacy column is a single value older clients gate on (e.g. the
+    Promotions page), and the roles UI appends newly-ticked roles in click
+    order — so ticking ``customer`` first could otherwise downgrade a manager
+    into a denied account.
+    """
+    # Read-only role submitted FIRST, privileged role last.
+    read = _put_roles(client, ["customer", "manager"])
+    assert read["role"] == "manager"
+
+    # Reversing the submission order must NOT change the outcome.
+    read = _put_roles(client, ["manager", "customer"])
+    assert read["role"] == "manager"
+
+    # Every system role at once, least-privileged first -> top one wins.
+    read = _put_roles(client, ["customer", "staff", "manager", "admin"])
+    assert read["role"] == "admin"
+
+    # Same set submitted in the opposite order -> same answer.
+    read = _put_roles(client, ["admin", "manager", "staff", "customer"])
+    assert read["role"] == "admin"
+
+
+def test_custom_only_role_set_leaves_legacy_role_alone(client):
+    """With no legacy slug assigned, ``users.role`` keeps its previous value
+    instead of being overwritten by a slug the enum cannot hold."""
+    baseline = _put_roles(client, ["manager"])["role"]
+    assert baseline == "manager"
+
+    read = _put_roles(client, ["packer"])
+    assert read["role"] == baseline  # unchanged, not clobbered
+
+    # A custom role stacked under a legacy one still loses to the legacy one.
+    read = _put_roles(client, ["packer", "staff"])
+    assert read["role"] == "staff"

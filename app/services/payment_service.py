@@ -39,6 +39,17 @@ class PaymentService(ABC):
         """Fetch the status of a refund."""
         pass
 
+    def get_charge_refund_state(self, payment_id: str) -> dict | None:
+        """Provider-side truth for a charge/payment: total already refunded.
+
+        Used to detect money moved OUTSIDE this app (e.g. dashboard refunds)
+        when our ledger disagrees with the provider. Returns
+        ``{"refunded_total": float, "currency": str, "refunds": [...]}`` or
+        None when the provider cannot answer. Base returns None; providers
+        with a refunds API override this.
+        """
+        return None
+
     def cancel_payment_intent(self, payment_intent_id: str) -> dict:
         """Best-effort cancel of an unpaid provider PaymentIntent.
 
@@ -154,12 +165,11 @@ class DummyPaymentService(PaymentService):
         }
 
 
-def get_payment_service() -> PaymentService:
-    """Factory function to get payment service"""
-    provider = settings.PAYMENT_PROVIDER  # 👈 Use settings
+def _service_for_provider(provider: str) -> PaymentService:
+    """Instantiate the PSP for an explicit provider name (no global fallback)."""
     is_production = settings.ENVIRONMENT == "production"
 
-    print(f"Payment Provider from settings: {provider}")
+    print(f"Payment Provider requested: {provider}")
     print(f"Environment: {settings.ENVIRONMENT}")
 
     if not provider:
@@ -224,3 +234,43 @@ def get_payment_service() -> PaymentService:
             raise RuntimeError(f"Unknown PAYMENT_PROVIDER: {provider}")
         print(f"Unknown provider: {provider}. Falling back to dummy.")
         return DummyPaymentService()
+
+
+def get_payment_service(provider: str | None = None) -> PaymentService:
+    """Factory function to get payment service.
+
+    ``provider`` overrides the global ``settings.PAYMENT_PROVIDER`` — used by
+    per-payment routing. When omitted, the global setting applies (legacy
+    behaviour for charge-time paths that have no payment row yet).
+    """
+    return _service_for_provider(provider or settings.PAYMENT_PROVIDER)
+
+
+def get_payment_service_for_payment(payment) -> PaymentService:
+    """Route to the PSP that actually captured ``payment``.
+
+    The global ``PAYMENT_PROVIDER`` setting only decides which gateway NEW
+    checkouts use. A historical payment row remembers its own gateway in
+    ``payment.provider`` — refunds / reconcile / status lookups MUST use that,
+    otherwise a Razorpay ``order_xxx`` id gets sent to Stripe (``No such
+    payment_intent``) or vice versa.
+
+    - razorpay/stripe/dummy → that provider's service (with the usual
+      not-configured → dummy fallback outside production).
+    - cod → ValueError (no online money to move; callers map to 400).
+    - unknown/legacy/empty → today's global default (backwards compatible).
+    """
+    raw = getattr(payment, "provider", None)
+    try:
+        from enum import Enum as _Enum
+        name = raw.value if isinstance(raw, _Enum) else str(raw or "")
+    except Exception:
+        name = str(raw or "")
+    name = (name or "").strip().lower()
+
+    if name == "cod":
+        raise ValueError("Cash on Delivery orders have no online payment to refund")
+    if name in ("razorpay", "stripe", "dummy"):
+        return _service_for_provider(name)
+    # Unknown / legacy rows — preserve today's behaviour.
+    return get_payment_service()

@@ -8,18 +8,54 @@ from app.models.order import Order
 from app.core.config import settings
 
 
+import os
+import smtplib
+from email.message import EmailMessage
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+from decimal import Decimal
+
+from app.models.user import User
+from app.models.order import Order
+from app.core.config import settings
+
+
 class EmailService:
+    """Transactional email with pluggable provider.
+
+    Provider selection (no caller changes needed — every template method
+    funnels through ``_send_email``):
+      EMAIL_PROVIDER=gmail     → Gmail SMTP (free, 500/day)
+      EMAIL_PROVIDER=sendgrid  → SendGrid API
+      unset                    → Gmail if GMAIL_ADDRESS + GMAIL_APP_PASSWORD
+                                are set, else SendGrid if its key is set.
+    """
+
     def __init__(self):
         self.api_key = settings.SENDGRID_API_KEY
         self.from_email = settings.FROM_EMAIL
         self.client = SendGridAPIClient(self.api_key) if self.api_key else None
         self.frontend_url = settings.FRONTEND_URL
-        
-        # Debug: Check if API key is set
-        if self.api_key:
-            print(f"SendGrid API Key loaded: {self.api_key[:10]}...")
+        self.gmail_address = settings.GMAIL_ADDRESS
+        self.gmail_app_password = settings.GMAIL_APP_PASSWORD
+
+        requested = (settings.EMAIL_PROVIDER or "").strip().lower() or None
+        if requested in ("gmail", "sendgrid"):
+            self.provider = requested
+        elif self.gmail_address and self.gmail_app_password:
+            self.provider = "gmail"
+        elif self.api_key:
+            self.provider = "sendgrid"
         else:
-            print("WARNING: SENDGRID_API_KEY not found in settings!")
+            self.provider = "none"
+
+        # Debug: Check what is configured (never log secrets).
+        if self.provider == "gmail":
+            print(f"Email provider: Gmail SMTP (from {self.gmail_address})")
+        elif self.provider == "sendgrid":
+            print(f"Email provider: SendGrid (key {self.api_key[:10]}...)")
+        else:
+            print("WARNING: no email provider configured — emails will be skipped!")
 
     # ========== ✅ NEW: Public send_email method ==========
     def send_email(self, to: str, subject: str, html_body: str, plain_text: str = None) -> bool:
@@ -37,7 +73,37 @@ class EmailService:
         return f"₹{amount:,.2f}"
 
     def _send_email(self, to_email: str, subject: str, html_content: str, plain_text: str = None):
-        """Internal method to send email"""
+        """Internal method to send email via the configured provider."""
+        if self.provider == "gmail":
+            return self._send_via_gmail(to_email, subject, html_content, plain_text)
+        if self.provider == "sendgrid":
+            return self._send_via_sendgrid(to_email, subject, html_content, plain_text)
+        print(f"No email provider configured - skipping email to {to_email}")
+        return False
+
+    def _send_via_gmail(self, to_email: str, subject: str, html_content: str, plain_text: str = None):
+        """Free Gmail SMTP (500/day). Needs GMAIL_ADDRESS + App Password."""
+        if not self.gmail_address or not self.gmail_app_password:
+            print(f"Gmail not configured - skipping email to {to_email}")
+            return False
+        try:
+            msg = EmailMessage()
+            msg["From"] = self.gmail_address
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg.set_content(plain_text or "Please view this email in an HTML-capable client.")
+            msg.add_alternative(html_content, subtype="html")
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
+                smtp.login(self.gmail_address, self.gmail_app_password)
+                smtp.send_message(msg)
+            print(f"Email sent via Gmail to {to_email}")
+            return True
+        except Exception as e:
+            print(f"Failed to send email via Gmail to {to_email}: {str(e)}")
+            return False
+
+    def _send_via_sendgrid(self, to_email: str, subject: str, html_content: str, plain_text: str = None):
+        """SendGrid API (paid/credits)."""
         if not self.client:
             print(f"SendGrid not configured - skipping email to {to_email}")
             return False
@@ -500,6 +566,43 @@ class EmailService:
         </html>
         """
         self._send_email(user.email, subject, html_content)
+
+    def send_refund_approval_needed(
+        self, to_email: str, to_name: str, order_number: str,
+        amount, requester: str, reason: str | None,
+    ):
+        """Tell an eligible approver a refund awaits their decision."""
+        subject = f"Refund approval needed — Order #{order_number} (₹{amount})"
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; color: #333; }}
+                .header {{ background: #d97706; color: white; padding: 20px; text-align: center; }}
+                .footer {{ margin-top: 20px; padding: 20px; text-align: center; color: #888; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>Refund Approval Needed</h1>
+            </div>
+
+            <p>Hi {to_name or 'Admin'},</p>
+            <p><strong>{requester}</strong> requested a refund of
+            <strong>₹{amount}</strong> on order <strong>#{order_number}</strong>.</p>
+            <p><strong>Reason:</strong> {reason or '—'}</p>
+
+            <p>Review it in the admin panel under <strong>Refunds → Pending approval</strong>.
+            No money moves until a different admin approves.</p>
+
+            <div class="footer">
+                <p>This is an automated alert. Please do not reply.</p>
+            </div>
+        </body>
+        </html>
+        """
+        self._send_email(to_email, subject, html_content)
 
     def send_refund_completed(self, order: Order, user: User):
         """Send refund completed notification"""

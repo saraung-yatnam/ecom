@@ -95,18 +95,27 @@ class EcommerceNotificationService:
         title: str,
         body: str,
         data: dict = None,
-        target_user_ids: List[str] = None
+        target_user_ids: List[str] = None,
+        notification_type: str = "promotion",
+        audience: str | None = None,
     ):
-        """Send promotional notification to all or specific users"""
+        """Send promotional notification to all or specific users.
+
+        ``audience`` gates the unfiltered broadcast path: ``shopper``
+        broadcasts reach storefront clients, while anything else (admin
+        operational traffic such as order_placed / order_cancelled) stays
+        out of shopper sockets. Targeted sends (explicit user ids) bypass
+        the gate — the caller already resolved recipients.
+        """
         if data is None:
             data = {}
-        
+
         print(f"📢 Broadcasting promotion: {title}")
         print(f"👥 Connected users: {list(self.connections.keys())}")
-        
+
         sent_count = 0
         failed_count = 0
-        
+
         # If target_user_ids provided, send only to those users
         if target_user_ids:
             print(f"🎯 Target users: {target_user_ids}")
@@ -117,13 +126,22 @@ class EcommerceNotificationService:
                         title=title,
                         body=body,
                         data=data,
-                        notification_type="promotion"
+                        notification_type=notification_type,
                     )
                     sent_count += 1
                 except Exception as e:
                     print(f"❌ Failed to send to user {user_id}: {e}")
                     failed_count += 1
         else:
+            # Unfiltered broadcasts are shopper traffic only — never fan out
+            # staff operational alerts to every connected socket.
+            if audience is not None and audience != "shopper":
+                print(f"⏭️ Skipping non-shopper broadcast (audience={audience})")
+                return {
+                    "sent_count": 0,
+                    "failed_count": 0,
+                    "total_connected_users": len(self.connections),
+                }
             # Send to all connected users
             for user_id in list(self.connections.keys()):
                 try:
@@ -132,7 +150,7 @@ class EcommerceNotificationService:
                         title=title,
                         body=body,
                         data=data,
-                        notification_type="promotion"
+                        notification_type=notification_type,
                     )
                     sent_count += 1
                 except Exception as e:

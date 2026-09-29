@@ -15,10 +15,10 @@ from app.services.refund_service import process_refund, restore_stock
 from app.services.order_expiry import cancel_pending_online_order, notify_order_cancelled
 from app.services.shipping_status import (
     TERMINAL_ORDER_STATUSES,
+    is_rto_delivered,
     map_shiprocket_status,
     normalize_location,
     normalize_status,
-    should_restore_stock,
 )
 
 
@@ -372,8 +372,26 @@ def process_tracking_event(session: Session, payload: dict) -> dict:
                     pass
 
         elif target_status == OrderStatus.RTO:
-            if should_restore_stock(current_status, label):
-                restore_stock(session, order)
+            # Stock restoration is handled below by the label-based,
+            # flag-guarded block (covers INITIATED-then-DELIVERED and
+            # retries without double-restore).
+            pass
+
+    # RTO restock independent of status movement: a parcel handed back to
+    # the seller restocks when the LABEL says RTO DELIVERED, even if the
+    # order status already read RTO from an earlier INITIATED scan (in
+    # which case nothing above runs). Flag-guarded so retried webhooks can
+    # never double-restore; delivered orders never restock.
+    # (This supersedes the old in-branch restore, which missed the
+    # INITIATED-then-DELIVERED sequence and could double-fire with it.)
+    if (
+        is_rto_delivered(label or "")
+        and current_status != OrderStatus.DELIVERED
+        and not order.rto_stock_restored
+    ):
+        restore_stock(session, order)
+        order.rto_stock_restored = True
+        session.add(order)
 
     # Always record the courier's own status (even for events we do not model,
     # like NOC) so the admin timeline reflects reality.

@@ -19,6 +19,10 @@ def validate_coupon(
     # Check if coupon is active
     if not coupon.is_active:
         return False, "This coupon is currently inactive"
+
+    # Internal/test codes can never be used on public orders.
+    if getattr(coupon, "internal_only", False):
+        return False, "This coupon code is not valid"
     
     # Check if coupon is valid from date
     if coupon.valid_from and coupon.valid_from > datetime.now():

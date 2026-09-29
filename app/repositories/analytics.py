@@ -28,6 +28,7 @@ def get_sales_report(
         Order.placed_at >= from_date,
         Order.placed_at <= to_date,
         Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False,
     )
     
     result = session.exec(statement).first()
@@ -51,6 +52,7 @@ def get_sales_report(
         Order.placed_at >= from_date,
         Order.placed_at <= to_date,
         Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False,
     ).group_by(group_col).order_by(group_col)
     
     period_data = session.exec(statement).all()
@@ -100,6 +102,7 @@ def get_sales_trend(session: Session, days: int = 7) -> list[dict]:
             Order.placed_at >= from_datetime,
             Order.placed_at < to_datetime,
             Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False,
         )
         .group_by("period")
     )
@@ -155,7 +158,8 @@ def get_top_products(
         statement = statement.where(Order.placed_at <= to_datetime)
     
     statement = statement.where(
-        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED])
+        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False
     ).group_by(Product.id, Product.name, Product.slug)
     
     statement = statement.order_by(
@@ -210,7 +214,8 @@ def get_order_statistics(
     
     # Total orders
     total_statement = select(func.count(Order.id)).where(
-        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED])
+        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False
     )
     if from_date:
         from_datetime = datetime.combine(from_date, datetime.min.time())
@@ -262,6 +267,7 @@ def get_revenue_report(
         Order.placed_at >= from_date,
         Order.placed_at <= to_date,
         Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False,
     ).group_by(group_col).order_by(group_col)
     
     results = session.exec(statement).all()
@@ -327,6 +333,7 @@ def get_customer_summary(
             Order.placed_at >= from_datetime,
             Order.placed_at <= to_datetime,
             Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED]),
+            Order.placed_by_staff == False,
         ).group_by(User.id).having(func.count(Order.id) > 1)
         
         repeat_customers = len(session.exec(statement).all())
@@ -363,6 +370,7 @@ def get_dashboard_stats(
         select(func.sum(Order.grand_total)).where(
             func.date(Order.placed_at) == today,
             Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False,
         )
     ).first() or Decimal("0.00")
     
@@ -375,6 +383,7 @@ def get_dashboard_stats(
         select(func.sum(Order.grand_total)).where(
             Order.placed_at >= start_of_week,
             Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False,
         )
     ).first() or Decimal("0.00")
     
@@ -387,19 +396,22 @@ def get_dashboard_stats(
         select(func.sum(Order.grand_total)).where(
             Order.placed_at >= start_of_month,
             Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False,
         )
     ).first() or Decimal("0.00")
     
     # Total orders
     total_orders = session.exec(
         select(func.count(Order.id)).where(
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED])
+            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False
         )
     ).first() or 0
     
     total_revenue = session.exec(
         select(func.sum(Order.grand_total)).where(
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED])
+            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            Order.placed_by_staff == False
         )
     ).first() or Decimal("0.00")
     

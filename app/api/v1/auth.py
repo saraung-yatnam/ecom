@@ -15,7 +15,12 @@ from app.repositories import user as user_repo
 from app.repositories import token as token_repo
 from app.repositories import rbac as rbac_repo
 from app.core.security import verify_password, create_access_token, hash_password, generate_reset_token
-from app.core.security import create_login_challenge, verify_login_challenge
+from app.core.security import (
+    AUDIENCE_ADMIN,
+    AUDIENCE_STOREFRONT,
+    create_login_challenge,
+    verify_login_challenge,
+)
 from app.services import otp_service
 from app.services.email_service import email_service
 from app.services.google_auth_service import google_auth_service
@@ -28,7 +33,9 @@ from app.models.password_reset import PasswordResetToken
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-def _issue_access_token(session: SessionDep, user: User) -> str:
+def _issue_access_token(
+    session: SessionDep, user: User, audience: str = AUDIENCE_ADMIN
+) -> str:
     """Access token carrying legacy role + dynamic permission set."""
     role_value = getattr(user.role, "value", user.role) or "customer"
     try:
@@ -38,8 +45,25 @@ def _issue_access_token(session: SessionDep, user: User) -> str:
         # a role-only token instead of failing login.
         permissions = []
     return create_access_token(
-        subject=user.email, role=role_value, permissions=permissions
+        subject=user.email, role=role_value, permissions=permissions,
+        audience=audience,
     )
+
+
+def _require_otp_sent(sent: bool) -> None:
+    """Fail honestly when the email provider rejects the OTP.
+
+    A silently-unsent code strands the user on a screen whose codes can
+    never arrive — worse than an explicit error they can act on.
+    """
+    if not sent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Could not send the verification email — the email service "
+                "is unavailable. Please try again in a few minutes."
+            ),
+        )
 
 
 def _mask_email(email: str) -> str:
@@ -55,23 +79,39 @@ def _mask_email(email: str) -> str:
     return f"{masked}@{domain}"
 
 
-def _privileged_or_tokens(session: SessionDep, user: User) -> TokenPair | dict:
+def _privileged_or_tokens(
+    session: SessionDep, user: User, audience: str = AUDIENCE_ADMIN
+) -> TokenPair | dict:
     """Step-up gate for privileged accounts (any non-customer permission).
 
     - Shoppers (no permissions): session tokens immediately.
     - Staff/managers/admins: password is verified by the caller, then an OTP
       challenge is issued — tokens are only minted at /login/verify-otp.
+
+    The gate applies to the ADMIN audience only. Staff shopping in the
+    storefront are issued a storefront-scoped token instead: they keep full
+    customer rights, and ``require_perm`` refuses that token on admin routes.
+    That matches the product rule that staff orders are allowed but flagged
+    (Order.placed_by_staff) rather than banned.
     """
+    if audience != AUDIENCE_ADMIN:
+        access = _issue_access_token(session, user, audience)
+        refresh = token_repo.issue_refresh_token(
+            session, user.id, scope=audience
+        )
+        return TokenPair(access_token=access, refresh_token=refresh)
+
     try:
         permissions = rbac_repo.get_user_permissions(session, user.id)
     except Exception:
         permissions = []
     if not permissions:
-        access = _issue_access_token(session, user)
-        refresh = token_repo.issue_refresh_token(session, user.id)
+        access = _issue_access_token(session, user, audience)
+        refresh = token_repo.issue_refresh_token(session, user.id, scope=audience)
         return TokenPair(access_token=access, refresh_token=refresh)
 
-    otp_service.create_otp(session, user.email, "admin_login")
+    _, sent = otp_service.create_otp(session, user.email, "admin_login")
+    _require_otp_sent(sent)
     return {
         "otp_required": True,
         "challenge_token": create_login_challenge(user.email),
@@ -194,8 +234,9 @@ def initiate_registration(
         )
     
     # ✅ Generate and send OTP
-    create_otp(session, request.email, "signup")
-    
+    _, sent = create_otp(session, request.email, "signup")
+    _require_otp_sent(sent)
+
     return {
         "message": "OTP sent to your email",
         "email": request.email,
@@ -285,8 +326,9 @@ def resend_otp(
         )
     
     # ✅ Generate and send new OTP
-    create_otp(session, request.email, "signup")
-    
+    _, sent = create_otp(session, request.email, "signup")
+    _require_otp_sent(sent)
+
     return {
         "message": "OTP resent to your email",
         "email": request.email,
@@ -318,8 +360,10 @@ def login(request: Request, data: UserLogin, session: SessionDep):
         raise HTTPException(status_code=403, detail="Account disabled")
 
     # Privileged accounts stop here until the OTP challenge is completed;
-    # shoppers receive tokens immediately.
-    return _privileged_or_tokens(session, user)
+    # shoppers receive tokens immediately. The step-up applies to the admin
+    # audience only — a storefront login is never challenged (see
+    # _privileged_or_tokens).
+    return _privileged_or_tokens(session, user, data.audience)
 
 
 @router.post("/login/verify-otp", response_model=TokenPair)
@@ -361,8 +405,10 @@ def verify_login_otp(
             ),
         )
 
-    access = _issue_access_token(session, user)
-    refresh = token_repo.issue_refresh_token(session, user.id)
+    access = _issue_access_token(session, user, AUDIENCE_ADMIN)
+    refresh = token_repo.issue_refresh_token(
+        session, user.id, scope=AUDIENCE_ADMIN
+    )
     return TokenPair(access_token=access, refresh_token=refresh)
 
 
@@ -390,7 +436,8 @@ def resend_login_otp(request: Request, data: ResendLoginOtpRequest, session: Ses
             detail=f"Please wait {wait} second(s) before requesting a new code.",
         )
 
-    otp_service.create_otp(session, email, "admin_login")
+    _, sent = otp_service.create_otp(session, email, "admin_login")
+    _require_otp_sent(sent)
     return {
         "message": "A new code was sent",
         "email_masked": _mask_email(email),
@@ -405,8 +452,12 @@ def refresh(data: RefreshRequest, session: SessionDep):
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
     user = session.get(User, record.user_id)
+    # Re-issue with the scope the session was ORIGINALLY created under. Reading
+    # it from the stored record is what stops a storefront session from
+    # upgrading itself to an admin-capable token on refresh.
+    scope = record.scope or AUDIENCE_ADMIN
     new_refresh = token_repo.rotate_token(session, record)
-    access = _issue_access_token(session, user)
+    access = _issue_access_token(session, user, scope)
     return TokenPair(access_token=access, refresh_token=new_refresh)
 
 
@@ -536,8 +587,8 @@ def google_auth(
             )
     
     # Privileged accounts stop here until the OTP challenge is completed;
-    # shoppers receive tokens immediately.
-    return _privileged_or_tokens(session, user)
+    # shoppers receive tokens immediately. Channel split as in /login.
+    return _privileged_or_tokens(session, user, request_data.audience)
 
 
 @router.post("/set-password", response_model=dict)

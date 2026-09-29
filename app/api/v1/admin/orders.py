@@ -312,6 +312,12 @@ def get_order_detail(
         # Cancellation
         "cancellation_reason": order.cancellation_reason,
         "cancelled_at": order.cancelled_at.isoformat() if order.cancelled_at else None,
+
+        # Refund position (drives the "Issue Refund" action availability)
+        "refund_amount": float(order.refund_amount or 0),
+        "refund_id": order.refund_id,
+        "refund_reason": order.refund_reason,
+        "refunded_at": order.refunded_at.isoformat() if order.refunded_at else None,
         
         # Shipping / Shiprocket
         "shiprocket_order_id": order.shiprocket_order_id,
@@ -376,6 +382,55 @@ def update_order_status_admin(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Order is already {old_status.value} — its status cannot be changed",
+        )
+
+    # Forward-only fulfilment workflow (mirrors Adobe/Shopify state
+    # machines): each status lists the ONLY legal next states. Free jumping
+    # (e.g. pending → delivered, delivered → processing) is how orders get
+    # "unknowingly" misclicked into wrong states with no audit meaning.
+    # cancelled/refunded skip this check — the money-state block below
+    # handles them with its pipeline-pointing message.
+    _ALLOWED_TRANSITIONS = {
+        OrderStatus.PENDING: (OrderStatus.CONFIRMED,),
+        OrderStatus.CONFIRMED: (OrderStatus.PROCESSING,),
+        OrderStatus.PROCESSING: (OrderStatus.SHIPPED,),
+        OrderStatus.SHIPPED: (OrderStatus.OUT_FOR_DELIVERY, OrderStatus.RTO),
+        OrderStatus.OUT_FOR_DELIVERY: (OrderStatus.DELIVERED, OrderStatus.RTO),
+        OrderStatus.DELIVERED: (),
+        OrderStatus.RTO: (),
+    }
+    try:
+        new_status_enum = OrderStatus(new_status)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown status: {new_status}",
+        )
+    if new_status_enum not in (OrderStatus.CANCELLED, OrderStatus.REFUNDED):
+        allowed_next = _ALLOWED_TRANSITIONS.get(old_status, ())
+        if new_status_enum not in allowed_next:
+            names = ", ".join(s.value for s in allowed_next) or "none — terminal"
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Cannot move order from {old_status.value} to {new_status}. "
+                    f"Allowed next: {names}."
+                ),
+            )
+
+    # cancelled / refunded are MONEY states, not plain status flips: they must
+    # go through the refund pipeline (ledger + PSP call + approvals), never a
+    # bare status write. Use POST /admin/orders/{id}/cancel (with refund
+    # choice) or POST /admin/orders/{id}/refund instead — otherwise the
+    # status says "refunded" while no money moved.
+    if new_status in (OrderStatus.CANCELLED.value, OrderStatus.REFUNDED.value):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Status '{new_status}' cannot be set directly. "
+                "Use POST /admin/orders/{id}/cancel for cancellations or "
+                "POST /admin/orders/{id}/refund for standalone refunds."
+            ),
         )
 
     # Cancelling from the admin panel must behave exactly like the user-facing

@@ -154,7 +154,11 @@ def cancel_order(
         session.refresh(order)
     elif order.payment_status == "paid":
         result = process_refund(
-            session, order, status_at_cancellation, cancel_data.reason
+            session,
+            order,
+            status_at_cancellation,
+            cancel_data.reason,
+            requested_by=current_user.id,
         )
         refund_info = RefundInfo(
             processed=result["processed"],
@@ -230,8 +234,8 @@ def get_refund_status(
             detail="No refund found for this order",
         )
 
-    # Live lookup from provider
-    live = fetch_refund_status(order)
+    # Live lookup from the order's own provider (not the global setting).
+    live = fetch_refund_status(order, session)
     live_status = live.get("status", "unknown")
 
     # ---- Friendly message based on our stored phase + live provider state ----

@@ -91,6 +91,11 @@ class Order(SQLModel, table=True):
     cancellation_reason: str | None = None
     cancelled_at: datetime | None = None
 
+    # True when the buyer held any admin permission at checkout time.
+    # Drives guardrails (self-dealing block, analytics exclusion) while the
+    # account keeps full shopping rights.
+    placed_by_staff: bool = Field(default=False, index=True)
+
     # Refund
     refund_amount: Decimal = Field(default=0, max_digits=12, decimal_places=2)
     refund_id: str | None = None           # Razorpay refund ID (rfnd_xxx)
@@ -116,6 +121,12 @@ class Order(SQLModel, table=True):
         default=None,
         sa_column=Column(JSON, nullable=True)
     )
+
+    # RTO restock guard: a parcel handed back to the seller must restore
+    # stock EXACTLY once. Webhooks retry and RTO scans arrive in stages
+    # (INITIATED then DELIVERED), so "did the status just change" is not a
+    # sufficient condition — this flag is.
+    rto_stock_restored: bool = Field(default=False, index=True)
 
     # Timestamps
     placed_at: datetime = Field(

@@ -11,6 +11,13 @@ class NotificationType(str, Enum):
     ORDER_CANCELLED = "order_cancelled"
     ORDER_STATUS = "order_status"
     PROMOTION = "promotion"
+    # Staff-only: a refund is staged and needs a second admin's decision.
+    # ⚠️ Adding a member here requires a matching `ALTER TYPE notificationtype
+    # ADD VALUE '<MEMBER_NAME>'` migration: SQLAlchemy persists the member NAME
+    # (e.g. "REFUND_APPROVAL") into the native Postgres enum, so a new member
+    # whose label is missing from the DB makes any query/insert touching it
+    # fail with InvalidTextRepresentation (HTTP 500). See revision h3d4e5f6a7b8.
+    REFUND_APPROVAL = "refund_approval"
 
 
 class Notification(SQLModel, table=True):

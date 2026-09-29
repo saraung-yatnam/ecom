@@ -1,8 +1,9 @@
 # app/schemas/rbac.py
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class PermissionRead(BaseModel):
@@ -26,6 +27,8 @@ class RolePermissionRead(BaseModel):
     slug: str
     description: str | None = None
     is_system: bool = False
+    # Max single-refund auto-approval amount. None = unlimited.
+    max_refund_amount: Decimal | None = None
     permissions: list[str] = []
     user_count: int = 0
     created_at: datetime
@@ -37,6 +40,8 @@ class RoleCreate(BaseModel):
     slug: str | None = None
     description: str | None = None
     permission_keys: list[str] = []
+    # None = unlimited (admin default). Omit for system-seeded values.
+    max_refund_amount: Decimal | None = Field(default=None, ge=0)
 
     @field_validator("name")
     @classmethod
@@ -69,6 +74,9 @@ class RoleUpdate(BaseModel):
     description: str | None = None
     # When provided, REPLACES the full permission set.
     permission_keys: list[str] | None = None
+    # Max auto-approvable single refund (None = unlimited). The endpoint
+    # checks model_fields_set so explicit null clears while omission keeps.
+    max_refund_amount: Decimal | None = Field(default=None, ge=0)
 
 
 class UserRolesUpdate(BaseModel):

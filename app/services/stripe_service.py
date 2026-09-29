@@ -309,6 +309,37 @@ class StripePaymentService(PaymentService):
             print(f"❌ Stripe refund fetch failed: {str(e)}")
             return {"status": "failed", "refund_id": refund_id, "is_dummy": False, "error": str(e)}
 
+    def get_charge_refund_state(self, payment_id: str) -> dict | None:
+        """Refunded totals straight from Stripe (catches dashboard-side refunds)."""
+        if not self.is_configured:
+            return None
+        try:
+            pid = payment_id or ""
+            charge_id = pid
+            if pid.startswith("pi_"):
+                charge_id = self.get_payment_id_for_order(pid)
+                if not charge_id:
+                    return None
+            charge = stripe.Charge.retrieve(charge_id, expand=["refunds"])
+            refunds = []
+            for r in charge.refunds.auto_paging_iter():
+                refunds.append({
+                    "id": r.id,
+                    "amount": float(r.amount) / 100,
+                    "status": getattr(r, "status", "unknown"),
+                })
+            succeeded = [r for r in refunds if r["status"] in ("succeeded",)]
+            return {
+                "charge_id": charge.id,
+                "charge_total": float(charge.amount) / 100,
+                "currency": str(charge.currency or "").upper(),
+                "refunded_total": round(sum(r["amount"] for r in succeeded), 2),
+                "refunds": refunds,
+            }
+        except Exception as e:
+            print(f"⚠️ Could not fetch Stripe refund state for {payment_id}: {e}")
+            return None
+
     def get_payment_id_for_order(self, payment_intent_id):
         """
         Resolve the actual Charge ID (ch_xxx) for a Stripe PaymentIntent

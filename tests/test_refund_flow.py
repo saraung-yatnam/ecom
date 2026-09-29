@@ -127,7 +127,7 @@ def test_1_refund_service_sets_initiated_when_pending():
             "payment_id": "pay_rzp_test_123",
             "amount": 1000.00,
         }
-        with patch("app.services.refund_service.get_payment_service") as mocked:
+        with patch("app.services.refund_service.get_payment_service_for_payment") as mocked:
             svc = mocked.return_value
             svc.create_refund.return_value = fake_result
             result = process_refund(s, order, OrderStatus.CONFIRMED, "Changed my mind")
@@ -154,7 +154,7 @@ def test_2_refund_service_sets_completed_when_processed():
             "payment_id": "pay_rzp_test_123",
             "amount": 1000.00,
         }
-        with patch("app.services.refund_service.get_payment_service") as mocked:
+        with patch("app.services.refund_service.get_payment_service_for_payment") as mocked:
             svc = mocked.return_value
             svc.create_refund.return_value = fake_result
             result = process_refund(s, order, OrderStatus.CONFIRMED, "Duplicate order")
@@ -237,9 +237,94 @@ def _ensure_setup():
         print("Seeded DB (user=%s, order=%s)" % (USER_ID, ORDER_ID))
 
 
+def test_7_per_payment_routing_razorpay_record_under_stripe_settings():
+    """Razorpay payment row routes to Razorpay even when global = stripe."""
+    print("\n=== TEST 7: per-payment routing (razorpay row, stripe settings) ===")
+    from unittest.mock import MagicMock
+    from app.services import refund_service as rs_mod
+
+    razorpay_svc = MagicMock()
+    razorpay_svc.get_payment_id_for_order = MagicMock(
+        return_value="pay_TWckya4DzCJzw3"
+    )
+    razorpay_svc.create_refund.return_value = {
+        "status": "processed",
+        "refund_id": "rfnd_routed_rzp_001",
+        "payment_id": "pay_TWckya4DzCJzw3",
+        "amount": 1169.5,
+    }
+    stripe_svc = MagicMock()
+    stripe_svc.get_payment_id_for_order = MagicMock(
+        side_effect=Exception("No such payment_intent")
+    )
+    stripe_svc.create_refund.side_effect = AssertionError(
+        "Stripe must NOT be called for a Razorpay payment"
+    )
+
+    def _route(payment=None, **kwargs):
+        name = getattr(getattr(payment, "provider", None), "value",
+                       str(getattr(payment, "provider", ""))).lower()
+        if name == "razorpay":
+            return razorpay_svc
+        return stripe_svc
+
+    with Session(ENGINE) as s:
+        order = new_paid_order(s)
+        # Simulate ORD-20260901085753: order-level id stored, charge id NOT
+        # yet settled on the row.
+        from sqlmodel import select as _select
+        pay = s.exec(
+            _select(Payment).where(Payment.order_id == order.id)
+        ).first()
+        pay.provider = PaymentProvider.RAZORPAY
+        pay.provider_payment_id = "order_TWckp9KZO8kGBb"
+        pay.provider_payment_intent = None
+        s.add(pay)
+        s.commit()
+        s.refresh(order)
+
+        with patch.object(
+            rs_mod, "get_payment_service_for_payment", side_effect=_route
+        ), patch.object(
+            rs_mod, "get_payment_service", return_value=stripe_svc
+        ):
+            result = process_refund(s, order, OrderStatus.CONFIRMED, "Changed my mind")
+            assert result["processed"] is True, result
+            assert result["refund_id"] == "rfnd_routed_rzp_001"
+            razorpay_svc.create_refund.assert_called_once()
+            args, _ = razorpay_svc.create_refund.call_args
+            assert args[0] == "pay_TWckya4DzCJzw3", args
+            assert stripe_svc.create_refund.call_count == 0
+            print("  ✅ routed to Razorpay, refunded pay_TWckya4DzCJzw3")
+
+
+def test_8_cod_payment_refused_without_psp_call():
+    """COD rows never touch a PSP — clear 400-style message instead."""
+    print("\n=== TEST 8: COD payment refused ===")
+    with Session(ENGINE) as s:
+        order = new_paid_order(s)
+        from sqlmodel import select as _select
+        pay = s.exec(
+            _select(Payment).where(Payment.order_id == order.id)
+        ).first()
+        pay.provider = PaymentProvider.COD
+        s.add(pay)
+        s.commit()
+        s.refresh(order)
+        result = process_refund(
+            s, order, OrderStatus.CONFIRMED, "Changed my mind",
+            idempotency_key=f"test-cod-{uuid4().hex}",
+        )
+        assert result["processed"] is False, result
+        assert "Cash on Delivery" in result["message"], result
+        print("  ✅ COD refused:", result["message"])
+
+
 def run_all():
     test_1_refund_service_sets_initiated_when_pending()
     test_2_refund_service_sets_completed_when_processed()
+    test_7_per_payment_routing_razorpay_record_under_stripe_settings()
+    test_8_cod_payment_refused_without_psp_call()
     test_3_webhook_refund_processed()
     test_4_webhook_refund_failed()
     test_5_webhook_unknown_refund_id_no_crash()

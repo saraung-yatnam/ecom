@@ -248,6 +248,35 @@ class RazorpayPaymentService(PaymentService):
             print(f"❌ Razorpay refund failed: {str(e)}")
             return {"status": "failed", "payment_id": payment_id, "is_dummy": False, "error": str(e)}
 
+    def get_charge_refund_state(self, payment_id: str) -> dict | None:
+        """Refunded totals straight from Razorpay (catches dashboard-side refunds)."""
+        if not self.is_configured:
+            return None
+        try:
+            items = self.client.payment.fetch_multiple_refund(payment_id).get(
+                "items", []
+            )
+            refunds = [
+                {
+                    "id": r.get("id"),
+                    "amount": (r.get("amount") or 0) / 100,
+                    "status": r.get("status", "unknown"),
+                }
+                for r in items
+            ]
+            succeeded = [r for r in refunds if r["status"] in ("processed",)]
+            payment = self.client.payment.fetch(payment_id)
+            return {
+                "charge_id": payment_id,
+                "charge_total": (payment.get("amount") or 0) / 100,
+                "currency": str(payment.get("currency") or "").upper(),
+                "refunded_total": round(sum(r["amount"] for r in succeeded), 2),
+                "refunds": refunds,
+            }
+        except Exception as e:
+            print(f"⚠️ Could not fetch Razorpay refund state for {payment_id}: {e}")
+            return None
+
     def get_refund_status(self, refund_id):
         """Fetch a refund from Razorpay by its refund ID (rfnd_xxx)."""
         if not self.is_configured:

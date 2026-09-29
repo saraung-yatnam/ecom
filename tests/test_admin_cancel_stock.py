@@ -1,6 +1,6 @@
 # tests/test_admin_cancel_stock.py
 """
-Functional test: admin status-change path (PUT /admin/orders/{id}/status).
+Functional test: admin cancel path (POST /admin/orders/{id}/cancel).
 
 Verifies:
   1. Admin cancelling an active order RESTORES variant stock (parity with the
@@ -9,6 +9,9 @@ Verifies:
      (prevents double stock restore via re-cancel).
   3. Shipped / delivered orders cannot be cancelled from the admin panel.
   4. Normal transitions (pending -> shipped) still work and don't touch stock.
+
+Money states (cancelled/refunded) are rejected by PUT
+/admin/orders/{id}/status and must go through the unified cancel endpoint.
 
 Run:  PYTHONPATH=. python tests/test_admin_cancel_stock.py
 """
@@ -27,7 +30,9 @@ from app.models.address import Address
 from app.models.product import Product, ProductVariant
 
 from app.api.v1.admin.orders import update_order_status_admin
+from app.api.v1.admin.refunds import admin_cancel_order
 from app.schemas.order import OrderStatusUpdate
+from app.schemas.refund import AdminCancelRequest
 
 ENGINE = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
 
@@ -130,12 +135,32 @@ def _stock(order_id) -> int:
         return s.get(ProductVariant, order.items[0].variant_id).stock
 
 
+def _admin_cancel(order_id, refund_choice="later"):
+    """Call the unified cancel endpoint directly (bypasses auth Depends)."""
+    with Session(ENGINE) as s:
+        admin = s.get(User, ADMIN_ID)
+        try:
+            result = admin_cancel_order(
+                order_id=order_id,
+                data=AdminCancelRequest(
+                    reason="test cancel", refund_choice=refund_choice
+                ),
+                session=s,
+                request=None,
+                current_user=admin,
+            )
+            return result, None
+        except HTTPException as e:
+            s.rollback()
+            return None, e
+
+
 def test_1_admin_cancel_restores_stock():
     print("\n=== TEST 1: admin cancel restores stock ===")
     stock_before = _stock(ORDER_ID)
-    order, err = _set_status(ORDER_ID, "cancelled")
+    result, err = _admin_cancel(ORDER_ID)
     assert err is None, err
-    assert order.status == OrderStatus.CANCELLED, order.status
+    assert result["status"] == OrderStatus.CANCELLED.value, result["status"]
     stock_after = _stock(ORDER_ID)
     assert stock_after == stock_before + QTY, (
         f"Expected stock {stock_before + QTY}, got {stock_after}"
@@ -163,7 +188,7 @@ def test_3_shipped_order_cannot_be_cancelled():
             product_name="Test Mug", stock=7,
         )
         order_id = order.id
-    _, err = _set_status(order_id, "cancelled")
+    _, err = _admin_cancel(order_id)
     assert err is not None, "Expected HTTPException, got success"
     assert err.status_code == 400, err.status_code
     assert "cannot be cancelled" in err.detail, err.detail
@@ -188,20 +213,26 @@ def test_4_refunded_order_is_terminal():
 
 
 def test_5_normal_transition_untouched():
-    print("\n=== TEST 5: normal transition (pending -> shipped) still works ===")
+    print("\n=== TEST 5: forward-only workflow (pending -> confirmed ok, jumps rejected) ===")
     with Session(ENGINE) as s:
         order = _make_order(
             s, status=OrderStatus.PENDING, sku_prefix="CAP",
             product_name="Test Cap", stock=4,
         )
         order_id = order.id
-    order, err = _set_status(order_id, "shipped")
+    # Legal single step works and doesn't touch stock.
+    _, err = _set_status(order_id, "confirmed")
     assert err is None, err
-    assert order.status == OrderStatus.SHIPPED, order.status
-    assert order.shipped_at is not None, "shipped_at must be auto-set"
-    assert _stock(order_id) == 4, "stock must NOT change on shipped"
-    print("  ✅ status pending -> shipped, shipped_at set")
-    print("  ✅ stock unchanged at 4")
+    with Session(ENGINE) as s:
+        assert s.get(Order, order_id).status == OrderStatus.CONFIRMED
+    assert _stock(order_id) == 4, "stock must NOT change on confirm"
+    print("  ✅ status pending -> confirmed, stock unchanged at 4")
+    # Skipping stages is rejected (no more silent misclicks).
+    _, err = _set_status(order_id, "shipped")
+    assert err is not None, "Expected HTTPException, got success"
+    assert err.status_code == 400, err.status_code
+    assert "Allowed next" in err.detail, err.detail
+    print(f"  ✅ 400: {err.detail}")
 
 
 def _ensure_setup():

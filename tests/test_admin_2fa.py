@@ -171,6 +171,7 @@ def test_verify_correct_code_issues_tokens(client):
         resp.json()["access_token"],
         settings.JWT_SECRET_KEY,
         algorithms=[settings.JWT_ALGORITHM],
+        audience="admin",
     )
     assert payload["sub"] == "staffer@2fa-test.com"
     assert "products.view" in payload["permissions"]

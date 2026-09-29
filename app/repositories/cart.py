@@ -228,10 +228,11 @@ def apply_coupon_to_cart(
     
     # Apply coupon to cart
     cart.coupon_code = coupon_code
-    
-    # Increment coupon usage
-    coupon_repo.increment_coupon_usage(session, coupon)
-    
+
+    # NOTE: usage is counted at CHECKOUT (order placement), not here. Counting
+    # at apply time burns max_uses budget on abandoned carts (and checkout
+    # counted again → double-count). Per-user limits are order-based and
+    # unaffected.
     session.add(cart)
     session.commit()
     session.refresh(cart)

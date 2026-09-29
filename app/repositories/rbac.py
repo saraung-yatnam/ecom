@@ -12,7 +12,20 @@ from app.models.rbac import (
     RolePermissionLink,
     UserRoleLink,
 )
-from app.models.user import User
+from app.models.user import User, UserRole
+
+
+# Privilege rank for the single legacy ``users.role`` column, mirroring the
+# declaration order of ``UserRole`` (customer < staff < manager < admin).
+# Only legacy slugs are ranked; custom role slugs rank below every legacy one.
+_LEGACY_ROLE_RANK: dict[str, int] = {
+    slug.value: index for index, slug in enumerate(UserRole)
+}
+
+
+def legacy_role_rank(slug: str) -> int:
+    """Higher is more privileged; unknown/custom slugs rank lowest."""
+    return _LEGACY_ROLE_RANK.get(slug, -1)
 
 
 def list_permissions(session: Session) -> list[Permission]:
@@ -101,6 +114,7 @@ def create_role(
     description: str | None,
     permission_keys: list[str],
     created_by: UUID | None = None,
+    max_refund_amount=None,
 ) -> Role:
     unknown = validate_permission_keys(permission_keys)
     if unknown:
@@ -114,6 +128,7 @@ def create_role(
         description=description,
         is_system=False,
         created_by=created_by,
+        max_refund_amount=max_refund_amount,
     )
     session.add(role)
     session.flush()
@@ -249,11 +264,15 @@ def set_user_roles(
                 assigned_by=assigned_by,
             )
         )
-    # Legacy display field: first role slug, fallback keeps old value.
+    # Legacy display field: the HIGHEST-privilege assigned slug, so stacking a
+    # read-only role (e.g. ``customer``) on top of ``manager`` can never
+    # downgrade the single ``users.role`` value old clients gate on. Falls back
+    # to keeping the previous value when no assigned role is a legacy slug.
     if roles:
         legacy_values = {r.value for r in type(user.role)}
-        primary = roles[0].slug
-        if primary in legacy_values:
+        candidates = [r.slug for r in roles if r.slug in legacy_values]
+        if candidates:
+            primary = max(candidates, key=legacy_role_rank)
             user.role = type(user.role)(primary)
     session.add(user)
     session.commit()

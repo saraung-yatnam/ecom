@@ -4,7 +4,10 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session
 
-from app.core.security import decode_access_token
+from app.core.security import (
+    AUDIENCE_ADMIN,
+    decode_access_token,
+)
 from app.db.database import get_session
 from app.models.user import User, UserRole
 from app.repositories.user import get_user_by_email
@@ -61,6 +64,29 @@ CurrentUser = Annotated[
 ]
 
 
+# Returned by require_perm/require_role so they can read the caller's token
+# audience. Decoding is cheap and happens once per request.
+TokenPayload = Annotated[
+    dict,
+    Depends(lambda token=Depends(oauth2_scheme): decode_access_token(token) or {}),
+]
+
+
+def _assert_admin_audience(payload: dict) -> None:
+    """Reject storefront-scoped sessions on privileged endpoints.
+
+    Tokens issued before the ``aud`` claim existed have no audience at all;
+    treat those as admin so existing sessions (all created via the OTP-gated
+    login) keep working.
+    """
+    audience = payload.get("aud")
+    if audience is not None and audience != AUDIENCE_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This session is not authorized for the admin panel",
+        )
+
+
 def get_user_role_slugs(session: Session, user: User) -> set[str]:
     """Role slugs from the dynamic ``user_roles`` table, falling back to the
     legacy ``User.role`` enum for users not yet backfilled."""
@@ -80,7 +106,10 @@ def require_role(*allowed: UserRole):
     def checker(
         session: SessionDep,
         user: CurrentUser,
+        payload: TokenPayload,
     ) -> User:
+
+        _assert_admin_audience(payload)
 
         allowed_slugs = {
             getattr(r, "value", r) if not isinstance(r, str) else r
@@ -102,12 +131,19 @@ def require_perm(*permissions: str, require_all: bool = True):
 
     Checks the union of the caller's role grants in the DB — custom roles
     created from the dashboard work automatically.
+
+    Also enforces the token audience: a storefront-scoped session is refused
+    before permissions are even consulted, so shopping in the shop never grants
+    admin reach.
     """
 
     def checker(
         session: SessionDep,
         user: CurrentUser,
+        payload: TokenPayload,
     ) -> User:
+
+        _assert_admin_audience(payload)
 
         # Local import (see get_user_role_slugs).
         from app.repositories import rbac as rbac_repo
