@@ -21,6 +21,11 @@ from app.services.refund_service import fetch_refund_status, process_refund, res
 from app.services.shipping_status import shipment_stage_payload
 from app.repositories import notification as notification_repo
 from app.core.config import settings
+from app.core.store_settings import get_store_settings
+
+
+def _refund_processing_days() -> int:
+    return int(get_store_settings().refund_processing_days)
 
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
@@ -246,11 +251,11 @@ def get_refund_status(
     elif order.payment_status == "refund_initiated":
         message = (
             f"Your refund of ₹{order.refund_amount} is being processed. "
-            f"It will be credited within {settings.REFUND_PROCESSING_DAYS} business days."
+            f"It will be credited within {_refund_processing_days()} business days."
         )
     else:
         status_messages = {
-            "processed": f"Refund of ₹{order.refund_amount} has been processed. It will reflect in your account within {settings.REFUND_PROCESSING_DAYS} business days.",
+            "processed": f"Refund of ₹{order.refund_amount} has been processed. It will reflect in your account within {_refund_processing_days()} business days.",
             "pending": "Refund is being processed. Please check back shortly.",
             "failed": "Refund failed. Please contact support for assistance.",
         }

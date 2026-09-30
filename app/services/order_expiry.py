@@ -92,8 +92,10 @@ def notify_order_cancelled(session: Session, order: Order) -> None:
 
 def expire_stale_pending_orders(session: Session) -> dict:
     """Auto-cancel every unpaid online order older than the expiry window."""
+    from app.core.store_settings import get_store_settings
+
     cutoff = datetime.now(timezone.utc) - timedelta(
-        minutes=settings.PENDING_ORDER_EXPIRY_MINUTES
+        minutes=get_store_settings(session).pending_order_expiry_minutes
     )
     statement = (
         select(Order)

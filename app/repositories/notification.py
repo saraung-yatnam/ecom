@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func
 from sqlmodel import Session, select, col
 
-from app.models.notification import Notification, NotificationType
+from app.models.notification import Notification, NotificationType, PromotionBroadcast
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 
@@ -234,13 +234,8 @@ def notify_customer_status_changed(session: Session, order: Order, new_status: s
     return 1
 
 
-def broadcast_promotion(
-    session: Session,
-    title: str,
-    message: str,
-    link: str | None = None,
-) -> tuple[UUID, int]:
-    """Create a promotion notification for every true shopper.
+def _promotion_audience(session: Session) -> list[User]:
+    """Every true shopper (feed audience for promotions).
 
     Shoppers = active + push-enabled users holding ZERO dynamic
     permissions. The legacy ``role == customer`` check is kept only as a
@@ -250,7 +245,6 @@ def broadcast_promotion(
     """
     from app.models.rbac import Role, RolePermissionLink, UserRoleLink
 
-    broadcast_id = uuid4()
     grant_count = session.execute(
         select(func.count()).select_from(RolePermissionLink)
     ).scalar() or 0
@@ -277,6 +271,40 @@ def broadcast_promotion(
     # Legacy fallback: no RBAC rows at all (pre-backfill DB) → legacy check.
     if not use_dynamic:
         customers = [u for u in customers if _legacy_is_customer(u)]
+    return list(customers)
+
+
+def promotion_email_audience(session: Session) -> list[User]:
+    """Shopper audience further gated on the Email Notifications toggle.
+
+    Same audience as the feed, minus anyone who turned
+    ``email_notifications_enabled`` off (storefront/admin Settings).
+    Staff are never recipients of promotions in any channel.
+    """
+    return [
+        u for u in _promotion_audience(session)
+        if bool(getattr(u, "email_notifications_enabled", True))
+    ]
+
+
+#: Public alias — the feed audience for the estimate endpoint.
+promotion_feed_audience = _promotion_audience
+
+
+def broadcast_promotion(
+    session: Session,
+    title: str,
+    message: str,
+    link: str | None = None,
+    created_by: UUID | None = None,
+) -> tuple[UUID, int]:
+    """Create a promotion notification for every true shopper + header row.
+
+    Only stages rows (feed + ``PromotionBroadcast`` header) — the caller
+    commits, so notification failures can never break the main flow.
+    """
+    broadcast_id = uuid4()
+    customers = _promotion_audience(session)
     for user in customers:
         _insert(
             session,
@@ -287,7 +315,30 @@ def broadcast_promotion(
             link=link,
             broadcast_id=broadcast_id,
         )
+    session.add(
+        PromotionBroadcast(
+            id=broadcast_id,
+            title=title,
+            message=message,
+            link=link,
+            recipients_count=len(customers),
+            created_by=created_by,
+        )
+    )
     return broadcast_id, len(customers)
+
+
+def record_broadcast_email_result(
+    session: Session, broadcast_id: UUID, sent: int, failed: int
+) -> None:
+    """Stage the email fan-out outcome on the broadcast header row."""
+    header = session.get(PromotionBroadcast, broadcast_id)
+    if header is None:
+        return
+    header.email_requested = True
+    header.emails_sent = int(sent)
+    header.emails_failed = int(failed)
+    session.add(header)
 
 
 def _legacy_is_customer(user: User) -> bool:
@@ -388,19 +439,71 @@ def delete_notification(session: Session, user_id: UUID, notification_id: UUID) 
 
 
 def retract_broadcast(session: Session, broadcast_id: UUID) -> int:
-    """Delete every notification row belonging to a promotional broadcast."""
+    """Delete every notification row belonging to a promotional broadcast.
+
+    Also deletes the broadcast header, so a retracted promo vanishes from
+    history too (emails already sent can't be recalled — only the record
+    of the blast goes with it).
+    """
     rows = session.exec(
         select(Notification).where(col(Notification.broadcast_id) == broadcast_id)
     ).all()
     for row in rows:
         session.delete(row)
+    header = session.get(PromotionBroadcast, broadcast_id)
+    if header is not None:
+        session.delete(header)
     return len(rows)
+
+
+def _aware_moment(value: datetime | None) -> datetime:
+    """Normalize a stored timestamp to offset-aware (UTC) for sorting.
+
+    Legacy ``notifications.created_at`` values come back offset-naive
+    (plain TIMESTAMP column) while new header rows are offset-aware —
+    comparing them raises ``TypeError`` and 500s the history endpoint.
+    """
+    if value is None:
+        return datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def promotion_history(
     session: Session, skip: int = 0, limit: int = 20
 ) -> list[dict]:
-    """Group broadcast rows by broadcast_id for the Promotions history panel."""
+    """Broadcast history, newest first — header rows plus legacy fallback.
+
+    Header rows (all new broadcasts) carry email counts. Broadcasts that
+    predate the header table are reconstructed by grouping their feed rows,
+    exactly as before, with zeroed email fields.
+    """
+    headers = session.exec(
+        select(PromotionBroadcast)
+        .order_by(col(PromotionBroadcast.created_at).desc())
+        .offset(skip)
+        .limit(limit)
+    ).all()
+    header_ids = {h.id for h in headers}
+    items = [
+        {
+            "id": h.id,
+            "title": h.title,
+            "message": h.message,
+            "link": h.link,
+            "recipients_count": int(h.recipients_count or 0),
+            "email_requested": bool(h.email_requested),
+            "emails_sent": int(h.emails_sent or 0),
+            "emails_failed": int(h.emails_failed or 0),
+            "created_at": _aware_moment(h.created_at),
+        }
+        for h in headers
+    ]
+    # Legacy broadcasts without a header row (pre-migration sends).
+    filters = [col(Notification.broadcast_id).is_not(None)]
+    if header_ids:
+        filters.append(col(Notification.broadcast_id).not_in(header_ids))
     rows = session.exec(
         select(
             Notification.broadcast_id,
@@ -410,21 +513,25 @@ def promotion_history(
             func.count(),
             func.min(Notification.created_at),
         )
-        .where(col(Notification.broadcast_id).is_not(None))
+        .where(*filters)
         .group_by(col(Notification.broadcast_id))
         .order_by(func.min(Notification.created_at).desc())
         .offset(skip)
         .limit(limit)
     ).all()
-
-    return [
+    items.extend(
         {
             "id": row[0],
             "title": row[1],
             "message": row[2],
             "link": row[3],
             "recipients_count": int(row[4]),
-            "created_at": row[5] or datetime.now(timezone.utc),
+            "email_requested": False,
+            "emails_sent": 0,
+            "emails_failed": 0,
+            "created_at": _aware_moment(row[5]),
         }
         for row in rows
-    ]
+    )
+    items.sort(key=lambda e: e["created_at"], reverse=True)
+    return items[:limit]

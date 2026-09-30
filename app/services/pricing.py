@@ -40,10 +40,10 @@ from app.utils.coupon import calculate_discount, validate_coupon
 
 
 def _tax_rate() -> Decimal:
-    """Configured tax rate as Decimal (falls back to 18% GST)."""
-    if hasattr(settings, "TAX_RATE"):
-        return Decimal(str(settings.TAX_RATE))
-    return Decimal("0.18")
+    """Store tax rate as Decimal (DB-backed, env fallback)."""
+    from app.core.store_settings import get_store_settings
+
+    return Decimal(str(get_store_settings().tax_rate))
 
 
 def _enum_value(field) -> str:

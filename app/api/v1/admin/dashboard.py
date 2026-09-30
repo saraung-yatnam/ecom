@@ -29,6 +29,14 @@ def get_admin_dashboard(
     # Revenue stats
     revenue_stats = analytics_repo.get_dashboard_stats(session)
     
+    # Top products by revenue (last 30 days) — consumed by the dashboard widget
+    # via `revenue.top_products`. Kept inside `revenue` because the Dashboard
+    # page renders <RevenueChart data={dashboardData.revenue} />. Top 4 keeps the
+    # ranked list readable (a wider set turns into an unreadable bar chart).
+    revenue_stats["top_products"] = analytics_repo.get_dashboard_top_products(
+        session, limit=4, days=30
+    )
+    
     # Recent orders
     recent_orders = order_repo.get_recent_orders(session, limit=10)
     

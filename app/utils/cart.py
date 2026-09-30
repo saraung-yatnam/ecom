@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import List
 
-from app.core.config import settings
+from app.core.store_settings import get_store_settings
 from app.models.cart import Cart, CartItem
 from app.models.product import ProductVariant
 
@@ -55,7 +55,7 @@ def calculate_tax(cart: Cart, tax_rate: Decimal = None) -> Decimal:
         Decimal: Tax amount
     """
     if tax_rate is None:
-        tax_rate = Decimal(str(settings.TAX_RATE)) if hasattr(settings, 'TAX_RATE') else Decimal("0.18")
+        tax_rate = Decimal(str(get_store_settings().tax_rate))
     
     subtotal = calculate_subtotal(cart)
     discount = calculate_discount(cart)
@@ -75,7 +75,7 @@ def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = None) -> D
         Decimal: Shipping cost
     """
     if free_shipping_threshold is None:
-        threshold = Decimal(str(settings.FREE_SHIPPING_THRESHOLD)) if hasattr(settings, 'FREE_SHIPPING_THRESHOLD') else Decimal("1000.00")
+        threshold = Decimal(str(get_store_settings().free_shipping_threshold))
     else:
         threshold = free_shipping_threshold
     
@@ -87,7 +87,7 @@ def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = None) -> D
     if subtotal >= threshold:
         return Decimal("0.00")
     
-    shipping_cost = Decimal(str(settings.SHIPPING_COST)) if hasattr(settings, 'SHIPPING_COST') else Decimal("50.00")
+    shipping_cost = Decimal(str(get_store_settings().shipping_cost))
     return shipping_cost
 
 

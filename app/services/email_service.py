@@ -709,6 +709,65 @@ class EmailService:
         """
         self._send_email(user.email, subject, html_content)
 
+    def send_promotion_email(
+        self,
+        to_email: str,
+        to_name: str | None,
+        title: str,
+        message: str,
+        link: str | None = None,
+    ) -> bool:
+        """Send one promotional email (bulk fan-out calls this per recipient).
+
+        Promotional mail is consent-gated by the caller on
+        ``User.email_notifications_enabled`` — this method sends blindly.
+        """
+        name = (to_name or "").strip() or "there"
+        cta = ""
+        if (link or "").strip():
+            cta = f"""
+            <p style="text-align: center; margin: 24px 0;">
+                <a href="{link.strip()}"
+                   style="display: inline-block; background: #2563eb; color: white;
+                          padding: 12px 28px; text-decoration: none; border-radius: 6px;
+                          font-weight: bold;">Shop Now</a>
+            </p>"""
+        subject = title.strip()
+        plain_text = (
+            f"Hi {name},\n\n{title.strip()}\n\n{message.strip()}\n"
+            + (f"\nShop now: {link.strip()}\n" if (link or "").strip() else "")
+            + "\nYou received this because Email Notifications are on in your "
+              "account. Turn them off anytime under Settings → Notifications."
+        )
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; color: #333; }}
+                .header {{ background: #2563eb; color: white; padding: 20px; text-align: center; }}
+                .content {{ padding: 20px; }}
+                .footer {{ margin-top: 20px; padding: 20px; text-align: center; color: #888; font-size: 12px; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>📣 {title.strip()}</h1>
+            </div>
+            <div class="content">
+                <p>Hi {name},</p>
+                <p>{message.strip()}</p>
+                {cta}
+            </div>
+            <div class="footer">
+                <p>You received this because Email Notifications are on in your account.</p>
+                <p>Turn them off anytime under Settings → Notifications.</p>
+            </div>
+        </body>
+        </html>
+        """
+        return self._send_email(to_email, subject, html_content, plain_text)
+
 
 # Singleton instance
 email_service = EmailService()

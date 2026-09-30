@@ -19,11 +19,25 @@ from app.repositories import refund as refund_repo
 from app.services.payment_service import get_payment_service, get_payment_service_for_payment
 
 
-# Restocking fee % keyed by the order status AT THE TIME of cancellation
+def _refund_processing_days() -> int:
+    from app.core.store_settings import get_store_settings
+
+    return int(get_store_settings().refund_processing_days)
+
+
+# Restocking fee % keyed by the order status AT THE TIME of cancellation.
+# Store policy (DB-backed, env fallback) — read live so admin edits apply
+# without a restart.
+def _restocking_fee(which: str) -> float:
+    from app.core.store_settings import get_store_settings
+
+    return float(getattr(get_store_settings(), f"restocking_fee_{which}"))
+
+
 RESTOCKING_FEE_MAP = {
-    OrderStatus.PENDING: lambda: settings.RESTOCKING_FEE_PENDING,        # 0%
-    OrderStatus.CONFIRMED: lambda: settings.RESTOCKING_FEE_CONFIRMED,    # 5%
-    OrderStatus.PROCESSING: lambda: settings.RESTOCKING_FEE_PROCESSING,  # 15%
+    OrderStatus.PENDING: lambda: _restocking_fee("pending"),        # 0%
+    OrderStatus.CONFIRMED: lambda: _restocking_fee("confirmed"),    # 5%
+    OrderStatus.PROCESSING: lambda: _restocking_fee("processing"),  # 15%
 }
 
 # Provider refund-status values that mean "refund was accepted and is in flight"
@@ -332,7 +346,7 @@ def process_refund(
             "message": (
                 f"Refund of ₹{refund_amount} initiated successfully. "
                 f"It will reflect in your account within "
-                f"{settings.REFUND_PROCESSING_DAYS} business days."
+                f"{_refund_processing_days()} business days."
             ),
         }
 

@@ -15,7 +15,9 @@ from app.models.review import Review  # 👈 ADD THIS LINE
 from app.models.wishlist import Wishlist
 from app.models.coupon import Coupon, CouponType, DiscountType, TriggerType  # Add this
 from app.models.password_reset import PasswordResetToken  # Add this
-from app.models.notification import Notification, NotificationType
+from app.models.notification import Notification, NotificationType, PromotionBroadcast
+from app.models.store_settings import StoreSettings
+from app.models.content_block import ContentBlock
 from app.models.otp import OTP
 
 __all__ = [
@@ -51,5 +53,8 @@ __all__ = [
     "PasswordResetToken",  # Add this
     "Notification",
     "NotificationType",
+    "PromotionBroadcast",
+    "StoreSettings",
+    "ContentBlock",
     "OTP"
 ]

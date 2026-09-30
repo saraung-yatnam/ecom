@@ -19,6 +19,10 @@ class Review(SQLModel, table=True):
 
     is_verified_purchase: bool = Field(default=False)  # 👈 new
 
+    # Moderation: hidden reviews stay in the DB (audit trail) but are
+    # excluded from every storefront read path (list, averages, stats).
+    is_hidden: bool = Field(default=False, index=True)
+
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),

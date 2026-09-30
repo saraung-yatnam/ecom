@@ -122,6 +122,7 @@ def get_product_rating_stats(
     Returns a dict keyed by product_id: {"average_rating": float, "review_count": int}.
     Products with no reviews simply won't have an entry — callers should
     default to {"average_rating": 0.0, "review_count": 0}.
+    Hidden (moderated) reviews are excluded, matching the storefront paths.
     """
     if not product_ids:
         return {}
@@ -132,7 +133,7 @@ def get_product_rating_stats(
             func.avg(Review.rating).label("average_rating"),
             func.count(Review.id).label("review_count"),
         )
-        .where(Review.product_id.in_(product_ids))
+        .where(Review.product_id.in_(product_ids), Review.is_hidden == False)  # noqa: E712
         .group_by(Review.product_id)
     )
 

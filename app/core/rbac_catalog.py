@@ -41,6 +41,7 @@ PERMISSIONS: list[tuple[str, str, str, str]] = [
     ("roles.manage", "Manage roles", "roles", "Create/update/delete roles and their permissions"),
     # Reviews / payments / notifications / settings
     ("reviews.moderate", "Moderate reviews", "reviews", "Reserved for review moderation endpoints"),
+    ("content.manage", "Manage content", "content", "Create/edit storefront content blocks and banners"),
     ("payments.view", "View payments", "payments", "Reserved for payment inspection endpoints"),
     ("notifications.manage", "Manage notifications", "notifications", "Admin notification endpoints"),
     ("settings.manage", "Manage settings", "settings", "Access admin settings pages"),
@@ -70,6 +71,7 @@ _MANAGER_PERMS: list[str] = [
     "coupons.view",
     "coupons.manage",
     "promotions.send",
+    "content.manage",
     "users.view",
     "notifications.manage",
 ]

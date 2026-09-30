@@ -195,13 +195,14 @@ class Order(SQLModel, table=True):
     @property
     def restocking_fee_percentage(self) -> float:
         """Restocking fee % based on the order status at cancellation time."""
-        from app.core.config import settings
+        from app.core.store_settings import get_store_settings
 
+        store = get_store_settings()
         if self.status == OrderStatus.PROCESSING:
-            return settings.RESTOCKING_FEE_PROCESSING
+            return store.restocking_fee_processing
         if self.status == OrderStatus.CONFIRMED:
-            return settings.RESTOCKING_FEE_CONFIRMED
-        return settings.RESTOCKING_FEE_PENDING
+            return store.restocking_fee_confirmed
+        return store.restocking_fee_pending
 
 
 class OrderItem(SQLModel, table=True):

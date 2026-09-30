@@ -117,6 +117,18 @@ print(f"CORS_ORIGINS_LIST: {settings.cors_origins_list}")
 app.include_router(api_router, prefix="/api/v1")
 
 
+# User-uploaded content (banner/hero images). Served straight from disk;
+# back up the uploads/ dir — it is user content, not code. The directory is
+# created on boot so a fresh clone serves (empty) instead of 500ing.
+from pathlib import Path as _Path  # noqa: E402
+
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_UPLOADS_DIR = _Path(__file__).resolve().parent.parent / "uploads"
+_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(_UPLOADS_DIR)), name="uploads")
+
+
 @app.get("/")
 def root():
     return {

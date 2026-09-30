@@ -39,3 +39,30 @@ class Notification(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+
+class PromotionBroadcast(SQLModel, table=True):
+    """Header row for one promotional broadcast (feed + optional email).
+
+    Feed rows in ``notifications`` carry the same ``id`` as their
+    ``broadcast_id``; email sends produce no feed rows, so their outcome
+    (``emails_sent`` / ``emails_failed``) lives here. History reads this
+    table first and falls back to grouping legacy feed rows for broadcasts
+    that predate it. Retracting a broadcast deletes its feed rows AND this
+    header, matching the historic "vanishes from history" behaviour.
+    """
+
+    __tablename__ = "promotion_broadcasts"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    title: str
+    message: str | None = None
+    link: str | None = None
+    recipients_count: int = Field(default=0)
+    email_requested: bool = Field(default=False)
+    emails_sent: int = Field(default=0)
+    emails_failed: int = Field(default=0)
+    created_by: UUID | None = Field(default=None, foreign_key="users.id")
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )

@@ -22,6 +22,7 @@ from app.utils.order import generate_order_number
 from app.repositories import notification as notification_repo
 from app.services.email_service import email_service
 from app.core.config import settings
+from app.core.store_settings import get_store_settings
 
 
 router = APIRouter(prefix="/checkout", tags=["Checkout"])
@@ -49,13 +50,14 @@ def get_checkout_config():
     server-side in `checkout()` below, which re-reads the same settings,
     re-applies the eligibility guards and persists `cod_fee` on the order row.
     """
+    store = get_store_settings()
     return CheckoutConfigResponse(
-        cod_fee=settings.COD_FEE,
-        cod_min_order_value=settings.COD_MIN_ORDER_VALUE,
-        cod_max_order_value=settings.COD_MAX_ORDER_VALUE,
-        free_shipping_threshold=settings.FREE_SHIPPING_THRESHOLD,
-        shipping_cost=settings.SHIPPING_COST,
-        tax_rate=settings.TAX_RATE,
+        cod_fee=store.cod_fee,
+        cod_min_order_value=store.cod_min_order_value,
+        cod_max_order_value=store.cod_max_order_value,
+        free_shipping_threshold=store.free_shipping_threshold,
+        shipping_cost=store.shipping_cost,
+        tax_rate=store.tax_rate,
     )
 
 
@@ -152,21 +154,22 @@ def checkout(
     # 9.5 Resolve payment method from checkout body (persisted on the order)
     payment_method = checkout_data.payment_method.value  # cod | online
     
-    # 10. COD (Cash on Delivery) handling
+    # 10. COD (Cash on Delivery) handling (store policy, session-fresh)
+    store_policy = get_store_settings(session)
     cod_fee = Decimal("0.00")
     if payment_method == "cod":
         # Industry-standard eligibility guards
-        if grand_total < Decimal(str(settings.COD_MIN_ORDER_VALUE)):
+        if grand_total < Decimal(str(store_policy.cod_min_order_value)):
             raise HTTPException(
                 status_code=400,
-                detail=f"Cash on Delivery is available only for orders of ₹{settings.COD_MIN_ORDER_VALUE:g} or more",
+                detail=f"Cash on Delivery is available only for orders of ₹{store_policy.cod_min_order_value:g} or more",
             )
-        if grand_total > Decimal(str(settings.COD_MAX_ORDER_VALUE)):
+        if grand_total > Decimal(str(store_policy.cod_max_order_value)):
             raise HTTPException(
                 status_code=400,
-                detail=f"Cash on Delivery is available only for orders up to ₹{settings.COD_MAX_ORDER_VALUE:g}. Please pay online.",
+                detail=f"Cash on Delivery is available only for orders up to ₹{store_policy.cod_max_order_value:g}. Please pay online.",
             )
-        cod_fee = Decimal(str(settings.COD_FEE))
+        cod_fee = Decimal(str(store_policy.cod_fee))
         grand_total += cod_fee
         print(f"COD order: fee={cod_fee}, payable on delivery={grand_total}")
 
