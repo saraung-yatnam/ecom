@@ -26,13 +26,11 @@ tracker (shiprocket.in/blog/shipment-tracking) and their RTO terminology guide
 (shiprocket.in/blog/return-to-origin-processing-terminology). Both are quoted in
 ``tests/test_shiprocket_shipping.py::test_14`` so a regression here is caught.
 
-The *numeric* ``shipment_status`` table below is best-effort: Shiprocket's API
-reference is a Postman Documenter app with no public OpenAPI spec, so the code
-numbers could not be confirmed against an official source. That is safe by
-construction — :func:`map_shiprocket_status` matches the human ``current_status`
-string first and only falls back to a number, so a wrong code degrades to a
-recorded scan rather than a wrong order transition. Verify the numbers against
-one real payload from your Shiprocket account's webhook tester when going live.
+The numeric table is the published Shiprocket Postman collection's Shipments /
+Tracking status table (12508904/TVCZbXSb), checked 2026-10-05. Order status codes
+are a DIFFERENT namespace: e.g. order 26 is Return Delivered, shipment 26 is
+Fulfilled. Never use order status codes as tracking codes. Human carrier labels
+take precedence; unknown numeric codes remain unknown rather than being guessed.
 """
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -43,57 +41,52 @@ from app.models.order import OrderStatus
 # Shiprocket's numeric shipment_status codes
 # ---------------------------------------------------------------------------
 SHIPROCKET_STATUS_CODES: dict[int, str] = {
-    1: "PENDING",
-    2: "READY TO SHIP",
-    3: "MANIFEST GENERATED",
-    4: "SHIPMENT GENERATED",
-    5: "CONFIRMED",
-    6: "ON HOLD",
-    7: "PICKED UP",
-    8: "IN TRANSIT",
-    9: "OUT FOR DELIVERY",
-    10: "DELIVERED",
-    11: "NOT SERVICEABLE",
+    1: "AWB ASSIGNED",
+    2: "LABEL GENERATED",
+    3: "PICKUP SCHEDULED",
+    4: "PICKUP QUEUED",
+    5: "MANIFEST GENERATED",
+    6: "SHIPPED",
+    7: "DELIVERED",
+    8: "CANCELLED",
+    9: "RTO INITIATED",
+    10: "RTO DELIVERED",
+    11: "PENDING",
     12: "LOST",
-    13: "CUSTOMER APPOINTMENT BOOKED",
-    14: "3PL MISSORT",
-    15: "RTO IN TRANSIT",
-    16: "RTO DISPATCHED",
-    17: "RTO",
-    18: "3PL RTO DELIVERED",
-    19: "3PL RTO MISSORT",
-    20: "CANCELLED",
-    21: "3PL RTO REQUESTED",
-    22: "3PL RTO INITIATED",
-    23: "DAMAGED",
-    24: "SHIPMENT LOST",
-    25: "NOC",
-    26: "24X7 SUPPORT",
-    27: "LABEL GENERATED",
-    28: "MANIFEST GENERATED",
-    29: "READY TO SHIP",
-    30: "PICKUP SCHEDULED",
-    31: "PICKUP OVERDUE",
-    32: "PICKUP ATTEMPTED",
-    33: "PICKUP SUCCESSFUL",
-    34: "SHIPMENT DISPATCHED",
-    35: "SHIPMENT PICKED UP",
-    36: "AWAITING PICKUP SCHEDULE",
-    37: "DATA RECEIVED",
-    38: "DATA NOT AVAILABLE",
-    39: "SHIPMENT CANCELLED",
-    40: "MANIFEST NOT GENERATED",
-    41: "PICKUP CANCELLED",
-    42: "RTO INITIATED",
-    43: "SHIPMENT NOT SERVICEABLE",
-    44: "SHIPMENT DAMAGED",
-    45: "SHIPMENT LOST",
+    13: "PICKUP ERROR",
+    14: "RTO ACKNOWLEDGED",
+    15: "PICKUP RESCHEDULED",
+    16: "CANCELLATION REQUESTED",
+    17: "OUT FOR DELIVERY",
+    18: "IN TRANSIT",
+    19: "OUT FOR PICKUP",
+    20: "PICKUP EXCEPTION",
+    21: "UNDELIVERED",
+    22: "DELAYED",
+    23: "PARTIAL DELIVERED",
+    24: "DESTROYED",
+    25: "DAMAGED",
+    26: "FULFILLED",
+    38: "REACHED AT DESTINATION",
+    39: "MISROUTED",
+    40: "RTO NDR",
+    41: "RTO OFD",
+    42: "PICKED UP",
+    43: "SELF FULFILLED",
 }
 
 #: Human label -> the status code Shiprocket pairs it with, used by the simulator.
 STATUS_CODE_BY_LABEL: dict[str, int] = {}
 for _code, _label in SHIPROCKET_STATUS_CODES.items():
     STATUS_CODE_BY_LABEL.setdefault(_label, _code)
+STATUS_CODE_BY_LABEL.update({"RETURN PICKUP GENERATED": 3, "RETURN PICKUP RESCHEDULED": 15,
+    "RETURN OUT FOR PICKUP": 19, "RETURN PICKED UP": 42, "RETURN IN TRANSIT": 18,
+    "RETURN OUT FOR DELIVERY": 17, "RETURN DELIVERED": 7, "RETURN PICKUP ERROR": 13,
+    "RETURN PICKUP EXCEPTION": 20, "RETURN UNDELIVERED": 21, "RETURN CANCELLED": 8,
+    # Human labels observed in courier scans mapped to the published shipment
+    # status namespace used in simulator payloads.
+    "RTO INITIATED": 9, "RTO IN TRANSIT": 18, "RTO DISPATCHED": 6,
+    "RTO OFD": 41, "RTO DELIVERED": 10, "RTO ACKNOWLEDGED": 14})
 # ---------------------------------------------------------------------------
 # Ordered transition rules
 # ---------------------------------------------------------------------------
@@ -122,6 +115,7 @@ _STATUS_RULES: tuple[tuple[str, Optional[OrderStatus], str], ...] = (
     ("PICKED UP", OrderStatus.SHIPPED, "IN TRANSIT"),
     ("ORDER PICKED", OrderStatus.SHIPPED, "IN TRANSIT"),
     ("PICKED", OrderStatus.SHIPPED, "IN TRANSIT"),
+    ("SHIPPED", OrderStatus.SHIPPED, "IN TRANSIT"),
     ("IN TRANSIT", OrderStatus.SHIPPED, "IN TRANSIT"),
     ("DISPATCHED", OrderStatus.SHIPPED, "IN TRANSIT"),
     # --- Pickup scheduling: real, but not an order-status change. The order
@@ -163,7 +157,7 @@ _STATUS_RULES: tuple[tuple[str, Optional[OrderStatus], str], ...] = (
 #: Real couriers send out-of-order and duplicate scans, and Shiprocket retries
 #: webhooks, so this is a correctness guard, not a nicety.
 TERMINAL_ORDER_STATUSES: frozenset[OrderStatus] = frozenset(
-    {OrderStatus.DELIVERED, OrderStatus.CANCELLED, OrderStatus.REFUNDED}
+    {OrderStatus.DELIVERED, OrderStatus.CANCELLED, OrderStatus.REFUNDED, OrderStatus.RTO}
 )
 
 #: A parcel handed back to the seller is restocked when it reaches the warehouse
@@ -177,7 +171,7 @@ def normalize_status(value: Any) -> str:
     """Coerce any status representation to an upper-case label.
 
     Shiprocket is inconsistent about types: ``current_status`` is a string
-    ("IN TRANSIT") but ``shipment_status`` is a numeric code (8) in the same
+    ("IN TRANSIT") but ``shipment_status`` is a numeric code (18) in the same
     payload. Calling ``.upper()`` on the raw value raises ``AttributeError`` on
     the int and 500s the webhook, which makes Shiprocket retry and eventually
     disable the endpoint — so normalise before any string operation.
@@ -202,6 +196,17 @@ def map_shiprocket_status(raw_status: Any) -> tuple[Optional[OrderStatus], str]:
     label = normalize_status(raw_status)
     if not label:
         return None, "UNKNOWN"
+
+    # Failed/partial delivery must not substring-match DELIVERED. RTO remains
+    # on the original shipment and keeps its exact phase for presentation.
+    if "RTO" in label:
+        return OrderStatus.RTO, label
+    if "UNDELIVERED" in label or "NOT DELIVERED" in label:
+        return None, "UNDELIVERED"
+    if "PARTIAL DELIVERED" in label or "PARTIAL_DELIVERED" in label:
+        return None, "PARTIAL DELIVERED"
+    if label in {"DELAYED", "MISROUTED", "DESTROYED", "PICKUP ERROR", "PICKUP EXCEPTION", "PICKUP RESCHEDULED", "OUT FOR PICKUP"}:
+        return None, label
 
     for needle, order_status, shipment_status in _STATUS_RULES:
         if needle in label:
@@ -260,8 +265,11 @@ def build_tracking_webhook_payload(
     shipment_status: Optional[int] = None,
     location: str = "Regional Processing Hub",
     activity: Optional[str] = None,
-    order_id: Optional[int] = None,
+    order_id: Optional[str | int] = None,
     is_return: int = 0,
+    label_generated: bool = False,
+    manifest_generated: bool = False,
+    pickup_scheduled: bool = False,
 ) -> dict[str, Any]:
     """Build a payload shaped exactly like Shiprocket's tracking webhook.
 
@@ -276,7 +284,7 @@ def build_tracking_webhook_payload(
     code = (
         shipment_status
         if shipment_status is not None
-        else STATUS_CODE_BY_LABEL.get(label, 8)
+        else STATUS_CODE_BY_LABEL.get(label)
     )
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     is_rto = "RTO" in label
@@ -287,15 +295,15 @@ def build_tracking_webhook_payload(
             "id": order_id,
             "awb": awb,
             "awb_code": awb,
-            "is_label_generated": True,
-            "is_manifest_generated": True,
-            "is_pickup_scheduled": code in (30, 32, 33, 34, 35),
-            "is_courier_awaiting": code in (1, 2, 3, 4, 5, 36),
+            "is_label_generated": label_generated,
+            "is_manifest_generated": manifest_generated,
+            "is_pickup_scheduled": pickup_scheduled or label in {"PICKUP SCHEDULED", "RETURN PICKUP GENERATED"},
+            "is_courier_awaiting": code in (1, 2, 3, 4, 5, 11),
             "is_fulfilment": False,
             "is_dropship": False,
             "is_return": is_return,
-            "is_returned": bool(is_return) or (is_rto and label in RTO_DELIVERED_LABELS),
-            "is_delivered": "DELIVERED" in label and not is_rto,
+            "is_returned": label in RTO_DELIVERED_LABELS or bool(is_return) and label in {"DELIVERED", "RETURN DELIVERED", "RETURN_DELIVERED"},
+            "is_delivered": label in {"DELIVERED", "RETURN DELIVERED", "RETURN_DELIVERED"},
             "is_cancelled": "CANCEL" in label or "KILLED" in label,
             "is_killed": "KILLED" in label,
             "current_status": label,
@@ -318,7 +326,7 @@ def build_tracking_webhook_payload(
                         "status": label,
                         "activity": detail,
                         "location": location,
-                        "sr-status": str(code),
+                        "sr-status": str(code) if code is not None else "",
                         "sr-status-label": label,
                     }
                 ],
@@ -378,7 +386,8 @@ STAGE_PRESENTATION: dict[str, tuple[str, Optional[int], str]] = {
 #: Shipment statuses meaning "something is wrong, a human should look". These
 #: are the ones worth surfacing loudly in the admin UI.
 EXCEPTION_LABELS: frozenset[str] = frozenset(
-    {"NOC", "LOST", "DAMAGED", "NOT SERVICEABLE", "MISSORT", "ON HOLD", "UNKNOWN"}
+    {"NOC", "UNDELIVERED", "PARTIAL DELIVERED", "DELAYED", "MISROUTED", "RTO NDR",
+     "PICKUP ERROR", "PICKUP EXCEPTION", "LOST", "DAMAGED", "NOT SERVICEABLE", "MISSORT", "ON HOLD", "UNKNOWN"}
 )
 
 #: Statuses this app writes itself when an admin acts, mapped to stages. These
@@ -477,6 +486,8 @@ def shipment_stage_payload(
         order_status=order_status,
     )
     label, step, tone = STAGE_PRESENTATION[stage]
+    if stage == STAGE_RETURNED and not is_rto_delivered(shipment_status or ""):
+        label = "Returning to Origin"
     return {
         "stage": stage,
         "label": label,
@@ -487,3 +498,14 @@ def shipment_stage_payload(
         "is_exception": stage == STAGE_EXCEPTION,
     }
 
+
+def simulation_state(order, returned=None) -> dict[str, Any]:
+    """Actual before/after facts for simulator feedback, never provider promises."""
+    result = {"order_status": order.status.value, "shipment_status": order.shipment_status,
+              "payment_status": order.payment_status, "refund_amount": str(order.refund_amount),
+              "stock_released": order.stock_released, "rto_stock_restored": order.rto_stock_restored,
+              "forward_awb": order.awb_code}
+    if returned is not None:
+        result.update(return_status=returned.status.value, return_tracking_status=returned.tracking_status,
+                      inspection_passed=returned.inspection_passed, return_awb=returned.tracking_number)
+    return result

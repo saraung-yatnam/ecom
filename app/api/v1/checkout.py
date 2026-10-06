@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
+from sqlalchemy import select
 
 from app.api.deps import SessionDep,CurrentUser
 from app.models.cart import Cart
@@ -20,9 +21,11 @@ from app.utils.cart import validate_cart_items
 from app.services.pricing import resolve_cart_pricing
 from app.utils.order import generate_order_number
 from app.repositories import notification as notification_repo
-from app.services.email_service import email_service
+from app.services.email_outbox import enqueue_order_email
 from app.core.config import settings
 from app.core.store_settings import get_store_settings
+from app.core.region import format_money
+from app.services.order_snapshot import customer_snapshot, address_snapshot
 
 
 router = APIRouter(prefix="/checkout", tags=["Checkout"])
@@ -40,7 +43,7 @@ def _buyer_permissions(session, user) -> list[str]:
 
 
 @router.get("/config", response_model=CheckoutConfigResponse)
-def get_checkout_config():
+def get_checkout_config(session: SessionDep = None):
     """
     Client-facing checkout pricing configuration (public — nothing sensitive).
 
@@ -50,7 +53,14 @@ def get_checkout_config():
     server-side in `checkout()` below, which re-reads the same settings,
     re-applies the eligibility guards and persists `cod_fee` on the order row.
     """
-    store = get_store_settings()
+    from app.core.region import (
+        currency_code,
+        default_country,
+        display_locale,
+        tax_label,
+    )
+
+    store = get_store_settings(session, seed=False)
     return CheckoutConfigResponse(
         cod_fee=store.cod_fee,
         cod_min_order_value=store.cod_min_order_value,
@@ -58,6 +68,11 @@ def get_checkout_config():
         free_shipping_threshold=store.free_shipping_threshold,
         shipping_cost=store.shipping_cost,
         tax_rate=store.tax_rate,
+        currency=currency_code(),
+        locale=display_locale(),
+        tax_label=tax_label(),
+        country=default_country(),
+        support_phone=settings.STORE_SUPPORT_PHONE or "",
     )
 
 
@@ -67,6 +82,15 @@ def checkout(
     session: SessionDep,
     current_user: CurrentUser,
 ):
+    """Place an order atomically; failed attempts leave the session reusable."""
+    try:
+        return _checkout(checkout_data, session, current_user)
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _checkout(checkout_data: CheckoutRequest, session: Session, current_user: User):
     """
     Convert cart to order.
     """
@@ -98,9 +122,17 @@ def checkout(
             )
     else:
         billing_address_id = checkout_data.shipping_address_id
+        billing_address = shipping_address
     
     # 3. Get user's cart
-    cart = cart_repo.get_or_create_cart(session, current_user.id)
+    # Serialize consumption of one cart. Never create/commit a cart during checkout.
+    cart = session.execute(
+        select(Cart).where(Cart.user_id == current_user.id)
+        .with_for_update().execution_options(populate_existing=True)
+    ).scalars().first()
+    if cart is None:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+    session.expire(cart, ["items"])
     cart_with_items = cart_repo.get_cart_with_items(session, cart.id)
     
     if not cart_with_items.items:
@@ -155,19 +187,20 @@ def checkout(
     payment_method = checkout_data.payment_method.value  # cod | online
     
     # 10. COD (Cash on Delivery) handling (store policy, session-fresh)
-    store_policy = get_store_settings(session)
+    # Startup owns seeding; a missing policy must not commit this transaction.
+    store_policy = pricing.policy or get_store_settings(session, seed=False)
     cod_fee = Decimal("0.00")
     if payment_method == "cod":
         # Industry-standard eligibility guards
         if grand_total < Decimal(str(store_policy.cod_min_order_value)):
             raise HTTPException(
                 status_code=400,
-                detail=f"Cash on Delivery is available only for orders of ₹{store_policy.cod_min_order_value:g} or more",
+                detail=f"Cash on Delivery is available only for orders of {format_money(store_policy.cod_min_order_value)} or more",
             )
         if grand_total > Decimal(str(store_policy.cod_max_order_value)):
             raise HTTPException(
                 status_code=400,
-                detail=f"Cash on Delivery is available only for orders up to ₹{store_policy.cod_max_order_value:g}. Please pay online.",
+                detail=f"Cash on Delivery is available only for orders up to {format_money(store_policy.cod_max_order_value)}. Please pay online.",
             )
         cod_fee = Decimal(str(store_policy.cod_fee))
         grand_total += cod_fee
@@ -182,6 +215,9 @@ def checkout(
         user_id=current_user.id,
         shipping_address_id=checkout_data.shipping_address_id,
         billing_address_id=billing_address_id,
+        customer_snapshot=customer_snapshot(current_user),
+        shipping_snapshot=address_snapshot(shipping_address, current_user),
+        billing_snapshot=address_snapshot(billing_address, current_user),
         subtotal=final_subtotal,
         discount_total=discount_amount,
         tax_total=tax_amount,
@@ -218,7 +254,9 @@ def checkout(
             .where(ProductVariant.id.in_(
                 [item.variant_id for item in cart_with_items.items]
             ))
+            .order_by(ProductVariant.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         ).scalars().all()
     }
     for item in cart_with_items.items:
@@ -251,7 +289,7 @@ def checkout(
         session.add(variant)
     
     # 12. Clear cart
-    cart_repo.clear_cart(session, cart_with_items)
+    cart_repo.clear_cart(session, cart_with_items, commit=False)
     
     # 12b. Record usage of the winning coupon (manual AND automatic).
     # Counted here at order placement — never at cart-apply time (abandoned
@@ -264,15 +302,18 @@ def checkout(
             _select(Coupon)
             .where(Coupon.id == winner.coupon.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         ).scalars().one()
         if locked.max_uses and locked.times_used >= locked.max_uses:
             raise HTTPException(
                 status_code=400,
                 detail="Sorry, this coupon just reached its maximum usage limit",
             )
-        coupon_repo.increment_coupon_usage(session, locked)
+        coupon_repo.increment_coupon_usage(session, locked, commit=False)
     
     # 13. Commit everything
+    if payment_method == "cod":
+        enqueue_order_email(session, order, "order_confirmation")
     session.commit()
     session.refresh(order)
     
@@ -284,22 +325,9 @@ def checkout(
         session.rollback()
         print(f"Failed to create order notifications: {str(e)}")
     
-    # 14. Send order confirmation email
-    #     - COD: order is fully confirmed at checkout -> "pay on delivery" email now
-    #     - Online: email is sent after payment succeeds (payments.py / webhooks.py)
-    if payment_method == "cod" and settings.SENDGRID_API_KEY:
-        try:
-            user = session.get(User, order.user_id)
-            if user:
-                email_service.send_order_confirmation(order, user)
-                print(f"Order confirmation email sent to {user.email}")
-        except Exception as e:
-            print(f"Failed to send order confirmation email: {str(e)}")
-    
     print("="*50)
     print(f"FINAL ORDER: payment_method={payment_method}, cod_fee={order.cod_fee}, coupon_code={order.coupon_code}, grand_total={order.grand_total}")
     print("=== CHECKOUT DEBUG END ===")
     print("="*50 + "\n")
     
     return order
-

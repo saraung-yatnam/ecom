@@ -3,13 +3,38 @@ from abc import ABC, abstractmethod
 
 from app.models.order import Order
 from app.core.config import settings  # 👈 Use settings
+from app.core.region import currency_code, provider_compat_error
 
 
 class PaymentService(ABC):
     """Abstract base class for payment services"""
+    requires_refund_reconciliation = True
+
+    def create_refund_safely(self, payment_id, amount, notes, recorded_ids):
+        """The gateway is the durable journal when local execution rolls back."""
+        if not self.requires_refund_reconciliation:
+            return self.create_refund(payment_id, amount, notes)
+        state = self.get_charge_refund_state(payment_id)
+        if state is None:
+            return {"status": "unknown", "error": "Provider refund lookup unavailable"}
+        refunds = state.get("refunds", [])
+        own = [r for r in refunds if (r.get("receipt") == notes["refund_key"]
+               or (r.get("notes") or {}).get("refund_key") == notes["refund_key"])]
+        if len(own) > 1:
+            return {"status": "unknown", "error": "Multiple gateway refunds match this request"}
+        if own:
+            from decimal import Decimal
+            if Decimal(str(own[0]["amount"])) != Decimal(str(amount)):
+                return {"status": "unknown", "error": "Recorded gateway refund amount differs"}
+            return {"status": own[0]["status"], "refund_id": own[0]["id"],
+                    "amount": own[0]["amount"], "recovered": True}
+        accepted = {"processed", "pending", "succeeded", "processing", "requires_action"}
+        if any(r.get("status") in accepted and r.get("id") not in recorded_ids for r in refunds):
+            return {"status": "unknown", "error": "Unrecorded gateway refund requires reconciliation"}
+        return self.create_refund(payment_id, amount, notes)
     
     @abstractmethod
-    def create_payment_intent(self, order: Order, payment_method: str = "card") -> dict:
+    def create_payment_intent(self, order: Order, payment_method: str = "card", *, idempotency_key=None, currency=None) -> dict:
         pass
     
     @abstractmethod
@@ -50,6 +75,13 @@ class PaymentService(ABC):
         """
         return None
 
+    def recover_payment_creation(self, order, attempt) -> dict | None:
+        """Resolve an ambiguous creation; default refuses to create again."""
+        return None
+
+    def get_payment_intent(self, payment_id: str) -> dict | None:
+        return None
+
     def cancel_payment_intent(self, payment_intent_id: str) -> dict:
         """Best-effort cancel of an unpaid provider PaymentIntent.
 
@@ -71,18 +103,25 @@ class PaymentService(ABC):
 class DummyPaymentService(PaymentService):
     """Dummy payment service for testing"""
     
-    def create_payment_intent(self, order, payment_method="card") -> dict:
-        payment_id = f"dummy_pay_{uuid.uuid4().hex[:12]}"
+    provider_name = "dummy"
+    requires_refund_reconciliation = False
+
+    def create_payment_intent(self, order, payment_method="card", *, idempotency_key=None, currency=None) -> dict:
+        payment_id = f"dummy_pay_{idempotency_key or uuid.uuid4().hex[:12]}"
         return {
             "client_secret": f"{payment_id}_secret_dummy",
             "payment_intent_id": payment_id,
             "order_id": str(order.id),
             "amount": float(order.grand_total),
-            "currency": "INR",
+            "currency": currency or currency_code(),
             "is_dummy": True,
             "status": "succeeded",
             "message": "Dummy payment - no real money involved"
         }
+
+    def recover_payment_creation(self, order, attempt):
+        return self.create_payment_intent(order, attempt.payment_method,
+                                         idempotency_key=attempt.creation_key, currency=attempt.currency)
     
     def confirm_payment(self, payment_intent_id: str) -> dict:
         return {
@@ -146,7 +185,7 @@ class DummyPaymentService(PaymentService):
         amount: float | None = None,
         notes: dict | None = None,
     ) -> dict:
-        refund_id = f"dummy_rfnd_{uuid.uuid4().hex[:12]}"
+        refund_id = f"dummy_rfnd_{(notes or {}).get('refund_key') or uuid.uuid4().hex[:12]}"
         return {
             "status": "processed",
             "refund_id": refund_id,
@@ -165,12 +204,28 @@ class DummyPaymentService(PaymentService):
         }
 
 
-def _service_for_provider(provider: str) -> PaymentService:
-    """Instantiate the PSP for an explicit provider name (no global fallback)."""
+def _service_for_provider(provider: str, historical: bool = False) -> PaymentService:
+    """Instantiate the PSP for an explicit provider name (no global fallback).
+
+    ``historical`` = routing a payment captured earlier (refunds/reconcile):
+    skips the currency-compat gate, since that money was validly captured
+    under its own gateway and must still be serviceable after the deployment
+    moves on (e.g. Razorpay→Stripe still refunds old Razorpay payments).
+    """
     is_production = settings.ENVIRONMENT == "production"
 
     print(f"Payment Provider requested: {provider}")
     print(f"Environment: {settings.ENVIRONMENT}")
+
+    # Fail fast on gateway/currency combos that cannot settle (e.g. Razorpay
+    # with EUR): a 2am provider rejection becomes a loud boot/request error
+    # instead. Historical-payment routing is unaffected — each payment row
+    # remembers its own (valid-at-the-time) gateway.
+    compat_error = None if historical else provider_compat_error(provider)
+    if compat_error is not None:
+        if is_production:
+            raise RuntimeError(compat_error)
+        print(f"⚠️ {compat_error} — continuing anyway (non-production)")
 
     if not provider:
         # No provider configured — a configuration error, never silently pay.
@@ -271,6 +326,6 @@ def get_payment_service_for_payment(payment) -> PaymentService:
     if name == "cod":
         raise ValueError("Cash on Delivery orders have no online payment to refund")
     if name in ("razorpay", "stripe", "dummy"):
-        return _service_for_provider(name)
+        return _service_for_provider(name, historical=True)
     # Unknown / legacy rows — preserve today's behaviour.
     return get_payment_service()

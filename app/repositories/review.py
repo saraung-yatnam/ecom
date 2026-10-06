@@ -132,10 +132,10 @@ def update_review(
     return review
 
 
-def delete_review(session: Session, review: Review) -> None:
+def delete_review(session: Session, review: Review, *, commit: bool = True) -> None:
     """Delete a review"""
     session.delete(review)
-    session.commit()
+    session.commit() if commit else session.flush()
 
 
 def list_reviews_admin(

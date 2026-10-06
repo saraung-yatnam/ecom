@@ -15,3 +15,6 @@ wheels/
 chroma_db/
 *.sqlite3
 *.bin
+
+# Authenticated return evidence must never be committed or publicly served.
+private_storage/

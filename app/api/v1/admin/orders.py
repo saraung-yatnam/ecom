@@ -16,14 +16,17 @@ from app.repositories import order as order_repo
 from app.repositories import notification as notification_repo
 from app.repositories import product_image as product_image_repo
 from app.schemas.order import OrderRead, OrderStatusUpdate, OrderListRead
-from app.services.email_service import email_service
+from app.services.email_outbox import enqueue_order_email
 from app.services.refund_service import restore_stock
 from app.services.shipping_status import (
     build_tracking_webhook_payload,
     normalize_location,
+    simulation_state,
     shipment_stage_payload,
 )
 from app.core.config import settings
+from app.core.region import format_money
+from app.services.order_snapshot import order_details
 
 router = APIRouter(prefix="/admin/orders", tags=["Admin Orders"])
 
@@ -61,49 +64,10 @@ def get_all_orders_admin(
     # Manually convert orders to dict with user data
     orders_data = []
     for order in orders:
-        # Get user data
-        user_data = None
-        if order.user:
-            user_data = {
-                "id": str(order.user.id),
-                "full_name": order.user.full_name,
-                "email": order.user.email,
-                "phone": order.user.phone
-            }
-        
-        # Get shipping address data
-        shipping_address_data = None
-        if order.shipping_address:
-            shipping_address_data = {
-                "id": str(order.shipping_address.id),
-                "label": order.shipping_address.label,
-                "line1": order.shipping_address.line1,
-                "line2": order.shipping_address.line2,
-                "city": order.shipping_address.city,
-                "state": order.shipping_address.state,
-                "postal_code": order.shipping_address.postal_code,
-                "country": order.shipping_address.country,
-                "is_default": order.shipping_address.is_default,
-                "full_name": order.user.full_name if order.user else None,
-                "phone": order.user.phone if order.user else None
-            }
-        
-        # Get billing address data
-        billing_address_data = None
-        if order.billing_address:
-            billing_address_data = {
-                "id": str(order.billing_address.id),
-                "label": order.billing_address.label,
-                "line1": order.billing_address.line1,
-                "line2": order.billing_address.line2,
-                "city": order.billing_address.city,
-                "state": order.billing_address.state,
-                "postal_code": order.billing_address.postal_code,
-                "country": order.billing_address.country,
-                "is_default": order.billing_address.is_default,
-                "full_name": order.user.full_name if order.user else None,
-                "phone": order.user.phone if order.user else None
-            }
+        details = order_details(order)
+        user_data = details["user"]
+        shipping_address_data = details["shipping_address"]
+        billing_address_data = details["billing_address"]
         
         # Build order dictionary
         order_dict = {
@@ -248,43 +212,7 @@ def get_order_detail(
         "order_number": order.order_number,
         "user_id": str(order.user_id),
         
-        # User data
-        "user": {
-            "id": str(order.user.id),
-            "full_name": order.user.full_name,
-            "email": order.user.email,
-            "phone": order.user.phone
-        } if order.user else None,
-        
-        # Shipping address
-        "shipping_address": {
-            "id": str(order.shipping_address.id),
-            "label": order.shipping_address.label,
-            "line1": order.shipping_address.line1,
-            "line2": order.shipping_address.line2,
-            "city": order.shipping_address.city,
-            "state": order.shipping_address.state,
-            "postal_code": order.shipping_address.postal_code,
-            "country": order.shipping_address.country,
-            "is_default": order.shipping_address.is_default,
-            "full_name": order.user.full_name if order.user else None,
-            "phone": order.user.phone if order.user else None
-        } if order.shipping_address else None,
-        
-        # Billing address
-        "billing_address": {
-            "id": str(order.billing_address.id),
-            "label": order.billing_address.label,
-            "line1": order.billing_address.line1,
-            "line2": order.billing_address.line2,
-            "city": order.billing_address.city,
-            "state": order.billing_address.state,
-            "postal_code": order.billing_address.postal_code,
-            "country": order.billing_address.country,
-            "is_default": order.billing_address.is_default,
-            "full_name": order.user.full_name if order.user else None,
-            "phone": order.user.phone if order.user else None
-        } if order.billing_address else None,
+        **order_details(order),
         
         "shipping_address_id": str(order.shipping_address_id),
         "billing_address_id": str(order.billing_address_id),
@@ -364,7 +292,7 @@ def update_order_status_admin(
         manager
         admin
     """
-    order = order_repo.get_order_by_id(session, order_id)
+    order = order_repo.get_order_by_id(session, order_id, for_update=True)
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -446,27 +374,10 @@ def update_order_status_admin(
         if old_status in (OrderStatus.PENDING, OrderStatus.CONFIRMED, OrderStatus.PROCESSING):
             restore_stock(session, order)
 
-    order = order_repo.update_order_status(session, order, new_status)
-    
-    # Send email notification on status change
-    if settings.SENDGRID_API_KEY:
-        try:
-            user = session.get(User, order.user_id)
-            if user:
-                if new_status == "shipped" and old_status != "shipped":
-                    email_service.send_order_shipped(order, user)
-                    print(f"Order shipped email sent to {user.email}")
-                elif new_status == "delivered" and old_status != "delivered":
-                    email_service.send_order_delivered(order, user)
-                    print(f"Order delivered email sent to {user.email}")
-                elif new_status == "cancelled" and old_status != "cancelled":
-                    email_service.send_order_cancelled(order, user)
-                    print(f"Order cancelled email sent to {user.email}")
-                elif new_status == "refunded" and old_status != "refunded":
-                    email_service.send_order_refunded(order, user)
-                    print(f"Order refunded email sent to {user.email}")
-        except Exception as e:
-            print(f"Failed to send order status email: {str(e)}")
+    order = order_repo.update_order_status(session, order, new_status, commit=False)
+    if new_status in ("shipped", "delivered") and new_status != old_status.value:
+        enqueue_order_email(session, order, f"order_{new_status}")
+    session.commit()
 
     # --- Notifications feed ---
     # Customer gets an order_status update; admins/managers get an
@@ -490,6 +401,7 @@ def update_order_status_admin(
 # =========================================================
 
 from fastapi.responses import HTMLResponse
+from html import escape
 from app.services.shiprocket_service import (
     estimate_delivery_date,
     get_shipping_service,
@@ -514,7 +426,7 @@ def check_order_shipping_serviceability(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    shipping_address = order.shipping_address
+    shipping_address = order.shipping_details
     if not shipping_address or not shipping_address.postal_code:
         raise HTTPException(status_code=400, detail="Order does not have a valid shipping address or postal code")
 
@@ -768,18 +680,19 @@ def get_order_shipping_tracking(
 # --- Visual Simulator Printable Label & Manifest HTML helpers ---
 
 @router.get("/shipping/simulated-label/{shipment_id}")
-def view_simulated_label(shipment_id: str, session: SessionDep):
+def view_simulated_label(shipment_id: str, session: SessionDep,
+                         current_user: User = Depends(require_perm("shipping.manage"))):
     """Returns a printable mock Shiprocket Shipping Label in HTML/CSS."""
     statement = select(Order).where(Order.shiprocket_shipment_id == shipment_id)
     order = session.execute(statement).scalars().first()
     if not order:
         return HTMLResponse("<h3>Shipment not found</h3>", status_code=404)
 
-    shipping = order.shipping_address
+    shipping = order.shipping_details
     html = f"""<!DOCTYPE html>
     <html>
     <head>
-        <title>Shipping Label - {order.awb_code or shipment_id}</title>
+        <title>Shipping Label - {escape(str(order.awb_code or shipment_id))}</title>
         <style>
             body {{ font-family: monospace, sans-serif; margin: 20px; }}
             .label-box {{ width: 380px; border: 2px solid #000; padding: 15px; margin: auto; }}
@@ -798,25 +711,25 @@ def view_simulated_label(shipment_id: str, session: SessionDep):
             <div class="header">
                 <div>
                     <span class="bold">SHIPROCKET</span> (SIMULATOR)<br/>
-                    <span>{order.courier_name or 'DELHIVERY'}</span>
+                    <span>{escape(str(order.courier_name or 'DELHIVERY'))}</span>
                 </div>
                 <div style="text-align: right;">
-                    <span class="bold">{'COD: ₹' + str(order.grand_total) if order.payment_method == 'cod' else 'PREPAID'}</span>
+                    <span class="bold">{escape('COD: ' + format_money(order.grand_total) if order.payment_method == 'cod' else 'PREPAID')}</span>
                 </div>
             </div>
             <div class="barcode">
                 |||||| | |||||||| |||| | ||||||<br/>
-                <span style="font-size: 14px; letter-spacing: 2px;">{order.awb_code or 'SR-AWB-998877'}</span>
+                <span style="font-size: 14px; letter-spacing: 2px;">{escape(str(order.awb_code or 'SR-AWB-998877'))}</span>
             </div>
             <div class="section">
                 <span class="bold">Ship To:</span><br/>
-                {order.user.full_name if order.user else 'Customer'}<br/>
-                {shipping.line1 if shipping else ''}<br/>
-                {shipping.city if shipping else ''}, {shipping.state if shipping else ''} - <span class="bold">{shipping.postal_code if shipping else ''}</span><br/>
-                Phone: {order.user.phone if order.user and order.user.phone else 'N/A'}
+                {escape(str(order.customer_details.full_name or 'Customer') if order.customer_details else 'Customer')}<br/>
+                {escape(str(shipping.line1 or '') if shipping else '')}<br/>
+                {escape(str(shipping.city or '') if shipping else '')}, {escape(str(shipping.state or '') if shipping else '')} - <span class="bold">{escape(str(shipping.postal_code or '') if shipping else '')}</span><br/>
+                Phone: {escape(str(order.customer_details.phone) if order.customer_details and order.customer_details.phone else 'N/A')}
             </div>
             <div class="section">
-                <span class="bold">Order No:</span> {order.order_number}<br/>
+                <span class="bold">Order No:</span> {escape(str(order.order_number))}<br/>
                 <span class="bold">Date:</span> {order.placed_at.strftime('%d-%b-%Y')}<br/>
                 <span class="bold">Dimensions:</span> 10x10x10 cm | 0.50 kg
             </div>
@@ -826,12 +739,13 @@ def view_simulated_label(shipment_id: str, session: SessionDep):
         </div>
     </body>
     </html>"""
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
 
 
 
 @router.get("/shipping/simulated-manifest/{shipment_id}")
-def view_simulated_manifest(shipment_id: str, session: SessionDep):
+def view_simulated_manifest(shipment_id: str, session: SessionDep,
+                            current_user: User = Depends(require_perm("shipping.manage"))):
     """Returns a printable mock Shiprocket Pickup Manifest in HTML/CSS."""
     statement = select(Order).where(Order.shiprocket_shipment_id == shipment_id)
     order = session.execute(statement).scalars().first()
@@ -841,7 +755,7 @@ def view_simulated_manifest(shipment_id: str, session: SessionDep):
     html = f"""<!DOCTYPE html>
     <html>
     <head>
-        <title>Pickup Manifest - {shipment_id}</title>
+        <title>Pickup Manifest - {escape(shipment_id)}</title>
         <style>
             body {{ font-family: sans-serif; margin: 30px; font-size: 13px; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
@@ -858,11 +772,11 @@ def view_simulated_manifest(shipment_id: str, session: SessionDep):
         <div class="header">
             <div>
                 <h2>SHIPROCKET COURIER MANIFEST</h2>
-                <p>Courier Partner: <b>{order.courier_name or 'Delhivery'}</b></p>
+                <p>Courier Partner: <b>{escape(str(order.courier_name or 'Delhivery'))}</b></p>
             </div>
             <div style="text-align: right;">
                 <p>Date: <b>{datetime.now().strftime('%d-%m-%Y')}</b></p>
-                <p>Manifest ID: <b>MNF-{shipment_id}</b></p>
+                <p>Manifest ID: <b>MNF-{escape(shipment_id)}</b></p>
             </div>
         </div>
         <table>
@@ -879,10 +793,10 @@ def view_simulated_manifest(shipment_id: str, session: SessionDep):
             <tbody>
                 <tr>
                     <td>1</td>
-                    <td><b>{order.awb_code or 'N/A'}</b></td>
-                    <td>{order.order_number}</td>
-                    <td>{order.shipping_address.postal_code if order.shipping_address else 'N/A'}</td>
-                    <td>{'COD (₹' + str(order.grand_total) + ')' if order.payment_method == 'cod' else 'PREPAID'}</td>
+                    <td><b>{escape(str(order.awb_code or 'N/A'))}</b></td>
+                    <td>{escape(str(order.order_number))}</td>
+                    <td>{escape(str(order.shipping_details.postal_code or '') if order.shipping_details else 'N/A')}</td>
+                    <td>{escape('COD (' + format_money(order.grand_total) + ')' if order.payment_method == 'cod' else 'PREPAID')}</td>
                     <td>0.50 kg</td>
                 </tr>
             </tbody>
@@ -893,7 +807,7 @@ def view_simulated_manifest(shipment_id: str, session: SessionDep):
         </div>
     </body>
     </html>"""
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
 
 
 
@@ -922,7 +836,7 @@ def get_simulator_shipments(
         results.append({
             "order_id": str(o.id),
             "order_number": o.order_number,
-            "user_name": o.user.full_name if o.user else "Customer",
+            "user_name": o.customer_details.full_name if o.customer_details else "Customer",
             "shiprocket_order_id": o.shiprocket_order_id,
             "shiprocket_shipment_id": o.shiprocket_shipment_id,
             "awb_code": o.awb_code,
@@ -964,15 +878,20 @@ SIMULATOR_EVENTS: dict[str, str] = {
     "out_for_delivery": "OUT FOR DELIVERY",
     "appointment_booked": "CUSTOMER APPOINTMENT BOOKED",
     "delivered": "DELIVERED",
-    # Return to origin. Shiprocket emits these as three separate events.
+    # Delivery failure/NDR precedes an RTO decision in the real flow.
+    "delivery_failed": "UNDELIVERED",
+    "undelivered": "UNDELIVERED",
+    # Return to origin is a branch of the ORIGINAL forward shipment. It must
+    # stay in the outbound card and never be marked is_return=1.
     "rto_initiated": "RTO INITIATED",
     "rto_in_transit": "RTO IN TRANSIT",
     "rto_dispatched": "RTO DISPATCHED",
+    "rto_ofd": "RTO OFD",
     "rto": "RTO IN TRANSIT",
     "rto_delivered": "RTO DELIVERED",
+    "rto_acknowledged": "RTO ACKNOWLEDGED",
     # Exceptions: recorded on the timeline, order status untouched.
     "noc": "NOC",
-    "undelivered": "NOC",
     "exception": "NOC",
     "lost": "LOST",
     "damaged": "DAMAGED",
@@ -1020,17 +939,22 @@ def trigger_simulator_event(
             ),
         )
 
+    before = simulation_state(order)
     payload = build_tracking_webhook_payload(
         awb=order.awb_code,
         current_status=shiprocket_status,
         location=data.location or "Regional Processing Hub",
         activity=data.activity or f"Shipment status: {shiprocket_status}",
         order_id=order.id.int if hasattr(order.id, "int") else None,
-        is_return=1 if "RTO" in shiprocket_status else 0,
+        # RTO is Return-to-Origin for the original shipment, not a customer
+        # return order. Customer reverse shipments use the separate return
+        # simulator endpoint and is_return=1.
+        is_return=0,
     )
 
     result = process_tracking_event(session, payload)
     session.refresh(order)
+    after = simulation_state(order)
 
     return {
         "success": True,
@@ -1044,4 +968,14 @@ def trigger_simulator_event(
         "shipment_status": order.shipment_status,
         "payment_status": order.payment_status,
         "status_changed": result.get("status_changed", False),
+        "before": before,
+        "after": after,
+        "effects": {
+            "order_status_changed": before["order_status"] != after["order_status"],
+            "shipment_status_changed": before["shipment_status"] != after["shipment_status"],
+            "rto_started": before["order_status"] != "rto" and after["order_status"] == "rto",
+            "rto_stock_restored_now": not before["rto_stock_restored"] and after["rto_stock_restored"],
+            "money_changed": before["payment_status"] != after["payment_status"] or before["refund_amount"] != after["refund_amount"],
+            "forward_awb_preserved": before["forward_awb"] == after["forward_awb"],
+        },
     }

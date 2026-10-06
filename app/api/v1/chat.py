@@ -1,10 +1,13 @@
 import re
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, Field
 from groq import Groq
 from sqlmodel import Session, select
 from app.core.config import settings
-from app.api.deps import SessionDep
+from app.api.deps import SessionDep, get_current_user
+from app.services.chat_session import issue_session, owned_session, allow_request, MAX_HISTORY, MAX_REPLY
 from app.services.rag_service import get_rag_response
 from app.models.product import Product
 
@@ -12,10 +15,45 @@ router = APIRouter(prefix="/chat", tags=["ChatBot"])
 
 # ✅ Initialize Groq client
 client = Groq(
-    api_key=settings.GROQ_API_KEY
+    api_key=settings.GROQ_API_KEY, timeout=20.0, max_retries=0,
 )
 
-SYSTEM_PROMPT = """You are a friendly customer support assistant for an e-commerce store.
+def build_system_prompt() -> str:
+    """Support prompt with LIVE policy numbers (never hardcoded).
+
+    Restocking fees, shipping threshold/cost, COD limits/fee and the
+    support phone all come from store settings + regional config, so the
+    assistant quotes today's values in the deployment's currency.
+    Falls back to code defaults when the DB is unreachable.
+    """
+    from app.core.region import currency_code, format_money, tax_label
+    from app.core.store_settings import get_store_settings
+    from app.core.config import settings as _settings
+
+    try:
+        store = get_store_settings()
+    except Exception:
+        store = None
+
+    def _num(value, default):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    restocking_confirmed = _num(getattr(store, "restocking_fee_confirmed", 5.0), 5.0)
+    restocking_processing = _num(
+        getattr(store, "restocking_fee_processing", 15.0), 15.0
+    )
+    free_ship = _num(getattr(store, "free_shipping_threshold", 1000.0), 1000.0)
+    ship_cost = _num(getattr(store, "shipping_cost", 50.0), 50.0)
+    cod_fee = _num(getattr(store, "cod_fee", 50.0), 50.0)
+    cod_min = _num(getattr(store, "cod_min_order_value", 0.0), 0.0)
+    cod_max = _num(getattr(store, "cod_max_order_value", 10000.0), 10000.0)
+    support_phone = _settings.STORE_SUPPORT_PHONE or "support line"
+    _ = tax_label, currency_code  # labels available to future prompt edits
+
+    return f"""You are a friendly customer support assistant for an e-commerce store.
 
 ## Your Role
 Help customers with product questions, shipping, and orders.
@@ -35,21 +73,20 @@ Keep answers short (2-3 sentences), friendly, and helpful.
 
 ## Cancellation Policy
 - Orders can be cancelled BEFORE shipping
-- Online orders: 5% restocking fee (15% while processing)
+- Online orders: {restocking_confirmed:g}% restocking fee ({restocking_processing:g}% while processing)
 - Once SHIPPED → CANNOT cancel
 
 ## Shipping Policy
-- Free shipping on orders above ₹500
-- Standard: ₹50 (3-5 days)
-- Express: ₹150 (1-2 days)
+- Free shipping on orders above {format_money(free_ship)}
+- Standard: {format_money(ship_cost)} (3-5 days)
 
 ## COD Policy
-- Available for orders between ₹100 and ₹10,000
-- COD fee: ₹50
+- Available for orders between {format_money(cod_min)} and {format_money(cod_max)}
+- COD fee: {format_money(cod_fee)}
 
 ## IMPORTANT RULES
 1. If a customer asks about returns or refunds, say:
-   "I don't have information about returns yet. Please contact our support team at support@store.com or call +91-XXXXX-XXXXX."
+   "I don't have information about returns yet. Please contact our support team at support@store.com or call {support_phone}."
 
 2. If a customer asks about a specific brand or product NOT in our store, say:
    "Sorry, we don't have [brand] products right now. Would you like to see our available products?"
@@ -59,6 +96,9 @@ Keep answers short (2-3 sentences), friendly, and helpful.
 4. If you don't know something, say:
    "I don't have that information right now. Let me connect you with a human agent!"
 """
+
+
+SYSTEM_PROMPT = build_system_prompt()
 
 PRODUCT_KEYWORDS = [
     "product", "item", "buy", "price", "shop", "available", 
@@ -72,8 +112,17 @@ POLICY_KEYWORDS = [
     "shipping", "delivery", "cod", "cancel", "cancellation"
 ]
 
-# ✅ Store conversation history per session
-conversation_history = {}
+optional_bearer = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+
+
+def optional_chat_user(session: SessionDep, token: str | None = Depends(optional_bearer)):
+    # Invalid/disabled/revoked authenticated sessions never downgrade to guests.
+    return get_current_user(session, token) if token else None
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    session_id: str = Field(min_length=1, max_length=1000)
 
 # ✅ Cache product names for quick lookup
 _product_names_cache = None
@@ -112,35 +161,28 @@ def is_product_query(message: str, session: Session) -> bool:
     
     return False
 
+@router.post("/session")
+def create_chat_session(session: SessionDep, request: Request, owner=Depends(optional_chat_user)):
+    allow_request(session, request, owner, "session")
+    return {"session_id": issue_session(session, owner)}
+
+
 @router.post("")
-def chat(req: dict, session: SessionDep):
-    message = req.get("message", "").strip()
-    
-    # ✅ REQUIRED: Get session_id from request
-    session_id = req.get("session_id")
-    
-    # ✅ If no session_id, return error (no default fallback!)
-    if not session_id:
-        return {"reply": "Session ID required. Please refresh the page."}
-    
+def chat(req: ChatRequest, session: SessionDep, request: Request, owner=Depends(optional_chat_user)):
+    message = req.message.strip()
     if not message:
         return {"reply": "Please type a message 🙂"}
-
+    owned_session(session, req.session_id, owner)
+    allow_request(session, request, owner, "message")
     try:
-        if session_id not in conversation_history:
-            conversation_history[session_id] = []
-        
-        # ✅ Check if it's a policy question FIRST
+        conversation = owned_session(session, req.session_id, owner, lock=True)
+        history = conversation.history[-MAX_HISTORY:]
         is_policy_query = any(keyword in message.lower() for keyword in POLICY_KEYWORDS)
-        
-        if is_policy_query:
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-            ]
-            for msg in conversation_history[session_id][-5:]:
-                messages.append(msg)
-            messages.append({"role": "user", "content": message})
-            
+        if not is_policy_query and is_product_query(message, session):
+            reply = get_rag_response(message, session, history)
+        else:
+            messages = [{"role": "system", "content": build_system_prompt()}, *history[-5:],
+                        {"role": "user", "content": message}]
             completion = client.chat.completions.create(
                 model="openai/gpt-oss-120b",
                 messages=messages,
@@ -148,54 +190,38 @@ def chat(req: dict, session: SessionDep):
                 temperature=0.7,
             )
             reply = completion.choices[0].message.content
-            
-            conversation_history[session_id].append({"role": "user", "content": message})
-            conversation_history[session_id].append({"role": "assistant", "content": reply})
-            return {"reply": reply}
-        
-        # ✅ Check if it's a product query
-        is_product = is_product_query(message, session)
-        
-        if is_product:
-            reply = get_rag_response(message, session, conversation_history[session_id])
-            conversation_history[session_id].append({"role": "user", "content": message})
-            conversation_history[session_id].append({"role": "assistant", "content": reply})
-            return {"reply": reply}
-        
-        # ✅ Default: Use LLM with history
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for msg in conversation_history[session_id][-5:]:
-            messages.append(msg)
-        messages.append({"role": "user", "content": message})
-        
-        completion = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=messages,
-            max_tokens=500,
-            temperature=0.7,
-        )
-        reply = completion.choices[0].message.content
-        
-        conversation_history[session_id].append({"role": "user", "content": message})
-        conversation_history[session_id].append({"role": "assistant", "content": reply})
+        reply = str(reply or "Sorry, I could not generate a reply.")[:MAX_REPLY]
+        conversation.history = [*history, {"role": "user", "content": message},
+                                {"role": "assistant", "content": reply}][-MAX_HISTORY:]
+        session.add(conversation)
+        session.commit()
         return {"reply": reply}
-
+    except HTTPException:
+        session.rollback()
+        raise
     except Exception as e:
+        session.rollback()
         print("Chatbot error:", e)
-        return {"reply": "Sorry, I'm having trouble right now. Please try again."}
+        raise HTTPException(503, "Chat is temporarily unavailable; please try again")
 
 @router.get("/history")
-def get_history(session_id: str):
-    """Get history for a specific session"""
-    if not session_id:
-        return {"error": "session_id required"}
-    return conversation_history.get(session_id, [])
+def get_history(session: SessionDep, request: Request,
+                session_id: str | None = Query(default=None, min_length=1, max_length=1000),
+                x_chat_session: str | None = Header(default=None, max_length=1000), owner=Depends(optional_chat_user)):
+    session_id = x_chat_session or session_id
+    owned_session(session, session_id, owner)
+    allow_request(session, request, owner, "history")
+    return owned_session(session, session_id, owner).history
 
 @router.delete("/history")
-def clear_history(session_id: str):
-    """Clear history for a specific session"""
-    if not session_id:
-        return {"error": "session_id required"}
-    if session_id in conversation_history:
-        conversation_history[session_id] = []
-    return {"message": f"History cleared for session {session_id}"}
+def clear_history(session: SessionDep, request: Request,
+                  session_id: str | None = Query(default=None, min_length=1, max_length=1000),
+                  x_chat_session: str | None = Header(default=None, max_length=1000), owner=Depends(optional_chat_user)):
+    session_id = x_chat_session or session_id
+    owned_session(session, session_id, owner)
+    allow_request(session, request, owner, "history")
+    row = owned_session(session, session_id, owner, lock=True)
+    row.history = []
+    session.add(row)
+    session.commit()
+    return {"message": "History cleared"}

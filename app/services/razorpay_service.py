@@ -1,5 +1,6 @@
 from app.services.payment_service import PaymentService
 from app.core.config import settings
+from app.core.region import currency_code, from_minor_units, minor_units
 
 # Try to import razorpay
 try:
@@ -12,6 +13,7 @@ except ImportError:
 
 class RazorpayPaymentService(PaymentService):
     """Razorpay payment service implementation."""
+    provider_name = "razorpay"
     
     def __init__(self):
         self.key_id = settings.RAZORPAY_KEY_ID
@@ -45,22 +47,24 @@ class RazorpayPaymentService(PaymentService):
             raise RuntimeError(message)
         return None
     
-    def create_payment_intent(self, order, payment_method="card"):
+    def create_payment_intent(self, order, payment_method="card", *, idempotency_key=None, currency=None):
         """Create Razorpay order"""
         if not self.is_configured:
             if settings.ENVIRONMENT == "production":
                 raise RuntimeError("Razorpay is not configured but ENVIRONMENT=production. No dummy fallback.")
             from app.services.payment_service import DummyPaymentService
             print("⚠️ Using dummy payment (Razorpay not configured)")
+            if idempotency_key:
+                raise RuntimeError("Recorded Razorpay provider is unavailable")
             return DummyPaymentService().create_payment_intent(order, payment_method)
         
         try:
-            amount_in_paise = int(float(order.grand_total) * 100)
-            
+            amount_in_minor = minor_units(order.grand_total, currency=currency)
+
             razorpay_order = self.client.order.create({
-                "amount": amount_in_paise,
-                "currency": (settings.PAYMENT_CURRENCY or "INR").upper(),
-                "receipt": order.order_number,
+                "amount": amount_in_minor,
+                "currency": currency or currency_code(),
+                "receipt": idempotency_key or order.order_number,
                 "payment_capture": 1,
                 "notes": {
                     "order_id": str(order.id),
@@ -75,16 +79,29 @@ class RazorpayPaymentService(PaymentService):
                 "payment_intent_id": razorpay_order["id"],
                 "order_id": str(order.id),
                 "amount": float(order.grand_total),
-                "currency": (settings.PAYMENT_CURRENCY or "INR").upper(),
+                "currency": currency or currency_code(),
                 "is_dummy": False,
                 "razorpay_order": razorpay_order,
             }
         except Exception as e:
             print(f"❌ Razorpay order creation failed: {str(e)}")
-            if settings.ENVIRONMENT == "production":
+            if settings.ENVIRONMENT == "production" or idempotency_key:
                 raise RuntimeError(f"Razorpay order creation failed: {str(e)}")
             from app.services.payment_service import DummyPaymentService
             return DummyPaymentService().create_payment_intent(order, payment_method)
+
+    def recover_payment_creation(self, order, attempt):
+        # Razorpay exposes receipt filtering. A missing match is NOT evidence
+        # that a timed-out POST failed: never issue another POST here.
+        result = self.client.order.all({"receipt": attempt.creation_key, "count": 100})
+        matches = [item for item in result.get("items", []) if item.get("receipt") == attempt.creation_key]
+        if len(matches) != 1:
+            return None
+        remote = matches[0]
+        return {"client_secret": remote["id"], "payment_intent_id": remote["id"],
+                "order_id": str(order.id),
+                "amount": from_minor_units(remote["amount"], currency=remote["currency"]),
+                "currency": remote["currency"], "is_dummy": False}
     
     def confirm_payment(self, payment_intent_id):
         """Fetch Razorpay order status"""
@@ -218,7 +235,8 @@ class RazorpayPaymentService(PaymentService):
         Create a full or partial refund for a Razorpay payment.
 
         - payment_id: the Razorpay payment ID (pay_xxx) — NOT the order ID
-        - amount:     amount in INR (rupees). None = full refund
+        - amount:     amount in the configured currency (full units).
+                      None = full refund
         - notes:      dict of notes stored against the refund
         """
         if not self.is_configured:
@@ -229,10 +247,13 @@ class RazorpayPaymentService(PaymentService):
         try:
             payload = {}
             if amount is not None:
-                # Razorpay expects the amount in paise
-                payload["amount"] = int(float(amount) * 100)
+                # Provider minor units (paise normally, whole units for
+                # zero-decimal currencies).
+                payload["amount"] = minor_units(amount)
             if notes:
                 payload["notes"] = {k: str(v) for k, v in notes.items()}
+                if notes.get("refund_key"):
+                    payload["receipt"] = notes["refund_key"]
 
             refund = self.client.payment.refund(payment_id, payload)
             print(f"✅ Razorpay refund created: {refund['id']} (status: {refund.get('status')})")
@@ -241,26 +262,37 @@ class RazorpayPaymentService(PaymentService):
                 "status": refund.get("status"),  # processed | pending | failed
                 "refund_id": refund["id"],
                 "payment_id": payment_id,
-                "amount": (refund.get("amount") or 0) / 100,
+                "amount": from_minor_units(refund.get("amount")),
                 "is_dummy": False,
             }
         except Exception as e:
             print(f"❌ Razorpay refund failed: {str(e)}")
-            return {"status": "failed", "payment_id": payment_id, "is_dummy": False, "error": str(e)}
+            # Transport/server errors do not prove that no money moved.
+            definite = (isinstance(e, razorpay.errors.BadRequestError)
+                        and not any(word in str(e).lower() for word in ("duplicate", "in progress")))
+            return {"status": "failed" if definite else "unknown", "payment_id": payment_id,
+                    "is_dummy": False, "error": str(e)}
 
     def get_charge_refund_state(self, payment_id: str) -> dict | None:
         """Refunded totals straight from Razorpay (catches dashboard-side refunds)."""
         if not self.is_configured:
             return None
         try:
-            items = self.client.payment.fetch_multiple_refund(payment_id).get(
-                "items", []
-            )
+            items = []
+            skip = 0
+            while True:
+                page = self.client.payment.fetch_multiple_refund(payment_id, {"count": 100, "skip": skip}).get("items", [])
+                items.extend(page)
+                if len(page) < 100:
+                    break
+                skip += len(page)
             refunds = [
                 {
                     "id": r.get("id"),
-                    "amount": (r.get("amount") or 0) / 100,
+                    "amount": from_minor_units(r.get("amount"), currency=r.get("currency")),
                     "status": r.get("status", "unknown"),
+                    "receipt": r.get("receipt"),
+                    "notes": r.get("notes") if isinstance(r.get("notes"), dict) else {},
                 }
                 for r in items
             ]
@@ -268,7 +300,7 @@ class RazorpayPaymentService(PaymentService):
             payment = self.client.payment.fetch(payment_id)
             return {
                 "charge_id": payment_id,
-                "charge_total": (payment.get("amount") or 0) / 100,
+                "charge_total": from_minor_units(payment.get("amount")),
                 "currency": str(payment.get("currency") or "").upper(),
                 "refunded_total": round(sum(r["amount"] for r in succeeded), 2),
                 "refunds": refunds,
@@ -288,7 +320,7 @@ class RazorpayPaymentService(PaymentService):
             return {
                 "refund_id": refund["id"],
                 "payment_id": refund.get("payment_id"),
-                "amount": (refund.get("amount") or 0) / 100,
+                "amount": from_minor_units(refund.get("amount")),
                 "status": refund.get("status"),  # processed | pending | failed
                 "is_dummy": False,
             }

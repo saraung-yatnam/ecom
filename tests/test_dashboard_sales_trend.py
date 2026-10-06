@@ -75,6 +75,10 @@ def _seed():
         s.commit()
 
 
+def setup_module():
+    _seed()
+
+
 def test_1_returns_seven_zero_filled_days():
     with Session(ENGINE) as s:
         trend = get_sales_trend(s, days=7)
@@ -88,7 +92,6 @@ def test_1_returns_seven_zero_filled_days():
     for entry in trend:
         assert set(entry.keys()) == {"date", "sales", "orders"}, entry
     print("  ✅ returns 7 consecutive zero-filled days")
-    return trend
 
 
 def test_2_counts_only_valid_order_statuses():

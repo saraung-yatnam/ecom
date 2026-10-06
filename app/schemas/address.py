@@ -1,7 +1,9 @@
 from uuid import UUID
 from datetime import datetime
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.core.region import default_country
 
 
 class AddressCreate(BaseModel):
@@ -11,7 +13,7 @@ class AddressCreate(BaseModel):
     city: str
     state: str
     postal_code: str
-    country: str = Field(default="India")
+    country: str = Field(default_factory=default_country)
     is_default: bool = Field(default=False)
 
 

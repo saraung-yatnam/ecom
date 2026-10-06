@@ -16,12 +16,13 @@ from app.schemas.order import (
     RefundInfo,
     RefundStatusResponse,
 )
-from app.services.email_service import email_service
+from app.services.email_outbox import enqueue_order_email
 from app.services.refund_service import fetch_refund_status, process_refund, restore_stock
 from app.services.shipping_status import shipment_stage_payload
 from app.repositories import notification as notification_repo
 from app.core.config import settings
 from app.core.store_settings import get_store_settings
+from app.core.region import format_money
 
 
 def _refund_processing_days() -> int:
@@ -104,7 +105,7 @@ def cancel_order(
     - COD orders: cancelled, no refund.
     - Online paid orders: cancelled + Razorpay refund (minus restocking fee).
     """
-    order = order_repo.get_order_by_id(session, order_id)
+    order = order_repo.get_order_by_id(session, order_id, for_update=True)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -144,6 +145,7 @@ def cancel_order(
 
     # --- Restore stock ---
     restore_stock(session, order)
+    enqueue_order_email(session, order, "order_cancelled")
 
     # --- Refund logic ---
     refund_info: RefundInfo
@@ -185,17 +187,6 @@ def cancel_order(
             fee_percentage=0,
             message="Order cancelled before payment — no refund needed",
         )
-
-    # --- Send email notification ---
-    if settings.SENDGRID_API_KEY:
-        try:
-            user = session.get(User, order.user_id)
-            if user:
-                email_service.send_order_cancelled(order, user)
-                if refund_info.processed:
-                    email_service.send_order_refunded(order, user)
-        except Exception as e:
-            print(f"Failed to send cancellation email: {str(e)}")
 
     # --- Notify managers/admins about the cancellation (notifications feed) ---
     try:
@@ -245,17 +236,17 @@ def get_refund_status(
 
     # ---- Friendly message based on our stored phase + live provider state ----
     if order.payment_status == "refund_completed":
-        message = f"Your refund of ₹{order.refund_amount} has been completed and credited to your account ✅"
+        message = f"Your refund of {format_money(order.refund_amount)} has been completed and credited to your account ✅"
     elif order.payment_status == "refund_failed" or live_status == "failed":
         message = "Refund failed. Please contact support for assistance."
     elif order.payment_status == "refund_initiated":
         message = (
-            f"Your refund of ₹{order.refund_amount} is being processed. "
+            f"Your refund of {format_money(order.refund_amount)} is being processed. "
             f"It will be credited within {_refund_processing_days()} business days."
         )
     else:
         status_messages = {
-            "processed": f"Refund of ₹{order.refund_amount} has been processed. It will reflect in your account within {_refund_processing_days()} business days.",
+            "processed": f"Refund of {format_money(order.refund_amount)} has been processed. It will reflect in your account within {_refund_processing_days()} business days.",
             "pending": "Refund is being processed. Please check back shortly.",
             "failed": "Refund failed. Please contact support for assistance.",
         }

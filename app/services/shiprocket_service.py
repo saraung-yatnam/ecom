@@ -3,12 +3,14 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
+import hashlib
 import random
 import re
 
 import httpx
 
 from app.core.config import settings
+from app.core.region import default_country, from_minor_units, minor_units
 from app.models.order import Order
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,15 @@ def estimate_delivery_date(etd: Optional[str], *, default_days: int = 7) -> date
 
 
 class ShippingServiceInterface(ABC):
+    def find_return_order(self, reference: str) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def get_return_order(self, order_id: str, reference: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def create_return_order(self, order: Order, reference: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        raise NotImplementedError
+
     @abstractmethod
     def check_serviceability(
         self, pickup_pincode: str, delivery_pincode: str, weight: float, cod: bool
@@ -74,7 +85,7 @@ class ShippingServiceInterface(ABC):
         pass
 
     @abstractmethod
-    def assign_awb(self, shipment_id: str, courier_id: Optional[int] = None) -> Dict[str, Any]:
+    def assign_awb(self, shipment_id: str, courier_id: Optional[int] = None, *, is_return: bool = False) -> Dict[str, Any]:
         """Assign courier partner and generate AWB"""
         pass
 
@@ -146,9 +157,22 @@ class MockShiprocketService(ShippingServiceInterface):
             "message": "Simulated order successfully pushed to Shiprocket",
         }
 
-    def assign_awb(self, shipment_id: str, courier_id: Optional[int] = None) -> Dict[str, Any]:
+    def find_return_order(self, reference: str) -> Optional[Dict[str, Any]]:
+        # No external store in simulator mode. Deterministic IDs make recovery
+        # survive service/process restarts without creating a second shipment.
+        return self.get_return_order(f"SR-RET-{reference}", reference)
+
+    def get_return_order(self, order_id: str, reference: str) -> Dict[str, Any]:
+        if order_id != f"SR-RET-{reference}":
+            raise ValueError("Return provider reference does not match")
+        return {"order_id": order_id, "shipment_id": f"SR-RET-SHP-{reference}", "status": "RETURN PENDING"}
+
+    def create_return_order(self, order: Order, reference: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return self.get_return_order(f"SR-RET-{reference}", reference)
+
+    def assign_awb(self, shipment_id: str, courier_id: Optional[int] = None, *, is_return: bool = False) -> Dict[str, Any]:
         courier = next((c for c in self.MOCK_COURIERS if c["courier_company_id"] == courier_id), self.MOCK_COURIERS[0])
-        awb_random = random.randint(1000000000, 9999999999)
+        awb_random = hashlib.sha256(shipment_id.encode()).hexdigest()[:16].upper() if is_return else random.randint(1000000000, 9999999999)
         prefix = courier["courier_name"][:3].upper()
         awb = f"{prefix}{awb_random}"
         return {
@@ -253,6 +277,86 @@ class RealShiprocketService(ShippingServiceInterface):
             "Authorization": f"Bearer {self._get_token()}",
         }
 
+    def _return_get(self, path: str, **params) -> Dict[str, Any]:
+        response = httpx.get(f"{self.BASE_URL}/{path}", params=params, headers=self._headers(), timeout=15.0)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Invalid Shiprocket return lookup response")
+        return data
+
+    def get_return_order(self, order_id: str, reference: str) -> Dict[str, Any]:
+        data = self._return_get(f"orders/show/{order_id}").get("data")
+        if not isinstance(data, dict) or str(data.get("id")) != str(order_id) or str(data.get("channel_order_id")) != reference or data.get("is_return") not in (1, "1"):
+            raise ValueError("Shiprocket order is not the matching reverse shipment")
+        shipments = data.get("shipments")
+        if isinstance(shipments, list) and len(shipments) == 1:
+            shipments = shipments[0]
+        if not isinstance(shipments, dict) or not shipments.get("id"):
+            raise ValueError("Shiprocket return has no unique shipment")
+        return {"order_id": str(data["id"]), "shipment_id": str(shipments["id"]),
+                "awb_code": shipments.get("awb"), "courier_name": shipments.get("courier"), "status": data.get("status")}
+
+    def find_return_order(self, reference: str) -> Optional[Dict[str, Any]]:
+        matches = []
+        # `search` is documented as AWB/channel_order_id search. Verify the
+        # exact reference and reverse flag, never a substring or forward order.
+        for page in range(1, 11):
+            result = self._return_get("orders", search=reference, page=page, per_page=100)
+            rows = result.get("data")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("Invalid Shiprocket return search response")
+            matches.extend(row for row in rows if str(row.get("channel_order_id")) == reference)
+            pages = result.get("meta", {}).get("pagination", {}).get("total_pages")
+            if (pages is not None and page >= int(pages)) or (pages is None and len(rows) < 100):
+                break
+        else:
+            raise ValueError("Shiprocket return search could not be fully reconciled")
+        if len(matches) > 1:
+            raise ValueError("Multiple Shiprocket orders match this return reference")
+        return self.get_return_order(str(matches[0]["id"]), reference) if matches else None
+
+    def create_return_order(self, order: Order, reference: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Official return API: customer is pickup; registered warehouse is
+        # destination. Return parcels are prepaid even for a collected COD sale.
+        try:
+            locations = self._return_get("settings/company/pickup")["data"]["shipping_address"]
+            warehouses = [row for row in locations if row.get("pickup_location") == settings.SHIPROCKET_PICKUP_LOCATION and row.get("status") in (1, "1")]
+            if len(warehouses) != 1:
+                raise ValueError("Configure one active Shiprocket pickup location for return delivery")
+            warehouse = warehouses[0]
+            address, customer = order.shipping_details, order.customer_details
+            if address is None:
+                raise ValueError("Return purchase has no shipping address")
+            names = (getattr(customer, "full_name", None) or "Customer").split()
+            seller = (warehouse.get("name") or warehouse["pickup_location"]).split()
+            payload = {"order_id": reference, "order_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "pickup_customer_name": names[0], "pickup_last_name": " ".join(names[1:]),
+                "pickup_address": address.line1, "pickup_address_2": address.line2 or "",
+                "pickup_city": address.city, "pickup_state": address.state, "pickup_country": address.country or default_country(),
+                "pickup_pincode": address.postal_code, "pickup_email": getattr(customer, "email", None) or "customer@example.com",
+                "pickup_phone": getattr(customer, "phone", None) or FALLBACK_PHONE,
+                # The published example leaves this empty for a new customer
+                # pickup address. A warehouse ID would select the wrong pickup.
+                "pickup_location_id": "",
+                "shipping_customer_name": seller[0], "shipping_last_name": " ".join(seller[1:]),
+                "shipping_address": warehouse["address"], "shipping_address_2": warehouse.get("address_2") or "",
+                "shipping_city": warehouse["city"], "shipping_state": warehouse["state"], "shipping_country": warehouse["country"],
+                "shipping_pincode": warehouse["pin_code"], "shipping_email": warehouse["email"], "shipping_phone": warehouse["phone"],
+                "order_items": items, "payment_method": "Prepaid", "sub_total": str(sum(Decimal(str(item["selling_price"])) * item["units"] for item in items)),
+                "length": DEFAULT_LENGTH_CM, "breadth": DEFAULT_BREADTH_CM, "height": DEFAULT_HEIGHT_CM, "weight": DEFAULT_WEIGHT_KG}
+            headers = self._headers()
+        except Exception as exc:
+            raise ReturnCreationRejected("Check the registered return warehouse and purchase address before retrying") from exc
+        response = httpx.post(f"{self.BASE_URL}/orders/create/return", json=payload, headers=headers, timeout=15.0)
+        if response.status_code in (400, 401, 403, 404, 405, 422):
+            raise ReturnCreationRejected("Shiprocket rejected return creation; check account access and return address/item details")
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or not result.get("order_id") or not result.get("shipment_id"):
+            raise ValueError("Shiprocket return creation outcome is unknown")
+        return {"order_id": str(result["order_id"]), "shipment_id": str(result["shipment_id"]), "status": result.get("status")}
+
     def check_serviceability(
         self, pickup_pincode: str, delivery_pincode: str, weight: float, cod: bool
     ) -> List[Dict[str, Any]]:
@@ -292,14 +396,15 @@ class RealShiprocketService(ShippingServiceInterface):
         # Reading them off Address raises AttributeError and 500s every
         # real dispatch — the Mock never touches addresses, so tests
         # never caught it.
-        customer_name = (getattr(order.user, "full_name", None) or "Customer").strip() or "Customer"
+        customer = order.customer_details
+        customer_name = (getattr(customer, "full_name", None) or "Customer").strip() or "Customer"
         name_parts = customer_name.split()
-        customer_email = (getattr(order.user, "email", None) or "customer@example.com")
+        customer_email = (getattr(customer, "email", None) or "customer@example.com")
         customer_phone = (
-            getattr(order.user, "phone", None) or FALLBACK_PHONE
+            getattr(customer, "phone", None) or FALLBACK_PHONE
         )
-        shipping = order.shipping_address
-        billing = order.billing_address or shipping
+        shipping = order.shipping_details
+        billing = order.billing_details or shipping
         if shipping is None:
             raise ValueError("Order has no shipping address.")
 
@@ -332,7 +437,7 @@ class RealShiprocketService(ShippingServiceInterface):
             "billing_city": billing.city,
             "billing_pincode": billing.postal_code,
             "billing_state": billing.state,
-            "billing_country": billing.country or "India",
+            "billing_country": billing.country or default_country(),
             "billing_email": customer_email,
             "billing_phone": customer_phone,
             "shipping_customer_name": name_parts[0],
@@ -342,7 +447,7 @@ class RealShiprocketService(ShippingServiceInterface):
             "shipping_city": shipping.city,
             "shipping_pincode": shipping.postal_code,
             "shipping_state": shipping.state,
-            "shipping_country": shipping.country or "India",
+            "shipping_country": shipping.country or default_country(),
             "shipping_email": customer_email,
             "shipping_phone": customer_phone,
             "shipping_is_billing": shipping_is_billing,
@@ -385,10 +490,12 @@ class RealShiprocketService(ShippingServiceInterface):
             "message": "Order created on Shiprocket",
         }
 
-    def assign_awb(self, shipment_id: str, courier_id: Optional[int] = None) -> Dict[str, Any]:
+    def assign_awb(self, shipment_id: str, courier_id: Optional[int] = None, *, is_return: bool = False) -> Dict[str, Any]:
         # Shiprocket's field is `courier_company_id`; `courier_id` is kept
         # as an accepted alias so callers using either name still work.
         payload: Dict[str, Any] = {"shipment_id": shipment_id}
+        if is_return:
+            payload["is_return"] = 1
         if courier_id:
             payload["courier_company_id"] = courier_id
             payload["courier_id"] = courier_id
@@ -429,6 +536,8 @@ class RealShiprocketService(ShippingServiceInterface):
             headers=self._headers(),
             timeout=15.0,
         )
+        if resp.status_code in (400, 401, 403, 404, 405, 422):
+            raise PickupRequestRejected("Shiprocket rejected pickup scheduling; check the reverse shipment and courier assignment")
         if resp.status_code != 200:
             raise Exception(f"Failed to request pickup: {resp.text}")
         return resp.json()
@@ -503,9 +612,16 @@ class RealShiprocketService(ShippingServiceInterface):
         return resp.json()
 
 
+class ReturnCreationRejected(ValueError):
+    """Definitively not submitted/accepted; safe to retry the same reference."""
+
+
+class PickupRequestRejected(ValueError):
+    """Definitively not accepted; safe to retry pickup scheduling."""
+
+
 def get_shipping_service() -> ShippingServiceInterface:
     """Factory returning the active shipping provider"""
     if getattr(settings, "SHIPPING_PROVIDER", "simulator").lower() == "shiprocket":
         return RealShiprocketService()
     return MockShiprocketService()
-

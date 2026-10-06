@@ -79,8 +79,6 @@ def create_block(
     _assert_window(payload.starts_at, payload.ends_at)
     block = ContentBlock(**payload.model_dump(), created_by=current_user.id)
     session.add(block)
-    session.commit()
-    session.refresh(block)
     audit_repo.log_and_commit(
         session,
         action="content.created",
@@ -90,6 +88,21 @@ def create_block(
         after={"key": block.key, "title": block.title},
         ip_address=audit_repo.client_ip(request),
     )
+    return ContentBlockRead.model_validate(block)
+
+
+@router.get("/blocks/{block_id}", response_model=ContentBlockRead)
+def get_block(
+    block_id: UUID,
+    session: SessionDep,
+    current_user: User = Depends(require_perm("content.manage")),
+):
+    """Single block for the edit page."""
+    block = content_repo.get_block_by_id(session, block_id)
+    if block is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Content block not found"
+        )
     return ContentBlockRead.model_validate(block)
 
 
@@ -122,8 +135,6 @@ def update_block(
 
     block.updated_at = datetime.now(timezone.utc)
     session.add(block)
-    session.commit()
-    session.refresh(block)
     audit_repo.log_and_commit(
         session,
         action="content.updated",
@@ -152,7 +163,6 @@ def delete_block(
         )
     snapshot = {"key": block.key, "title": block.title}
     session.delete(block)
-    session.commit()
     audit_repo.log_and_commit(
         session,
         action="content.deleted",

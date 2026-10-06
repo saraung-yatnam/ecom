@@ -21,7 +21,7 @@ def get_user_by_username(session: Session, username: str) -> User | None:
     return result.scalar_one_or_none()
 
 
-def create_user(session: Session, data: UserCreate) -> User:
+def create_user(session: Session, data: UserCreate, *, commit: bool = True) -> User:
     user = User(
         email=data.email,
         username=data.username,
@@ -30,8 +30,11 @@ def create_user(session: Session, data: UserCreate) -> User:
         phone=data.phone,
     )
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    if commit:
+        session.commit()
+        session.refresh(user)
+    else:
+        session.flush()
     return user
 
 
@@ -167,6 +170,7 @@ def update_user_by_admin(
     session: Session,
     user: User,
     update_data: dict,
+    *, commit: bool = True,
 ) -> User:
     """
     Update user by admin.
@@ -184,12 +188,15 @@ def update_user_by_admin(
             setattr(user, key, value)
     
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    if commit:
+        session.commit()
+        session.refresh(user)
+    else:
+        session.flush()
     return user
 
 
-def delete_user(session: Session, user: User) -> None:
+def delete_user(session: Session, user: User, *, commit: bool = True) -> None:
     """
     Hard delete user (use with caution).
     
@@ -198,7 +205,7 @@ def delete_user(session: Session, user: User) -> None:
         user: User object to delete
     """
     session.delete(user)
-    session.commit()
+    session.commit() if commit else session.flush()
 
 
 def update_user_profile(session: Session, user: User, update_data: dict) -> User:

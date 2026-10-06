@@ -11,6 +11,7 @@ from app.models.order import Order, OrderItem, OrderStatus
 from app.models.user import User
 from app.models.address import Address  # Add this if you have address model
 from app.models.product import Product, ProductVariant  # ⚠️ ASSUMED — see note below
+from app.repositories.commerce import settled_sale, net_sale_amount
 
 
 # Eager-load chain used by the user-facing order responses: each order item
@@ -23,7 +24,7 @@ _ORDER_ITEM_PRODUCT_LOAD = (
 )
 
 
-def get_order_by_id(session: Session, order_id: UUID) -> Order | None:
+def get_order_by_id(session: Session, order_id: UUID, *, for_update: bool = False) -> Order | None:
     """Get order by ID with items and user loaded"""
     statement = (
         select(Order)
@@ -36,6 +37,8 @@ def get_order_by_id(session: Session, order_id: UUID) -> Order | None:
             selectinload(Order.payments),  # 👈 resolves transaction_id
         )
     )
+    if for_update:
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     result = session.execute(statement)
     return result.scalar_one_or_none()
 
@@ -186,6 +189,7 @@ def update_order_status(
     session: Session,
     order: Order,
     status: str,
+    *, commit: bool = True,
 ) -> Order:
     """Update order status"""
     order.status = status
@@ -197,8 +201,11 @@ def update_order_status(
         order.delivered_at = datetime.now(timezone.utc)
     
     session.add(order)
-    session.commit()
-    session.refresh(order)
+    if commit:
+        session.commit()
+        session.refresh(order)
+    else:
+        session.flush()
     return order
 
 
@@ -261,14 +268,14 @@ def get_user_order_statistics(session: Session, user_id: UUID) -> dict:
         or 0
     )
 
-    # "Total Spent" = sum of grand_total for non-cancelled / non-refunded orders
+    # Settled active commerce, matching financial reports.
     total_spent = (
         session.execute(
-            select(func.coalesce(func.sum(Order.grand_total), 0))
+            select(func.coalesce(func.sum(net_sale_amount()), 0))
             .select_from(Order)
             .where(
                 Order.user_id == user_id,
-                Order.status.not_in([OrderStatus.CANCELLED, OrderStatus.REFUNDED]),
+                settled_sale(),
             )
         ).scalar()
         or 0
@@ -308,13 +315,13 @@ def get_user_order_statistics(session: Session, user_id: UUID) -> dict:
         .limit(1)
     ).scalar()
 
-    # Total items purchased (sum of quantities across all order items)
+    # Only retained purchases contribute units and the favorite-product metric.
     total_items_purchased = (
         session.execute(
             select(func.coalesce(func.sum(OrderItem.quantity), 0))
             .select_from(OrderItem)
             .join(Order, OrderItem.order_id == Order.id)
-            .where(Order.user_id == user_id)
+            .where(Order.user_id == user_id, settled_sale())
         ).scalar()
         or 0
     )
@@ -336,13 +343,15 @@ def get_user_order_statistics(session: Session, user_id: UUID) -> dict:
         select(OrderItem.product_name, func.sum(OrderItem.quantity).label("qty"))
         .select_from(OrderItem)
         .join(Order, OrderItem.order_id == Order.id)
-        .where(Order.user_id == user_id)
+        .where(Order.user_id == user_id, settled_sale())
         .group_by(OrderItem.product_name)
         .order_by(func.sum(OrderItem.quantity).desc(), OrderItem.product_name.asc())
         .limit(1)
     ).first()
 
-    average_order_value = float(total_spent) / total_orders if total_orders else 0
+    settled_orders = session.execute(select(func.count(Order.id)).where(
+        Order.user_id == user_id, settled_sale())).scalar() or 0
+    average_order_value = float(total_spent) / settled_orders if settled_orders else 0
 
     return {
         "total_orders": total_orders,

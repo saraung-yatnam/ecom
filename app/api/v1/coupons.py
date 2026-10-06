@@ -219,6 +219,7 @@ def create_coupon(
         session,
         create_data,
         current_user.id,
+        commit=False,
     )
     audit_repo.log_and_commit(
         session, action="coupon.created", entity="coupon", entity_id=coupon.id,
@@ -326,6 +327,7 @@ def update_coupon(
         coupon,
         update_data,
         none_fields,
+        commit=False,
     )
     audit_repo.log_and_commit(
         session, action="coupon.updated", entity="coupon", entity_id=coupon.id,
@@ -358,7 +360,7 @@ def delete_coupon(
         raise HTTPException(status_code=404, detail="Coupon not found")
     
     snapshot = {"code": coupon.code, "value": str(coupon.value)}
-    coupon_repo.delete_coupon(session, coupon)
+    coupon_repo.delete_coupon(session, coupon, commit=False)
     audit_repo.log_and_commit(
         session, action="coupon.deleted", entity="coupon", entity_id=coupon_id,
         actor_id=current_user.id, before=snapshot,

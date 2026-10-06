@@ -3,7 +3,8 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Request
 from sqlmodel import Session,select
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import select as sa_select, update
 
 from app.api.deps import SessionDep, CurrentUser, CurrentUser
 from app.core.rate_limit import limiter
@@ -23,6 +24,7 @@ from app.core.security import (
 )
 from app.services import otp_service
 from app.services.email_service import email_service
+from app.services.email_outbox import enqueue_email
 from app.services.google_auth_service import google_auth_service
 from app.services.otp_service import create_otp,verify_otp,increment_otp_attempts,get_otp_attempts
 from app.core.config import settings
@@ -34,7 +36,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _issue_access_token(
-    session: SessionDep, user: User, audience: str = AUDIENCE_ADMIN
+    session: SessionDep, user: User, audience: str = AUDIENCE_ADMIN, session_id: str | None = None,
 ) -> str:
     """Access token carrying legacy role + dynamic permission set."""
     role_value = getattr(user.role, "value", user.role) or "customer"
@@ -47,7 +49,20 @@ def _issue_access_token(
     return create_access_token(
         subject=user.email, role=role_value, permissions=permissions,
         audience=audience,
+        session_id=session_id, token_version=user.token_version,
     )
+
+
+def _issue_tokens(session: Session, user: User, audience: str = AUDIENCE_ADMIN) -> TokenPair:
+    try:
+        raw = token_repo.issue_refresh_token(session, user.id, scope=audience, commit=False)
+        record = token_repo.get_valid_token(session, raw)
+        access = _issue_access_token(session, user, audience, str(record.session_id))
+        session.commit()
+        return TokenPair(access_token=access, refresh_token=raw)
+    except Exception:
+        session.rollback()
+        raise
 
 
 def _require_otp_sent(sent: bool) -> None:
@@ -95,20 +110,14 @@ def _privileged_or_tokens(
     (Order.placed_by_staff) rather than banned.
     """
     if audience != AUDIENCE_ADMIN:
-        access = _issue_access_token(session, user, audience)
-        refresh = token_repo.issue_refresh_token(
-            session, user.id, scope=audience
-        )
-        return TokenPair(access_token=access, refresh_token=refresh)
+        return _issue_tokens(session, user, audience)
 
     try:
         permissions = rbac_repo.get_user_permissions(session, user.id)
     except Exception:
         permissions = []
     if not permissions:
-        access = _issue_access_token(session, user, audience)
-        refresh = token_repo.issue_refresh_token(session, user.id, scope=audience)
-        return TokenPair(access_token=access, refresh_token=refresh)
+        return _issue_tokens(session, user, audience)
 
     _, sent = otp_service.create_otp(session, user.email, "admin_login")
     _require_otp_sent(sent)
@@ -157,12 +166,12 @@ class ForgotPasswordRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     token: str
-    new_password: str
+    new_password: str = Field(min_length=8)
 
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
-    new_password: str
+    new_password: str = Field(min_length=8)
 
 
 class VerifyLoginOtpRequest(BaseModel):
@@ -287,16 +296,10 @@ def verify_registration(
         phone=request.phone,
     )
     
-    user = user_repo.create_user(session, user_data)
+    user = user_repo.create_user(session, user_data, commit=False)
+    enqueue_email(session, f"user:{user.id}:welcome", "send_welcome_email", user)
+    session.commit()
     _assign_default_role(session, user)
-    
-    # ✅ Send welcome email
-    if settings.SENDGRID_API_KEY:
-        try:
-            email_service.send_welcome_email(user)
-            print(f"✅ Welcome email sent to {user.email}")
-        except Exception as e:
-            print(f"❌ Failed to send welcome email: {str(e)}")
     
     return {
         "message": "Account created successfully",
@@ -405,11 +408,7 @@ def verify_login_otp(
             ),
         )
 
-    access = _issue_access_token(session, user, AUDIENCE_ADMIN)
-    refresh = token_repo.issue_refresh_token(
-        session, user.id, scope=AUDIENCE_ADMIN
-    )
-    return TokenPair(access_token=access, refresh_token=refresh)
+    return _issue_tokens(session, user, AUDIENCE_ADMIN)
 
 
 @router.post("/login/resend-otp")
@@ -451,22 +450,31 @@ def refresh(data: RefreshRequest, session: SessionDep):
     if not record:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
-    user = session.get(User, record.user_id)
+    user = session.execute(sa_select(User).where(User.id == record.user_id).with_for_update()
+                           .execution_options(populate_existing=True)).scalars().first()
+    if user is None or not user.is_active:
+        raise HTTPException(401, "Invalid or expired refresh token")
     # Re-issue with the scope the session was ORIGINALLY created under. Reading
     # it from the stored record is what stops a storefront session from
     # upgrading itself to an admin-capable token on refresh.
     scope = record.scope or AUDIENCE_ADMIN
-    new_refresh = token_repo.rotate_token(session, record)
-    access = _issue_access_token(session, user, scope)
-    return TokenPair(access_token=access, refresh_token=new_refresh)
+    try:
+        new_refresh = token_repo.rotate_token(session, record, commit=False)
+        access = _issue_access_token(session, user, scope, str(record.session_id))
+        session.commit()
+        return TokenPair(access_token=access, refresh_token=new_refresh)
+    except Exception:
+        session.rollback()
+        raise
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(data: RefreshRequest, session: SessionDep):
-    record = token_repo.get_valid_token(session, data.refresh_token)
+    record = token_repo.get_token(session, data.refresh_token)
     if not record:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
-    token_repo.revoke_token(session, record)    
+    token_repo.revoke_session(session, record)
+    session.commit()
 
 
 @router.get("/me", response_model=UserRead)
@@ -559,16 +567,11 @@ def google_auth(
             password_hash=None,
         )
         session.add(user)
+        enqueue_email(session, f"user:{user.id}:welcome", "send_welcome_email", user)
         session.commit()
         session.refresh(user)
         _assign_default_role(session, user)
         
-        if settings.SENDGRID_API_KEY:
-            try:
-                email_service.send_welcome_email(user)
-                print(f"✅ Welcome email sent to {user.email}")
-            except Exception as e:
-                print(f"❌ Failed to send welcome email: {str(e)}")
     
     else:
         # User exists - link Google account if not already
@@ -650,7 +653,6 @@ def forgot_password(
     session.query(PasswordResetToken).filter(
         PasswordResetToken.user_id == user.id
     ).delete()
-    session.commit()
     
     # Generate reset token (valid for 1 hour)
     token = generate_reset_token()
@@ -658,21 +660,16 @@ def forgot_password(
     
     # Store token in database
     reset_token = PasswordResetToken(
-        token=token,
+        token=token_repo._hash(token),
         user_id=user.id,
         expires_at=expires_at,
         used=False,
     )
     session.add(reset_token)
+    enqueue_email(session, f"password-reset:{reset_token.id}", "send_password_reset_email",
+                  user_email=user.email, user_name=user.full_name or user.username,
+                  reset_token=token, expires_at=expires_at)
     session.commit()
-    
-    # Send email in background
-    background_tasks.add_task(
-        email_service.send_password_reset_email,
-        user_email=user.email,
-        user_name=user.full_name or user.username,
-        reset_token=token,
-    )
     
     print(f"✅ Password reset token generated for {user.email}")
     return {"message": "If an account with this email exists, a reset link has been sent."}
@@ -688,7 +685,7 @@ def reset_password(
     """
     # Get token from database
     reset_token = session.query(PasswordResetToken).filter(
-        PasswordResetToken.token == request.token,
+        PasswordResetToken.token == token_repo._hash(request.token),
         PasswordResetToken.used == False,
         PasswordResetToken.expires_at > datetime.utcnow(),
     ).first()
@@ -698,6 +695,12 @@ def reset_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired reset token",
         )
+    claimed = session.execute(update(PasswordResetToken).where(
+        PasswordResetToken.id == reset_token.id, PasswordResetToken.used.is_(False),
+    ).values(used=True).execution_options(synchronize_session=False))
+    if claimed.rowcount != 1:
+        session.rollback()
+        raise HTTPException(400, "Invalid or expired reset token")
     
     # Get user
     user = session.get(User, reset_token.user_id)
@@ -716,6 +719,7 @@ def reset_password(
     
     session.add(user)
     session.add(reset_token)
+    token_repo.invalidate_user_sessions(session, user)
     session.commit()
     
     print(f"✅ Password reset successful for {user.email}")
@@ -749,6 +753,7 @@ def change_password(
     # Update password
     current_user.password_hash = hash_password(request.new_password)
     session.add(current_user)
+    token_repo.invalidate_user_sessions(session, current_user)
     session.commit()
     
     print(f"✅ Password changed successfully for {current_user.email}")

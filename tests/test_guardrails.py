@@ -802,14 +802,14 @@ def test_provider_mismatch_returns_409_with_figures_then_reconcile_heals(client)
 
         # The external ₹831.08 already baked in our 5% CONFIRMED fee
         # (874.82 − 43.74), so policy says nothing remains: the follow-up
-        # attempt reports fully-refunded instead of moving the fee.
+        # attempt rejects the now-terminal fully-refunded policy balance.
         final = client.post(
             f"/api/v1/admin/orders/{order_id}/refund",
             json={"reason": "Remaining balance"},
             headers=_admin_headers,
         )
-        assert final.status_code == 200, final.text
-        assert "Nothing to refund" in final.json()["message"]
+        assert final.status_code == 400, final.text
+        assert "already been refunded" in final.json()["detail"]
 
         # ...and the order drops out of the action queue.
         queue = client.get(
@@ -963,20 +963,32 @@ def _login_as(client, email: str) -> dict:
 
 
 def test_invite_cannot_mint_unheld_privileges(client):
-    """An inviter may only hand out power they already hold themselves."""
+    """An inviter may only hand out power they already hold themselves
+    (grant ⊆ held across the whole permission set, not just the two
+    admin-minting keys)."""
     with _testing_session() as s:
         # Can invite, but holds NEITHER users.manage_roles NOR roles.manage.
         _add_custom_role(s, "recruiter", {"users.view", "users.manage_roles"})
+        _add_custom_role(s, "greeter", {"users.view"})
         _make_user(s, "recruiter@g-test.com", UserRole.staff, "recruiter")
     headers = _login_as(client, "recruiter@g-test.com")
 
-    # In scope: `staff` grants no admin-minting permission → allowed.
+    # In scope: `greeter` grants only users.view (held) → allowed.
     ok = client.post(
         "/api/v1/admin/invites",
-        json={"email": "ok-hire@g-test.com", "role_slugs": ["staff"]},
+        json={"email": "ok-hire@g-test.com", "role_slugs": ["greeter"]},
         headers=headers,
     )
     assert ok.status_code == 201, ok.text
+
+    # Out of subset: `staff` grants products.view etc. (not held) → blocked.
+    blocked_staff = client.post(
+        "/api/v1/admin/invites",
+        json={"email": "staff-hire@g-test.com", "role_slugs": ["staff"]},
+        headers=headers,
+    )
+    assert blocked_staff.status_code == 403, blocked_staff.text
+    assert "privilege escalation" in blocked_staff.json()["detail"]
 
     # Out of scope: `admin` grants roles.manage (not held) → blocked.
     blocked = client.post(
@@ -998,7 +1010,8 @@ def test_invite_cannot_mint_unheld_privileges(client):
 
 
 def test_role_assignment_cannot_grant_unheld_privileges(client):
-    """Same escalation block on the role-assignment path as on invites."""
+    """Same escalation block on the role-assignment path as on invites
+    (grant ⊆ held across the whole permission set)."""
     with _testing_session() as s:
         target = _make_user(
             s, "promote-me@g-test.com", UserRole.customer, "customer"
@@ -1017,20 +1030,29 @@ def test_role_assignment_cannot_grant_unheld_privileges(client):
     assert blocked.status_code == 403, blocked.text
     assert "privilege escalation" in blocked.json()["detail"]
 
+    # The seeded `staff` role grants products.view etc., which the recruiter
+    # does not hold → also blocked under grant ⊆ held.
+    blocked_staff = client.put(
+        f"/api/v1/admin/users/{target_id}/roles",
+        json={"role_slugs": ["staff"]},
+        headers=headers,
+    )
+    assert blocked_staff.status_code == 403, blocked_staff.text
+
     # Nothing partial leaked into the target's role set.
     unchanged = client.get(
         f"/api/v1/admin/users/{target_id}/roles", headers=_admin_headers
     )
     assert unchanged.json() == ["customer"], unchanged.text
 
-    # In scope: a role that grants nothing the assigner lacks is allowed.
+    # In scope: `greeter` grants only users.view (held) → allowed.
     allowed = client.put(
         f"/api/v1/admin/users/{target_id}/roles",
-        json={"role_slugs": ["staff"]},
+        json={"role_slugs": ["greeter"]},
         headers=headers,
     )
     assert allowed.status_code == 200, allowed.text
-    assert allowed.json() == ["staff"]
+    assert allowed.json() == ["greeter"]
 
     # No self-promotion path at all.
     self_try = client.put(
@@ -1116,4 +1138,3 @@ def test_audit_records_forwarded_client_ip(client):
         assert entry is not None
         # Leftmost hop = the admin's browser, not the ingress address.
         assert entry.ip_address == "203.0.113.9"
-

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlmodel import Session
+from app.core.region import format_money
 
 from app.core.config import settings
 from app.models.cart import Cart
@@ -37,6 +38,7 @@ from app.repositories import coupon as coupon_repo
 from app.schemas.cart import AutomaticCouponRead, CartRead
 from app.utils.cart import calculate_cart_total
 from app.utils.coupon import calculate_discount, validate_coupon
+from app.core.store_settings import get_store_settings, StoreSettingsSnapshot
 
 
 def _tax_rate() -> Decimal:
@@ -73,6 +75,7 @@ class CartPricing:
     new_subtotal: Decimal
     tax_total: Decimal
     total: Decimal
+    policy: StoreSettingsSnapshot | None = None
 
 
 def trigger_description(coupon: Coupon) -> str:
@@ -80,7 +83,7 @@ def trigger_description(coupon: Coupon) -> str:
     trigger = _enum_value(coupon.trigger_type)
     if trigger == TriggerType.MIN_CART_VALUE.value:
         return (
-            f"Applies automatically to carts of ₹{coupon.trigger_min_cart_value:g} "
+            f"Applies automatically to carts of {format_money(coupon.trigger_min_cart_value)} "
             "or more"
         )
     if trigger == TriggerType.MIN_ITEM_COUNT.value:
@@ -91,7 +94,7 @@ def trigger_description(coupon: Coupon) -> str:
     if trigger == TriggerType.CATEGORY_SPEND.value:
         return (
             f"Applies automatically when you spend "
-            f"₹{coupon.trigger_category_spend:g} in this category"
+            f"{format_money(coupon.trigger_category_spend)} in this category"
         )
     if trigger == TriggerType.FIRST_ORDER.value:
         return "Applies automatically on your first order"
@@ -234,7 +237,8 @@ def resolve_cart_pricing(
     user: User | None,
 ) -> CartPricing:
     """Run the full decision ladder and return the authoritative pricing."""
-    base = calculate_cart_total(cart_with_items)
+    policy = get_store_settings(session, seed=False)
+    base = calculate_cart_total(cart_with_items, policy=policy)
     subtotal = base["subtotal"]
     item_count = base["item_count"]
 
@@ -255,7 +259,7 @@ def resolve_cart_pricing(
 
     # Step 5 — totals on the discounted amount.
     new_subtotal = subtotal - discount_total
-    tax_total = new_subtotal * _tax_rate()
+    tax_total = new_subtotal * Decimal(str(policy.tax_rate))
     shipping_total = base["shipping_total"]
     total = new_subtotal + tax_total + shipping_total
 
@@ -270,6 +274,7 @@ def resolve_cart_pricing(
         new_subtotal=new_subtotal,
         tax_total=tax_total,
         total=total,
+        policy=policy,
     )
 
 

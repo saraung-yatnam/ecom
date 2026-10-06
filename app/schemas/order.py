@@ -160,6 +160,17 @@ class ShipmentStage(BaseModel):
 class OrderRead(BaseModel):
     """Full order response with nested data"""
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _historical_details(cls, data):
+        if isinstance(data, dict) or getattr(data, "customer_snapshot", None) is None:
+            return data
+        values = {key: getattr(data, key, field.default) for key, field in cls.model_fields.items()}
+        values["user"] = data.customer_snapshot
+        values["shipping_address"] = data.shipping_snapshot
+        values["billing_address"] = data.billing_snapshot
+        return values
     
     # Basic Info
     id: UUID

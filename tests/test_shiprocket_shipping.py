@@ -114,7 +114,7 @@ def _make_order(s, *, sku_prefix: str, qty: int = 2, stock: int = 5,
         shipping_total=Decimal("0"),
         grand_total=Decimal("499.00") * qty,
         payment_method=payment_method,
-        payment_status="pending",
+        payment_status="cod_pending" if payment_method == "cod" else "pending",
         status=status,
         placed_at=datetime.now(timezone.utc),
     )
@@ -319,7 +319,7 @@ def test_4_simulator_event_transitions():
             s, ADMIN,
         )
     assert res["order_status"] == "delivered", res
-    assert res["payment_status"] == "paid", res  # COD collected on delivery
+    assert res["payment_status"] == "cod_pending", res  # Delivery is not proof of cash collection
     order = _order(order_id)
     assert order.delivered_at is not None
     print(f"  ✅ delivered -> {res['order_status']}, COD payment_status={res['payment_status']}")
@@ -351,7 +351,7 @@ def test_5_rto_delivered_restores_stock():
             order_id, SimulatorTriggerWebhookRequest(event="rto_delivered"), s, ADMIN,
         )
     assert res["order_status"] == "rto", res
-    assert res["shipment_status"] == "RTO", res
+    assert res["shipment_status"] == "RTO DELIVERED", res
 
     restored = _stock_of(variant_id)
     assert restored == 5, f"stock must be restored to 5, got {restored}"
@@ -406,7 +406,7 @@ def test_7_shiprocket_webhook_endpoint():
     fire({"awb": awb, "current_status": "DELIVERED", "location": "Doorstep"})
     order = _order(order_id)
     assert order.status == OrderStatus.DELIVERED, order.status
-    assert order.payment_status == "paid", "COD must be marked paid on delivery"
+    assert order.payment_status == "cod_pending", "Delivery must not imply cash collection"
 
     # Unknown AWB is ignored (never 500s the provider)
     ignored = fire({"awb": "NOPE-123", "current_status": "DELIVERED"})
@@ -499,7 +499,7 @@ def test_9_real_payload_shape():
     # Numeric-only payload: current_status absent, shipment_status is an int.
     # The old code called .upper() on this and raised AttributeError -> 500,
     # which makes Shiprocket retry and eventually disable the webhook.
-    ack2 = fire({"data": {"awb": awb, "shipment_status": 9}})
+    ack2 = fire({"data": {"awb": awb, "shipment_status": 17}})
     assert ack2["status"] == "success", ack2
     assert _order(order_id).status == OrderStatus.OUT_FOR_DELIVERY, ack2
     print("  ✅ nested 'data' envelope + numeric-only status both handled")
@@ -650,8 +650,26 @@ def test_12_simulator_uses_real_payload():
     sim("picked_up")
     assert _order(order_id).status == OrderStatus.SHIPPED, "pickup -> shipped"
 
-    sim("rto_in_transit")
-    assert _order(order_id).status == OrderStatus.RTO, "RTO IN TRANSIT -> rto"
+    failed = sim("delivery_failed")
+    assert failed["simulated_payload"]["data"]["current_status"] == "UNDELIVERED"
+    assert failed["simulated_payload"]["data"]["is_return"] == 0
+    assert failed["after"]["order_status"] == OrderStatus.SHIPPED.value
+    initiated = sim("rto_initiated")
+    assert initiated["after"]["order_status"] == OrderStatus.RTO.value
+    assert initiated["after"]["shipment_status"] == "RTO INITIATED"
+    transit = sim("rto_in_transit")
+    assert transit["after"]["shipment_status"] == "RTO IN TRANSIT"
+    ofd = sim("rto_ofd")
+    assert ofd["after"]["shipment_status"] == "RTO OFD"
+    delivered = sim("rto_delivered")
+    assert delivered["after"]["shipment_status"] == "RTO DELIVERED"
+    assert delivered["effects"]["rto_stock_restored_now"] is True
+    acknowledged = sim("rto_acknowledged")
+    assert acknowledged["after"]["shipment_status"] == "RTO ACKNOWLEDGED"
+    assert acknowledged["effects"]["rto_stock_restored_now"] is False
+    assert acknowledged["effects"]["money_changed"] is False
+    assert acknowledged["effects"]["forward_awb_preserved"] is True
+    assert _order(order_id).status == OrderStatus.RTO, "RTO branch must stay on the original order"
 
     # An unknown event name is a clear 400, not a silent no-op.
     try:
@@ -766,10 +784,11 @@ def test_14_shiprocket_official_statuses():
         ("OUT FOR DELIVERY", OrderStatus.OUT_FOR_DELIVERY, "OUT FOR DELIVERY"),
         ("REACHED DESTINATION", None, "OUT_FOR_DELIVERY"),
         ("DELIVERED", OrderStatus.DELIVERED, "DELIVERED"),
-        ("RTO INITIATED", OrderStatus.RTO, "RTO"),
-        ("RTO IN TRANSIT", OrderStatus.RTO, "RTO"),
-        ("RTO ACKNOWLEDGED", OrderStatus.RTO, "RTO"),
-        ("RTO DELIVERED", OrderStatus.RTO, "RTO"),
+        ("RTO INITIATED", OrderStatus.RTO, "RTO INITIATED"),
+        ("RTO IN TRANSIT", OrderStatus.RTO, "RTO IN TRANSIT"),
+        ("RTO OFD", OrderStatus.RTO, "RTO OFD"),
+        ("RTO ACKNOWLEDGED", OrderStatus.RTO, "RTO ACKNOWLEDGED"),
+        ("RTO DELIVERED", OrderStatus.RTO, "RTO DELIVERED"),
         ("NOC", None, "NOC"),
         ("LOST", None, "LOST"),
         ("DAMAGED", None, "DAMAGED"),
@@ -1136,4 +1155,3 @@ _ensure_setup()
 
 if __name__ == "__main__":
     run_all()
-

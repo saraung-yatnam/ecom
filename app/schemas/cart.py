@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, ConfigDict
 class AddToCartRequest(BaseModel):
     variant_id: UUID
     quantity: int = Field(ge=1, le=999)
+    merge_key: UUID | None = None
 
 
 class UpdateCartItemRequest(BaseModel):

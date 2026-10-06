@@ -35,6 +35,8 @@ class RefreshToken(SQLModel, table=True):
     scope: str = Field(default="admin", max_length=20, index=True)
 
     revoked: bool = Field(default=False)
+    # Stable login identity across rotations; logout invalidates only this session.
+    session_id: uuid.UUID = Field(default_factory=uuid.uuid4, index=True)
 
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),

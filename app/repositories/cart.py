@@ -4,7 +4,7 @@ from uuid import UUID
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 
-from app.models.cart import Cart, CartItem
+from app.models.cart import Cart, CartItem, CartMergeReceipt
 from app.models.coupon import CouponType
 from app.models.product import ProductVariant
 from app.models.product_image import ProductImage
@@ -100,11 +100,12 @@ def add_item_to_cart(
     session: Session,
     cart: Cart,
     variant_id: UUID,
-    quantity: int
+    quantity: int,
+    *, commit: bool = True,
 ) -> CartItem:
     """Add item to cart or update quantity if exists."""
     
-    variant = session.get(ProductVariant, variant_id)
+    variant = session.get(ProductVariant, variant_id, populate_existing=True)
     if not variant:
         raise ValueError("Variant not found")
     
@@ -114,7 +115,7 @@ def add_item_to_cart(
     statement = select(CartItem).where(
         CartItem.cart_id == cart.id,
         CartItem.variant_id == variant_id
-    )
+    ).execution_options(populate_existing=True)
     existing_item = session.exec(statement).first()
     
     if existing_item:
@@ -123,8 +124,11 @@ def add_item_to_cart(
             raise ValueError(f"Only {variant.stock} items available")
         existing_item.quantity = new_quantity
         session.add(existing_item)
-        session.commit()
-        session.refresh(existing_item)
+        if commit:
+            session.commit()
+            session.refresh(existing_item)
+        else:
+            session.flush()
         return existing_item
     
     price = variant.price_override or variant.product.price
@@ -136,9 +140,30 @@ def add_item_to_cart(
     )
     
     session.add(cart_item)
-    session.commit()
-    session.refresh(cart_item)
+    if commit:
+        session.commit()
+        session.refresh(cart_item)
+    else:
+        session.flush()
     return cart_item
+
+
+def merge_cart_item(session: Session, cart: Cart, variant_id: UUID, quantity: int, merge_key: UUID):
+    """An acknowledged guest entry is additive exactly once, even after a lost response."""
+    try:
+        session.exec(select(Cart).where(Cart.id == cart.id).with_for_update()).one()
+        receipt = session.get(CartMergeReceipt, (cart.id, merge_key))
+        if receipt is not None:
+            if receipt.variant_id != variant_id or receipt.quantity != quantity:
+                raise ValueError("Merge key was already used for a different cart entry")
+            return
+        add_item_to_cart(session, cart, variant_id, quantity, commit=False)
+        session.add(CartMergeReceipt(cart_id=cart.id, merge_key=merge_key,
+                                    variant_id=variant_id, quantity=quantity))
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
 
 
 def update_cart_item(
@@ -170,8 +195,8 @@ def remove_cart_item(session: Session, cart_item: CartItem) -> None:
     session.commit()
 
 
-def clear_cart(session: Session, cart: Cart) -> None:
-    """Remove all items from cart and clear coupon."""
+def clear_cart(session: Session, cart: Cart, *, commit: bool = True) -> None:
+    """Clear the cart; checkout stages this in its caller-owned transaction."""
     statement = select(CartItem).where(CartItem.cart_id == cart.id)
     items = session.exec(statement).all()
     for item in items:
@@ -180,7 +205,10 @@ def clear_cart(session: Session, cart: Cart) -> None:
     # Clear coupon code from cart
     cart.coupon_code = None
     session.add(cart)
-    session.commit()
+    if commit:
+        session.commit()
+    else:
+        session.flush()
 
 
 def apply_coupon_to_cart(

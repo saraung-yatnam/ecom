@@ -203,12 +203,35 @@ def update_user_role(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unknown role: {slug}",
             )
+        # Same guards as PUT .../roles (legacy path must not be softer).
+        assigner_perms = set(rbac_repo.get_user_permissions(session, current_user.id))
+        role_keys = set(rbac_repo.get_role_permission_keys(session, role.id))
+        escalating = rbac_repo.escalation_for_grant(assigner_perms, role_keys)
+        if escalating:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Role '{slug}' grants {sorted(escalating)} which you do "
+                    "not hold — assignment blocked (privilege escalation)"
+                ),
+            )
+        if rbac_repo.would_remove_last_holder(
+            session, "users.manage_roles", user.id,
+            still_grants="users.manage_roles" in role_keys,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Cannot remove the last holder of users.manage_roles — "
+                    "assign it to someone else first"
+                ),
+            )
         rbac_repo.set_user_roles(
-            session, user, [role], assigned_by=current_user.id
+            session, user, [role], assigned_by=current_user.id, commit=False
         )
         payload.pop("role")
     if payload:
-        user = user_repo.update_user_by_admin(session, user, payload)
+        user = user_repo.update_user_by_admin(session, user, payload, commit=False)
 
     audit_repo.log_and_commit(
         session, action="user.role_assigned", entity="user", entity_id=user.id,
@@ -243,12 +266,25 @@ def update_user_status(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot deactivate your own account"
         )
-    
+
+    # Deactivating the last users.manage_roles holder locks out
+    # administration just as surely as demoting them.
+    if update_data.is_active is False and rbac_repo.would_remove_last_holder(
+        session, "users.manage_roles", user.id, still_grants=False
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Cannot deactivate the last holder of users.manage_roles — "
+                "assign it to someone else first"
+            ),
+        )
+
     before_active = user.is_active
     user = user_repo.update_user_by_admin(
         session,
         user,
-        update_data.model_dump(exclude_unset=True)
+        update_data.model_dump(exclude_unset=True), commit=False
     )
     audit_repo.log_and_commit(
         session, action="user.status_changed", entity="user", entity_id=user.id,
@@ -283,7 +319,18 @@ def delete_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete your own account"
         )
-    
+
+    if rbac_repo.would_remove_last_holder(
+        session, "users.manage_roles", user.id, still_grants=False
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Cannot delete the last holder of users.manage_roles — "
+                "assign it to someone else first"
+            ),
+        )
+
     # 👇 Check if user has related data
     # Check for addresses
     addresses = session.exec(select(Address).where(Address.user_id == user_id)).all()
@@ -307,13 +354,12 @@ def delete_user(
         # Clear cart first
         cart.user_id = None
         session.add(cart)
-        session.commit()
     
     snapshot = {"email": user.email, "username": user.username}
-    user_repo.delete_user(session, user)
+    user_repo.delete_user(session, user, commit=False)
     audit_repo.log_and_commit(
         session, action="user.deleted", entity="user", entity_id=user_id,
         actor_id=current_user.id, before=snapshot,
         ip_address=audit_repo.client_ip(request),
     )
-    return None 
+    return None

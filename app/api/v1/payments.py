@@ -15,6 +15,10 @@ from app.schemas.payment import (
     PaymentConfirmRequest,
 )
 from app.services.payment_service import get_payment_service
+from app.services import payment_service as provider_services
+from app.services.payment_settlement import settle_payment, record_payment_failure
+from app.models.payment import PaymentStatus
+from app.services.payment_creation import create_or_reuse_intent
 from app.services.email_service import email_service
 from app.core.config import settings
 
@@ -34,47 +38,7 @@ def create_payment_intent(
     - Dummy mode: Always succeeds (for testing)
     - Real mode: Creates actual payment intent
     """
-    # Get order
-    order = order_repo.get_order_by_id(session, request.order_id)
-    if not order:
-        raise HTTPException(404, "Order not found")
-    
-    if order.user_id != current_user.id:
-        raise HTTPException(403, "Not authorized")
-    
-    # 🚫 COD orders are paid in cash on delivery — no online intent
-    if order.payment_method == "cod":
-        raise HTTPException(
-            400,
-            "This is a Cash on Delivery order. Payment will be collected on delivery.",
-        )
-    
-    # Get payment service (dummy or real)
-    payment_service = get_payment_service()
-    
-    # Create payment intent
-    result = payment_service.create_payment_intent(order, request.payment_method)
-    
-    # Save payment record
-    payment = payment_repo.create_payment(
-        session=session,
-        order_id=order.id,
-        provider="dummy" if result.get("is_dummy", False) else settings.PAYMENT_PROVIDER,
-        provider_payment_id=result["payment_intent_id"],
-        amount=result["amount"],
-        currency=result.get("currency") or settings.PAYMENT_CURRENCY,
-        payment_method=order.payment_method or request.payment_method,
-    )
-    
-    return PaymentIntentResponse(
-        client_secret=result["client_secret"],
-        payment_intent_id=result["payment_intent_id"],
-        order_id=result["order_id"],
-        amount=result["amount"],
-        currency=result["currency"],
-        provider=result.get("provider") or ("dummy" if result.get("is_dummy", False) else settings.PAYMENT_PROVIDER),
-        is_dummy=result.get("is_dummy", True),
-    )
+    return create_or_reuse_intent(session, request, current_user, get_payment_service)
 
 
 @router.post("/confirm", response_model=PaymentRead)
@@ -111,47 +75,27 @@ def confirm_payment(
             "Cash on Delivery orders cannot be confirmed online. Payment is collected on delivery.",
         )
     
-    # Get payment service
-    payment_service = get_payment_service()
+    if payment.status in (PaymentStatus.SUCCEEDED, PaymentStatus.REFUNDED):
+        return settle_payment(session, payment)
+
+    # Confirmation belongs to the provider recorded on this payment.
+    payment_service = provider_services.get_payment_service_for_payment(payment)
     
     # Confirm payment
     result = payment_service.confirm_payment(request.payment_intent_id)
     
     if result["status"] == "succeeded":
-        # Resolve the real transaction ID (pay_xxx) — prefer the value passed
-        # from the checkout callback, else fetch it from the provider, else
-        # fall back to whatever confirm returned (dummy_txn_... in dev).
-        transaction_id = request.transaction_id
+        # A client callback is not authoritative about the charge identity.
+        transaction_id = result.get("transaction_id")
         if not transaction_id and not result.get("is_dummy", True):
             resolver = getattr(payment_service, "get_payment_id_for_order", None)
             if callable(resolver):
                 transaction_id = resolver(payment.provider_payment_id)
         transaction_id = transaction_id or result.get("transaction_id") or payment.provider_payment_id
 
-        # Update payment status (payment_method = real instrument from Razorpay: upi/card/netbanking/...)
-        payment = payment_repo.mark_payment_succeeded(
-            session, request.payment_intent_id,
-            payment_method=result.get("method"),
-            provider_payment_intent=transaction_id,
-        )
-        # Update order status
-        order.status = "confirmed"
-        order.payment_status = "paid"
-        session.add(order)
-        session.commit()
-        session.refresh(order)
-        
-        # Send payment-received confirmation email (non-fatal)
-        if settings.SENDGRID_API_KEY:
-            try:
-                user = session.get(User, order.user_id)
-                if user:
-                    email_service.send_order_confirmation(order, user)
-                    print(f"Payment confirmation email sent to {user.email}")
-            except Exception as e:
-                print(f"Failed to send payment confirmation email: {str(e)}")
-        
-        return payment
+        return settle_payment(session, payment, result.get("method"), transaction_id)
+    elif result["status"] == "pending":
+        raise HTTPException(409, "Payment is still pending")
     else:
-        payment_repo.mark_payment_failed(session, request.payment_intent_id)
+        record_payment_failure(session, payment)
         raise HTTPException(400, "Payment failed")

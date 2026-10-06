@@ -51,3 +51,11 @@ class CartItem(SQLModel, table=True):
     # Relationships
     cart: Cart = Relationship(back_populates="items")
     variant: ProductVariant = Relationship(back_populates="cart_items")
+
+
+class CartMergeReceipt(SQLModel, table=True):
+    __tablename__ = "cart_merge_receipts"
+    cart_id: UUID = Field(foreign_key="carts.id", primary_key=True, ondelete="CASCADE")
+    merge_key: UUID = Field(primary_key=True)
+    variant_id: UUID
+    quantity: int

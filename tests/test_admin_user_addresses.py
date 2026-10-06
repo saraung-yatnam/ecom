@@ -75,6 +75,10 @@ def _seed():
         s.commit()
 
 
+def setup_module():
+    _ensure_setup()
+
+
 def test_1_returns_target_users_addresses_only():
     with Session(ENGINE) as s:
         admin = s.get(User, ADMIN_ID)

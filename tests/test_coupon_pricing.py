@@ -355,7 +355,9 @@ def test_expired_manual_code_not_counted(monkeypatch):
 
 
 def test_trigger_description_strings():
-    assert "₹2000" in pricing_service.trigger_description(
+    from app.core.region import format_money
+
+    assert format_money(2000) in pricing_service.trigger_description(
         make_coupon(trigger_min_cart_value=Decimal("2000"))
     )
     assert "3+ items" in pricing_service.trigger_description(

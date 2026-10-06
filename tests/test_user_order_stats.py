@@ -150,8 +150,8 @@ def test_1_repo_returns_correct_user_stats():
     assert stats["total_spent"] == 500.0, stats["total_spent"]  # only DELIVERED
     assert stats["gross_total"] == 1050.0, stats["gross_total"]  # all 3 orders
     assert stats["refunded_total"] == 250.0, stats["refunded_total"]
-    assert abs(stats["average_order_value"] - 166.67) < 0.01, stats["average_order_value"]
-    assert stats["total_items_purchased"] == 4, stats["total_items_purchased"]
+    assert stats["average_order_value"] == 500.0, stats["average_order_value"]
+    assert stats["total_items_purchased"] == 2, stats["total_items_purchased"]
     assert stats["status_breakdown"]["delivered"] == 1, stats["status_breakdown"]
     assert stats["status_breakdown"]["cancelled"] == 1, stats["status_breakdown"]
     assert stats["status_breakdown"]["refunded"] == 1, stats["status_breakdown"]
@@ -197,6 +197,10 @@ def _ensure_setup():
     if USER_ID is None:
         _seed()
         print(f"Seeded DB (admin={ADMIN_ID}, user={USER_ID})")
+
+
+def setup_module():
+    _ensure_setup()
 
 
 if __name__ == "__main__":

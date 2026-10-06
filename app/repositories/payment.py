@@ -16,6 +16,7 @@ def create_payment(
     currency: str = "INR",
     metadata: dict = None,
     payment_method: str | None = None,
+    *, commit: bool = True,
 ) -> Payment:
     """Create a new payment record"""
     payment = Payment(
@@ -29,8 +30,11 @@ def create_payment(
         status=PaymentStatus.PENDING,
     )
     session.add(payment)
-    session.commit()
-    session.refresh(payment)
+    if commit:
+        session.commit()
+        session.refresh(payment)
+    else:
+        session.flush()
     return payment
 
 
@@ -104,7 +108,8 @@ def mark_payment_succeeded(
             session, 
             payment, 
             "succeeded",
-            provider_payment_intent=provider_payment_intent
+            provider_payment_intent=provider_payment_intent,
+            payment_method=payment_method,
         )
     return None
 

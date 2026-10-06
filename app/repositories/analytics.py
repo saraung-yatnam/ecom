@@ -1,13 +1,24 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import func, extract
+from sqlalchemy import func, case
 from sqlmodel import Session, select, col
 
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product, ProductVariant, ProductImage  # 👈 ADD ProductVariant IMPORT
 from app.models.user import User
+from app.repositories.commerce import settled_sale, net_sale_amount, date_filters
+
+
+def _period_column(session, group_by):
+    if group_by == "day":
+        return func.date(Order.placed_at)
+    if session.get_bind().dialect.name == "sqlite":
+        if group_by == "month":
+            return func.strftime('%Y-%m-01', Order.placed_at)
+        return func.date(Order.placed_at, '-6 days', 'weekday 1')
+    return func.date_trunc(group_by, Order.placed_at)
 
 
 def get_sales_report(
@@ -21,36 +32,27 @@ def get_sales_report(
     """
     # Base query
     statement = select(
-        func.sum(Order.grand_total).label("total_sales"),
+        func.sum(net_sale_amount()).label("total_sales"),
         func.count(Order.id).label("order_count"),
-        func.avg(Order.grand_total).label("average_order_value"),
+        func.avg(net_sale_amount()).label("average_order_value"),
     ).where(
-        Order.placed_at >= from_date,
-        Order.placed_at <= to_date,
-        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+        *date_filters(Order.placed_at, from_date, to_date),
+        settled_sale(),
     )
     
     result = session.exec(statement).first()
     
     # Group by period
-    if group_by == "day":
-        group_col = func.date(Order.placed_at)
-    elif group_by == "week":
-        group_col = func.date_trunc('week', Order.placed_at)
-    elif group_by == "month":
-        group_col = func.date_trunc('month', Order.placed_at)
-    else:
-        group_col = func.date(Order.placed_at)
+    group_col = _period_column(session, group_by)
     
     statement = select(
         group_col.label("period"),
-        func.sum(Order.grand_total).label("total_sales"),
+        func.sum(net_sale_amount()).label("total_sales"),
         func.count(Order.id).label("order_count"),
-        func.avg(Order.grand_total).label("average_order_value"),
+        func.avg(net_sale_amount()).label("average_order_value"),
     ).where(
-        Order.placed_at >= from_date,
-        Order.placed_at <= to_date,
-        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+        *date_filters(Order.placed_at, from_date, to_date),
+        settled_sale(),
     ).group_by(group_col).order_by(group_col)
     
     period_data = session.exec(statement).all()
@@ -83,23 +85,18 @@ def get_sales_trend(session: Session, days: int = 7) -> list[dict]:
     Returns:
         list[dict]: [{ "date": "YYYY-MM-DD", "sales": float, "orders": int }, ...]
     """
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     from_date = today - timedelta(days=max(days - 1, 0))
-
-    # Inclusive day range → [midnight of from_date, midnight of day after to_date)
-    from_datetime = datetime.combine(from_date, datetime.min.time())
-    to_datetime = datetime.combine(today, datetime.min.time()) + timedelta(days=1)
 
     statement = (
         select(
             func.date(Order.placed_at).label("period"),
-            func.coalesce(func.sum(Order.grand_total), 0).label("total_sales"),
+            func.coalesce(func.sum(net_sale_amount()), 0).label("total_sales"),
             func.count(Order.id).label("order_count"),
         )
         .where(
-            Order.placed_at >= from_datetime,
-            Order.placed_at < to_datetime,
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+            *date_filters(Order.placed_at, from_date, today),
+            settled_sale(),
         )
         .group_by("period")
     )
@@ -132,34 +129,36 @@ def get_top_products(
     """
     Get top selling products.
     """
+    item_totals = select(OrderItem.order_id, func.sum(OrderItem.line_total).label("total")) \
+        .group_by(OrderItem.order_id).subquery()
+    discounted = item_totals.c.total - Order.discount_total
+    discount_ratio = case((discounted > 0, discounted / func.nullif(item_totals.c.total, 0)), else_=0)
+    refund_ratio = net_sale_amount() / func.nullif(Order.grand_total, 0)
+    merchandise_revenue = OrderItem.line_total * discount_ratio * refund_ratio
     statement = (
         select(
             Product.id,
             Product.name,
             Product.slug,
             func.coalesce(func.sum(OrderItem.quantity), 0).label("total_quantity_sold"),
-            func.coalesce(func.sum(OrderItem.line_total), 0).label("total_revenue"),
-            func.coalesce(func.avg(OrderItem.unit_price), 0).label("average_price"),
+            func.coalesce(func.sum(merchandise_revenue), 0).label("total_revenue"),
+            func.coalesce(func.sum(merchandise_revenue) / func.nullif(func.sum(OrderItem.quantity), 0), 0).label("average_price"),
+            func.count(Order.id.distinct()).label("order_count"),
+            func.count(ProductVariant.id.distinct()).label("variant_count"),
         )
         .select_from(Product)  # 👈 IMPORTANT: This establishes the base table
         .join(ProductVariant, Product.id == ProductVariant.product_id)  # 👈 Now ProductVariant is imported
         .join(OrderItem, ProductVariant.id == OrderItem.variant_id)
         .join(Order, OrderItem.order_id == Order.id)
+        .join(item_totals, item_totals.c.order_id == Order.id)
     )
     
-    if from_date:
-        from_datetime = datetime.combine(from_date, datetime.min.time())
-        statement = statement.where(Order.placed_at >= from_datetime)
-    if to_date:
-        to_datetime = datetime.combine(to_date, datetime.max.time())
-        statement = statement.where(Order.placed_at <= to_datetime)
-    
     statement = statement.where(
-        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+        *date_filters(Order.placed_at, from_date, to_date), settled_sale(),
     ).group_by(Product.id, Product.name, Product.slug)
     
     statement = statement.order_by(
-        func.sum(OrderItem.line_total).desc(),
+        func.sum(merchandise_revenue).desc(),
         func.sum(OrderItem.quantity).desc()
     ).limit(limit)
     
@@ -175,6 +174,8 @@ def get_top_products(
             "total_quantity_sold": int(row[3] or 0),
             "total_revenue": float(row[4] or 0),
             "average_price": float(row[5] or 0),
+            "order_count": int(row[6] or 0),
+            "variant_count": int(row[7] or 0),
         }
         for row in results
     ]
@@ -198,7 +199,7 @@ def get_dashboard_top_products(
     Returns an empty list when nothing sold in the window — the caller then
     falls back to the period-over-period chart.
     """
-    to_date = date.today()
+    to_date = datetime.now(timezone.utc).date()
     from_date = to_date - timedelta(days=max(days - 1, 0))
 
     rows = get_top_products(
@@ -243,30 +244,15 @@ def get_order_statistics(
     for status in OrderStatus:
         statement = select(
             func.count(Order.id),
-            func.sum(Order.grand_total),
-        ).where(Order.status == status)
-        
-        if from_date:
-            from_datetime = datetime.combine(from_date, datetime.min.time())
-            statement = statement.where(Order.placed_at >= from_datetime)
-        if to_date:
-            to_datetime = datetime.combine(to_date, datetime.max.time())
-            statement = statement.where(Order.placed_at <= to_datetime)
+            func.sum(case((settled_sale(), net_sale_amount()), else_=0)),
+        ).where(Order.status == status, *date_filters(Order.placed_at, from_date, to_date))
         
         result = session.exec(statement).first()
         status_counts[status.value] = result[0] or 0
         total_revenue_by_status[status.value] = float(result[1] or 0)
     
     # Total orders
-    total_statement = select(func.count(Order.id)).where(
-        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
-    )
-    if from_date:
-        from_datetime = datetime.combine(from_date, datetime.min.time())
-        total_statement = total_statement.where(Order.placed_at >= from_datetime)
-    if to_date:
-        to_datetime = datetime.combine(to_date, datetime.max.time())
-        total_statement = total_statement.where(Order.placed_at <= to_datetime)
+    total_statement = select(func.count(Order.id)).where(*date_filters(Order.placed_at, from_date, to_date))
     total_orders = session.exec(total_statement).first() or 0
     
     return {
@@ -292,14 +278,7 @@ def get_revenue_report(
     Get revenue report.
     """
     # Define group_col based on group_by
-    if group_by == "day":
-        group_col = func.date(Order.placed_at)
-    elif group_by == "week":
-        group_col = func.date_trunc('week', Order.placed_at)
-    elif group_by == "month":
-        group_col = func.date_trunc('month', Order.placed_at)
-    else:
-        group_col = func.date(Order.placed_at)
+    group_col = _period_column(session, group_by)
     
     statement = select(
         group_col.label("period"),
@@ -307,10 +286,10 @@ def get_revenue_report(
         func.sum(Order.discount_total).label("discounts"),
         func.sum(Order.tax_total).label("tax"),
         func.sum(Order.shipping_total).label("shipping"),
+        func.sum(net_sale_amount()).label("net_revenue"),
+        func.sum(Order.refund_amount).label("refunds"),
     ).where(
-        Order.placed_at >= from_date,
-        Order.placed_at <= to_date,
-        Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+        *date_filters(Order.placed_at, from_date, to_date), settled_sale(),
     ).group_by(group_col).order_by(group_col)
     
     results = session.exec(statement).all()
@@ -323,7 +302,9 @@ def get_revenue_report(
                 "discounts": float(row[2] or 0),
                 "tax": float(row[3] or 0),
                 "shipping": float(row[4] or 0),
-                "net_revenue": float((row[1] or 0) - (row[2] or 0)),
+                # grand_total already includes the discount; deduct refunds only.
+                "net_revenue": float(row[5] or 0),
+                "refunds": float(row[6] or 0),
             }
             for row in results
         ]
@@ -344,43 +325,20 @@ def get_customer_summary(
     # Active customers (placed order in period)
     statement = select(func.count(User.id.distinct())).select_from(Order).join(
         User, Order.user_id == User.id
-    )
-    if from_date:
-        from_datetime = datetime.combine(from_date, datetime.min.time())
-        statement = statement.where(Order.placed_at >= from_datetime)
-    if to_date:
-        to_datetime = datetime.combine(to_date, datetime.max.time())
-        statement = statement.where(Order.placed_at <= to_datetime)
+    ).where(settled_sale(), *date_filters(Order.placed_at, from_date, to_date))
     
     active_customers = session.exec(statement).first() or 0
     
     # New customers (registered in period)
-    statement = select(func.count(User.id))
-    if from_date:
-        from_datetime = datetime.combine(from_date, datetime.min.time())
-        statement = statement.where(User.created_at >= from_datetime)
-    if to_date:
-        to_datetime = datetime.combine(to_date, datetime.max.time())
-        statement = statement.where(User.created_at <= to_datetime)
+    statement = select(func.count(User.id)).where(*date_filters(User.created_at, from_date, to_date))
     new_customers = session.exec(statement).first() or 0
     
     # Repeat customers
-    if from_date and to_date:
-        from_datetime = datetime.combine(from_date, datetime.min.time())
-        to_datetime = datetime.combine(to_date, datetime.max.time())
-        
-        statement = select(
-            User.id,
-            func.count(Order.id).label("order_count"),
-        ).join(Order, User.id == Order.user_id).where(
-            Order.placed_at >= from_datetime,
-            Order.placed_at <= to_datetime,
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED]),
-        ).group_by(User.id).having(func.count(Order.id) > 1)
-        
-        repeat_customers = len(session.exec(statement).all())
-    else:
-        repeat_customers = 0
+    statement = select(
+        Order.user_id, func.count(Order.id).label("order_count"),
+    ).where(settled_sale(), *date_filters(Order.placed_at, from_date, to_date)) \
+        .group_by(Order.user_id).having(func.count(Order.id) > 1)
+    repeat_customers = len(session.exec(statement).all())
     
     return {
         "total_customers": total_customers,
@@ -399,7 +357,7 @@ def get_dashboard_stats(
     """
     Get dashboard statistics for admin.
     """
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     start_of_week = today - timedelta(days=today.weekday())
     start_of_month = today.replace(day=1)
     
@@ -409,47 +367,40 @@ def get_dashboard_stats(
     ).first() or 0
     
     today_revenue = session.exec(
-        select(func.sum(Order.grand_total)).where(
-            func.date(Order.placed_at) == today,
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+        select(func.sum(net_sale_amount())).where(
+            *date_filters(Order.placed_at, today, today), settled_sale(),
         )
     ).first() or Decimal("0.00")
     
     # This week's stats
     week_orders = session.exec(
-        select(func.count(Order.id)).where(Order.placed_at >= start_of_week)
+        select(func.count(Order.id)).where(*date_filters(Order.placed_at, start_of_week, today))
     ).first() or 0
     
     week_revenue = session.exec(
-        select(func.sum(Order.grand_total)).where(
-            Order.placed_at >= start_of_week,
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+        select(func.sum(net_sale_amount())).where(
+            *date_filters(Order.placed_at, start_of_week, today), settled_sale(),
         )
     ).first() or Decimal("0.00")
     
     # This month's stats
     month_orders = session.exec(
-        select(func.count(Order.id)).where(Order.placed_at >= start_of_month)
+        select(func.count(Order.id)).where(*date_filters(Order.placed_at, start_of_month, today))
     ).first() or 0
     
     month_revenue = session.exec(
-        select(func.sum(Order.grand_total)).where(
-            Order.placed_at >= start_of_month,
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
+        select(func.sum(net_sale_amount())).where(
+            *date_filters(Order.placed_at, start_of_month, today), settled_sale(),
         )
     ).first() or Decimal("0.00")
     
     # Total orders
     total_orders = session.exec(
-        select(func.count(Order.id)).where(
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
-        )
+        select(func.count(Order.id))
     ).first() or 0
     
     total_revenue = session.exec(
-        select(func.sum(Order.grand_total)).where(
-            Order.status.in_([OrderStatus.DELIVERED, OrderStatus.CONFIRMED, OrderStatus.SHIPPED]),
-        )
+        select(func.sum(net_sale_amount())).where(settled_sale())
     ).first() or Decimal("0.00")
     
     # Pending orders

@@ -32,6 +32,8 @@ def create_access_token(
     role: str,
     permissions: list[str] | None = None,
     audience: str = AUDIENCE_ADMIN,
+    session_id: str | None = None,
+    token_version: int = 0,
 ) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
@@ -43,7 +45,10 @@ def create_access_token(
         "exp": expire,
         "type": "access",
         "aud": audience,
+        "ver": token_version,
     }
+    if session_id is not None:
+        payload["sid"] = session_id
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 

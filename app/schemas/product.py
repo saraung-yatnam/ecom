@@ -168,3 +168,11 @@ class ProductRead(BaseModel):
     # 👇 Review aggregate fields (NOT stored in DB — computed from reviews table)
     average_rating: float = 0.0
     review_count: int = 0
+
+
+class ProductPage(BaseModel):
+    products: list[ProductRead]
+    total: int
+    page: int
+    limit: int
+    total_pages: int

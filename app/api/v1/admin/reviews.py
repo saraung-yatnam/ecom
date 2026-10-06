@@ -70,8 +70,6 @@ def set_review_visibility(
     was_hidden = bool(review.is_hidden)
     review.is_hidden = bool(payload.is_hidden)
     session.add(review)
-    session.commit()
-    session.refresh(review)
     audit_repo.log_and_commit(
         session,
         action="review.hidden" if review.is_hidden else "review.visible",
@@ -126,7 +124,7 @@ def delete_review(
         "rating": review.rating,
         "title": review.title,
     }
-    review_repo.delete_review(session, review)
+    review_repo.delete_review(session, review, commit=False)
     audit_repo.log_and_commit(
         session,
         action="review.deleted",

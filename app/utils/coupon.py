@@ -3,6 +3,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from app.models.coupon import Coupon, DiscountType
+from app.core.region import format_money
 
 
 def validate_coupon(
@@ -42,7 +43,7 @@ def validate_coupon(
     
     # Check min order value
     if coupon.min_order_value and cart_subtotal < coupon.min_order_value:
-        return False, f"Minimum order value of ₹{coupon.min_order_value} required. Current subtotal: ₹{cart_subtotal}"
+        return False, f"Minimum order value of {format_money(coupon.min_order_value)} required. Current subtotal: {format_money(cart_subtotal)}"
     
     return True, "Coupon applied successfully!"
 

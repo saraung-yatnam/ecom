@@ -120,6 +120,11 @@ def _seed():
         s.commit()
 
 
+def setup_module():
+    if USER_ID is None:
+        _seed()
+
+
 def _find_real_item(items: list) -> dict:
     return next(i for i in items if i["variant_sku"] == "TSHIRT-BLK-M")
 

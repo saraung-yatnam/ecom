@@ -10,10 +10,20 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import settings
+from app.core.release import validate_production_settings, assert_database_ready
 from app.core.rate_limit import limiter
 from app.api.v1.router import api_router
 from app.db.database import engine
 from app.services.order_expiry import expire_stale_pending_orders
+from app.services.email_outbox import deliver_pending_emails
+
+
+def _deliver_email_outbox():
+    try:
+        with Session(engine) as session:
+            deliver_pending_emails(session)
+    except Exception as exc:
+        print(f"Email outbox delivery failed: {exc}")
 
 
 def _sweep_expired_orders() -> None:
@@ -35,28 +45,50 @@ _scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    production = settings.ENVIRONMENT.lower() == "production"
+    if production:
+        validate_production_settings(settings)
+        assert_database_ready(engine)
     # Disabled during tests (or when a sqlite test DB is in use) so a stray
     # interval job never touches the database.
     started = False
     uses_test_db = settings.DATABASE_URL.startswith("sqlite")
-    if settings.ENVIRONMENT != "test" and not uses_test_db:
-        _scheduler.add_job(
-            _sweep_expired_orders,
-            "interval",
-            minutes=settings.PENDING_ORDER_EXPIRY_JOB_MINUTES,
-            id="expire_pending_orders",
-            replace_existing=True,
-        )
-        _scheduler.start()
-        started = True
-        print(
-            f"🧹 Order-expiry sweep started: every "
-            f"{settings.PENDING_ORDER_EXPIRY_JOB_MINUTES} min "
-            f"(auto-cancel after {settings.PENDING_ORDER_EXPIRY_MINUTES} min)"
-        )
-    yield
-    if started:
-        _scheduler.shutdown(wait=False)
+    if settings.ENVIRONMENT == "test" or uses_test_db:
+        yield
+        return
+    # Guarantee the store_settings singleton exists before serving, so
+    # request handlers (notably GET) never have to write. A failed seed
+    # never crashes boot — reads degrade to env defaults.
+    try:
+        from app.core.store_settings import seed_store_settings
+
+        with Session(engine) as session:
+            seed_store_settings(session)
+    except Exception as exc:
+        if production:
+            raise RuntimeError("Production store-policy initialization failed") from exc
+        print(f"⚠️ store_settings startup seed failed ({type(exc).__name__}: {exc})")
+    _scheduler.add_job(
+        _sweep_expired_orders,
+        "interval",
+        minutes=settings.PENDING_ORDER_EXPIRY_JOB_MINUTES,
+        id="expire_pending_orders",
+        replace_existing=True,
+    )
+    _scheduler.add_job(_deliver_email_outbox, "interval", seconds=30,
+                       id="deliver_email_outbox", replace_existing=True, max_instances=1)
+    _scheduler.start()
+    started = True
+    print(
+        f"🧹 Order-expiry sweep started: every "
+        f"{settings.PENDING_ORDER_EXPIRY_JOB_MINUTES} min "
+        f"(auto-cancel after {settings.PENDING_ORDER_EXPIRY_MINUTES} min)"
+    )
+    try:
+        yield
+    finally:
+        if started:
+            _scheduler.shutdown(wait=False)
 
 
 app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
@@ -138,3 +170,19 @@ def root():
     }
 
 
+@app.get("/health/live")
+def liveness():
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def readiness():
+    try:
+        validate_production_settings(settings)
+        assert_database_ready(engine)
+        if settings.ENVIRONMENT.lower() == "production":
+            if not _scheduler.running or any(_scheduler.get_job(key) is None for key in ("expire_pending_orders", "deliver_email_outbox")):
+                raise RuntimeError("Commerce background jobs unavailable")
+        return {"status": "ready"}
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})

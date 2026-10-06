@@ -20,6 +20,11 @@ from app.schemas.analytics import (
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
 
 
+def _validate_range(from_date, to_date):
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(400, "from_date cannot be greater than to_date")
+
+
 @router.get("/dashboard", response_model=DashboardStatsResponse)
 def get_dashboard_stats(
     session: SessionDep,
@@ -74,6 +79,7 @@ def get_top_products(
         manager
         admin
     """
+    _validate_range(from_date, to_date)
     products = analytics_repo.get_top_products(session, limit, from_date, to_date)
     
     return products
@@ -95,6 +101,7 @@ def get_order_statistics(
         manager
         admin
     """
+    _validate_range(from_date, to_date)
     return analytics_repo.get_order_statistics(session, from_date, to_date)
 
 
@@ -140,4 +147,5 @@ def get_customer_summary(
         manager
         admin
     """
+    _validate_range(from_date, to_date)
     return analytics_repo.get_customer_summary(session, from_date, to_date)

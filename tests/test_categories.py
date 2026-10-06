@@ -7,5 +7,5 @@ def test_category_schema_and_router_registration():
 
     assert payload.name == "Shoes"
     assert payload.slug == "shoes"
-    assert any(route.path == "" for route in router.routes)
-    assert any(route.path == "/{category_id}" for route in router.routes)
+    assert any(route.path == router.prefix for route in router.routes)
+    assert any(route.path == f"{router.prefix}/{{category_id}}" for route in router.routes)

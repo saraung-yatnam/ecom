@@ -43,7 +43,7 @@ def calculate_discount(cart: Cart) -> Decimal:
     return Decimal("0.00")
 
 
-def calculate_tax(cart: Cart, tax_rate: Decimal = None) -> Decimal:
+def calculate_tax(cart: Cart, tax_rate: Decimal = None, *, policy=None) -> Decimal:
     """
     Calculate tax on cart total (after discount).
     
@@ -55,7 +55,7 @@ def calculate_tax(cart: Cart, tax_rate: Decimal = None) -> Decimal:
         Decimal: Tax amount
     """
     if tax_rate is None:
-        tax_rate = Decimal(str(get_store_settings().tax_rate))
+        tax_rate = Decimal(str((policy or get_store_settings()).tax_rate))
     
     subtotal = calculate_subtotal(cart)
     discount = calculate_discount(cart)
@@ -63,7 +63,7 @@ def calculate_tax(cart: Cart, tax_rate: Decimal = None) -> Decimal:
     return taxable_amount * tax_rate
 
 
-def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = None) -> Decimal:
+def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = None, *, policy=None) -> Decimal:
     """
     Calculate shipping cost.
     
@@ -74,8 +74,9 @@ def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = None) -> D
     Returns:
         Decimal: Shipping cost
     """
+    policy = policy or get_store_settings()
     if free_shipping_threshold is None:
-        threshold = Decimal(str(get_store_settings().free_shipping_threshold))
+        threshold = Decimal(str(policy.free_shipping_threshold))
     else:
         threshold = free_shipping_threshold
     
@@ -87,11 +88,11 @@ def calculate_shipping(cart: Cart, free_shipping_threshold: Decimal = None) -> D
     if subtotal >= threshold:
         return Decimal("0.00")
     
-    shipping_cost = Decimal(str(get_store_settings().shipping_cost))
+    shipping_cost = Decimal(str(policy.shipping_cost))
     return shipping_cost
 
 
-def calculate_cart_total(cart: Cart) -> dict:
+def calculate_cart_total(cart: Cart, *, policy=None) -> dict:
     """
     Calculate all cart totals.
     
@@ -102,9 +103,10 @@ def calculate_cart_total(cart: Cart) -> dict:
         dict: All calculated totals
     """
     subtotal = calculate_subtotal(cart)
+    policy = policy or get_store_settings()
     discount = calculate_discount(cart)
-    tax = calculate_tax(cart)
-    shipping = calculate_shipping(cart)
+    tax = calculate_tax(cart, policy=policy)
+    shipping = calculate_shipping(cart, policy=policy)
     total = subtotal - discount + tax + shipping
     
     # Enrich items with product/variant data

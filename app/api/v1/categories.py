@@ -45,7 +45,7 @@ def create_category(
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Category slug already exists")
 
-    category = category_repo.create_category(session, category_data)
+    category = category_repo.create_category(session, category_data, commit=False)
     audit_repo.log_and_commit(
         session, action="category.created", entity="category",
         entity_id=category.id, actor_id=current_user.id,
@@ -74,7 +74,7 @@ def update_category(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Category slug already exists")
 
     before = {"name": category.name, "slug": category.slug}
-    updated = category_repo.update_category(session, category, category_data)
+    updated = category_repo.update_category(session, category, category_data, commit=False)
     audit_repo.log_and_commit(
         session, action="category.updated", entity="category",
         entity_id=category.id, actor_id=current_user.id,
@@ -98,7 +98,7 @@ def delete_category(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
 
     snapshot = {"name": category.name, "slug": category.slug}
-    category_repo.delete_category(session, category)
+    category_repo.delete_category(session, category, commit=False)
     audit_repo.log_and_commit(
         session, action="category.deleted", entity="category",
         entity_id=category_id, actor_id=current_user.id,

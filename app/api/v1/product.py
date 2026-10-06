@@ -10,6 +10,7 @@ from app.repositories import audit as audit_repo
 from app.schemas.product import (
     ProductCreate,
     ProductRead,
+    ProductPage,
     ProductUpdate,
     ProductVariantCreate,
     ProductVariantRead,
@@ -30,7 +31,7 @@ router = APIRouter(
 
 @router.get(
     "/",
-    response_model=list[ProductRead],
+    response_model=list[ProductRead] | ProductPage,
 )
 def get_products(
     session: SessionDep,
@@ -72,6 +73,8 @@ def get_products(
         ge=1,
         le=100,
     ),
+    include_pagination: bool = False,
+    include_descendants: bool = False,
 ):
     """
     Get active products.
@@ -100,6 +103,7 @@ def get_products(
         sort=sort,
         skip=skip,
         limit=limit,
+        include_descendants=include_descendants,
     )
 
     # Batch-fetch rating stats for all products in this page in ONE query
@@ -158,6 +162,12 @@ def get_products(
         
         response_products.append(product_read)
 
+    if include_pagination:
+        total = product_repo.count_catalog_products(session, search=search, category_id=category_id,
+                                                    min_price=min_price, max_price=max_price,
+                                                    include_descendants=include_descendants)
+        return ProductPage(products=response_products, total=total, page=page, limit=limit,
+                           total_pages=(total + limit - 1) // limit)
     return response_products
 
 
@@ -178,7 +188,7 @@ def get_product(
         slug,
     )
 
-    if not product:
+    if not product or not product.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found",
@@ -273,6 +283,7 @@ def create_product(
         session,
         product_data,
         current_user.id,
+        commit=False,
     )
     audit_repo.log_and_commit(
         session, action="product.created", entity="product",
@@ -387,6 +398,7 @@ def update_product(
         session,
         product,
         product_data,
+        commit=False,
     )
     audit_repo.log_and_commit(
         session, action="product.updated", entity="product",
@@ -495,6 +507,7 @@ def delete_product(
     product_repo.delete_product(
         session,
         product,
+        commit=False,
     )
     audit_repo.log_and_commit(
         session, action="product.deleted", entity="product",

@@ -16,6 +16,7 @@ from sqlmodel import Session, select, col
 from app.models.notification import Notification, NotificationType, PromotionBroadcast
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
+from app.core.region import format_money
 
 ADMIN_ROLES = (UserRole.manager, UserRole.admin)
 
@@ -149,7 +150,7 @@ def notify_admins_order_placed(session: Session, order: Order) -> int:
             admin.id,
             NotificationType.ORDER_PLACED,
             title=f"New Order #{order.order_number}",
-            message=f"New order of ₹{order.grand_total} from {label}",
+            message=f"New order of {format_money(order.grand_total)} from {label}",
             link=f"/orders/{order.id}",
             order_id=order.id,
         )
@@ -189,7 +190,7 @@ def notify_approvers_refund_pending(
             NotificationType.REFUND_APPROVAL,
             title=f"Refund approval needed — Order #{order.order_number}",
             message=(
-                f"₹{ledger.amount} refund requested by "
+                f"{format_money(ledger.amount)} refund requested by "
                 f"{requester.full_name or requester.email}. "
                 f"Reason: {ledger.reason or '—'}"
             ),

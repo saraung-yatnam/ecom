@@ -166,7 +166,16 @@ def test_catalog_covers_all_guard_permissions():
     assert "products.delete" in PERMISSION_KEYS
     assert "roles.manage" in PERMISSION_KEYS
     assert "users.manage_roles" in PERMISSION_KEYS
-    assert len(PERMISSION_KEYS) == len(set(PERMISSION_KEYS)) == 25
+    assert len(PERMISSION_KEYS) == len(set(PERMISSION_KEYS))
+    import ast
+    from pathlib import Path
+    referenced = set()
+    for path in (Path(__file__).resolve().parents[1] / "app").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "require_perm":
+                referenced.update(arg.value for arg in node.args
+                                  if isinstance(arg, ast.Constant) and isinstance(arg.value, str))
+    assert referenced <= set(PERMISSION_KEYS), referenced - set(PERMISSION_KEYS)
 
 
 def test_system_role_hierarchy_preserved():

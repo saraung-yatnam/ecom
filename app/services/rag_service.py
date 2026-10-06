@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 from decimal import Decimal
 import re
+from app.core.region import format_money
 
 # ✅ Use SentenceTransformerEmbeddingFunction
 try:
@@ -21,7 +22,7 @@ except (ImportError, AttributeError):
 
 # ✅ Initialize Groq client
 groq_client = Groq(
-    api_key=settings.GROQ_API_KEY
+    api_key=settings.GROQ_API_KEY, timeout=20.0, max_retries=0,
 )
 
 # Initialize ChromaDB
@@ -63,9 +64,9 @@ def flatten_product(product) -> str:
             max_price = max(prices)
             
             if min_price == max_price:
-                variant_info = f"Price: ₹{min_price:,.2f}. "
+                variant_info = f"Price: {format_money(min_price)}. "
             else:
-                variant_info = f"Prices range from ₹{min_price:,.2f} to ₹{max_price:,.2f}. "
+                variant_info = f"Prices range from {format_money(min_price)} to {format_money(max_price)}. "
             
             variant_details = []
             for v in variants:
@@ -74,13 +75,13 @@ def flatten_product(product) -> str:
                 color = attrs.get('color', '')
                 storage = attrs.get('storage', '')
                 if color and storage:
-                    variant_details.append(f"{storage} {color} - ₹{price:,.2f}")
+                    variant_details.append(f"{storage} {color} - {format_money(price)}")
                 elif storage:
-                    variant_details.append(f"{storage} - ₹{price:,.2f}")
+                    variant_details.append(f"{storage} - {format_money(price)}")
                 elif color:
-                    variant_details.append(f"{color} - ₹{price:,.2f}")
+                    variant_details.append(f"{color} - {format_money(price)}")
                 else:
-                    variant_details.append(f"₹{price:,.2f}")
+                    variant_details.append(f"{format_money(price)}")
             
             if variant_details and len(variant_details) > 1:
                 variant_info += f"Variants: {'; '.join(variant_details)}. "
@@ -186,7 +187,7 @@ def search_products(query: str, session: Session, top_k: int = 3) -> str:
         if results['documents'] and results['documents'][0]:
             formatted = []
             for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
-                price_info = f" (₹{meta.get('price_min', 0):,.2f})" if meta.get('price_min') else ""
+                price_info = f" ({format_money(meta.get('price_min', 0))})" if meta.get('price_min') else ""
                 formatted.append(f"- {doc}{price_info}")
             return "\n".join(formatted)
     except Exception as e:
@@ -213,7 +214,7 @@ def search_products(query: str, session: Session, top_k: int = 3) -> str:
                     elif p.price is not None:
                         prices.append(float(p.price))
                 price = min(prices) if prices else float(p.price or 0)
-                formatted.append(f"- {p.name} (₹{price:,.2f})")
+                formatted.append(f"- {p.name} ({format_money(price)})")
             return "\n".join(formatted)
     except Exception as e:
         print(f"Partial match search error: {e}")
@@ -272,7 +273,7 @@ def get_rag_response(user_query: str, session: Session, history: list = None) ->
                     elif p.price is not None:
                         prices.append(float(p.price))
                 price = min(prices) if prices else float(p.price or 0)
-                product_list.append(f"- {p.name} (₹{price:,.2f})")
+                product_list.append(f"- {p.name} ({format_money(price)})")
             
             return f"I don't have ratings or reviews for our products yet. However, here are our available products:\n" + "\n".join(product_list)
         else:
@@ -297,7 +298,7 @@ def get_rag_response(user_query: str, session: Session, history: list = None) ->
                     elif p.price is not None:
                         prices.append(float(p.price))
                 price = min(prices) if prices else float(p.price or 0)
-                product_list.append(f"- {p.name} (₹{price:,.2f})")
+                product_list.append(f"- {p.name} ({format_money(price)})")
             context = "Here are our available products:\n" + "\n".join(product_list)
         else:
             return "I couldn't find any products in our catalog. Please check back later!"

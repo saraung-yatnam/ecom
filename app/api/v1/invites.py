@@ -36,7 +36,8 @@ from app.schemas.invite import (
     InviteRead,
 )
 from app.schemas.token import TokenPair
-from app.services.email_service import email_service
+from app.services.email_outbox import enqueue_email
+from html import escape
 
 
 router = APIRouter(tags=["Staff Invites"])
@@ -70,10 +71,11 @@ def _get_live_invite(session: SessionDep, token: str) -> StaffInvite | None:
     return invite
 
 
-def _send_invite_email(email: str, token: str, role_slugs: list[str]) -> None:
+def _send_invite_email(email: str, token: str, role_slugs: list[str], *, session, invite) -> None:
     link = f"{settings.ADMIN_FRONTEND_URL}/accept-invite?token={token}"
-    roles = ", ".join(role_slugs)
-    email_service.send_email(
+    roles = escape(", ".join(role_slugs))
+    enqueue_email(session, f"invite:{invite.id}:{invite.token_hash}", "send_email",
+        expires_at=invite.expires_at,
         to=email,
         subject="You've been invited to join the store admin",
         html_body=f"""
@@ -104,9 +106,9 @@ def create_invite(
 ):
     """Invite a staffer by email + roles (requires users.manage_roles).
 
-    Guardrail: the invited role set may not include ``users.manage_roles``
-    or ``roles.manage`` unless the inviter holds that permission themselves —
-    a manager cannot mint an admin peer via invite.
+    Guardrail: grant ⊆ held — no invited role may grant a permission the
+    inviter does not hold themselves. A manager cannot mint an admin peer
+    via invite, nor invite into powers they lack.
     """
     inviter_perms = set(rbac_repo.get_user_permissions(session, current_user.id))
     roles = []
@@ -118,7 +120,7 @@ def create_invite(
                 detail=f"Unknown role: {slug}",
             )
         role_keys = set(rbac_repo.get_role_permission_keys(session, role.id))
-        escalating = (role_keys & {"users.manage_roles", "roles.manage"}) - inviter_perms
+        escalating = rbac_repo.escalation_for_grant(inviter_perms, role_keys)
         if escalating:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -158,9 +160,9 @@ def create_invite(
         after={"email": invite.email, "roles": invite.role_slugs},
         ip_address=_ip(request),
     )
+    _send_invite_email(invite.email, token, invite.role_slugs, session=session, invite=invite)
     session.commit()
     session.refresh(invite)
-    _send_invite_email(invite.email, token, invite.role_slugs)
     return invite
 
 
@@ -186,13 +188,41 @@ def resend_invite(
     request: Request,
     current_user: User = Depends(require_perm("users.manage_roles")),
 ):
-    """Rotate the token + expiry and re-send (requires users.manage_roles)."""
+    """Rotate the token + expiry and re-send (requires users.manage_roles).
+
+    Re-validates before rotating: invited roles must still exist, and the
+    resender must still hold everything they grant (a demoted resender's
+    stale invite cannot be revived into an escalation).
+    """
     invite = session.get(StaffInvite, invite_id)
     if not invite or invite.status != StaffInviteStatus.PENDING:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Pending invite not found",
         )
+    resender_perms = set(rbac_repo.get_user_permissions(session, current_user.id))
+    for slug in invite.role_slugs:
+        role = rbac_repo.get_role_by_slug(session, slug)
+        if role is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Invited role no longer exists: {slug} — "
+                    "revoke this invite and send a fresh one"
+                ),
+            )
+        escalating = rbac_repo.escalation_for_grant(
+            resender_perms,
+            set(rbac_repo.get_role_permission_keys(session, role.id)),
+        )
+        if escalating:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Role '{slug}' grants {sorted(escalating)} which you do "
+                    "not hold — resend blocked (privilege escalation)"
+                ),
+            )
     token = secrets.token_urlsafe(32)
     invite.token_hash = _hash_token(token)
     invite.expires_at = datetime.now(timezone.utc) + timedelta(days=INVITE_TTL_DAYS)
@@ -202,9 +232,9 @@ def resend_invite(
         entity_id=invite.id, actor_id=current_user.id,
         ip_address=_ip(request),
     )
+    _send_invite_email(invite.email, token, invite.role_slugs, session=session, invite=invite)
     session.commit()
     session.refresh(invite)
-    _send_invite_email(invite.email, token, invite.role_slugs)
     return invite
 
 
@@ -267,11 +297,8 @@ def accept_invite(
     try:
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
-            from app.core.security import decode_access_token
-
-            payload = decode_access_token(auth.split(" ", 1)[1])
-            if payload and payload.get("type") == "access":
-                caller = user_repo.get_user_by_email(session, payload.get("sub"))
+            from app.api.deps import get_current_user
+            caller = get_current_user(session, auth.split(" ", 1)[1])
     except Exception:
         caller = None
 
@@ -291,6 +318,40 @@ def accept_invite(
             )
         roles.append(role)
 
+    # The inviter's authority is re-checked at accept time: a pending invite
+    # from a since-demoted (or deleted) inviter cannot escalate on arrival.
+    # Invites minted before inviter tracking existed (invited_by NULL) skip
+    # this check — they predate the guarantee either way.
+    if invite.invited_by is not None:
+        inviter = user_repo.get_user_by_id(session, invite.invited_by)
+        inviter_perms = (
+            set(rbac_repo.get_user_permissions(session, inviter.id))
+            if inviter is not None and inviter.is_active
+            else set()
+        )
+        for role in roles:
+            escalating = rbac_repo.escalation_for_grant(
+                inviter_perms,
+                set(rbac_repo.get_role_permission_keys(session, role.id)),
+            )
+            if escalating:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "The inviter no longer holds "
+                        f"{sorted(escalating)} granted by role '{role.slug}' — "
+                        "ask an administrator to send a fresh invite"
+                    ),
+                )
+        if inviter is None or not inviter.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "The inviter is no longer an active staffer — ask an "
+                    "administrator to send a fresh invite"
+                ),
+            )
+
     existing = user_repo.get_user_by_email(session, invite.email)
     if existing is not None:
         # Link path: must prove ownership — either the logged-in matching
@@ -304,6 +365,7 @@ def accept_invite(
                     detail="Password must be at least 8 characters",
                 )
             existing.password_hash = hash_password(data.password)
+            token_repo.invalidate_user_sessions(session, existing)
             if existing.auth_provider == "google":
                 existing.auth_provider = "both"
             session.add(existing)
@@ -315,7 +377,19 @@ def accept_invite(
                     "it and accept again, or set a password to claim it."
                 ),
             )
-        rbac_repo.set_user_roles(session, existing, roles)
+        # Additive: accepting an invite grants roles, never strips the
+        # ones the account already holds (an existing admin accepting a
+        # staff invite must not be silently demoted).
+        current_slugs = set(rbac_repo.get_user_role_slugs(session, existing.id))
+        merged = {r.slug: r for r in roles}
+        for slug in current_slugs:
+            if slug not in merged:
+                kept = rbac_repo.get_role_by_slug(session, slug)
+                if kept is not None:
+                    merged[slug] = kept
+        rbac_repo.set_user_roles(
+            session, existing, list(merged.values()), assigned_by=invite.invited_by, commit=False
+        )
         invite.status = StaffInviteStatus.ACCEPTED
         invite.accepted_at = datetime.now(timezone.utc)
         session.add(invite)
@@ -350,9 +424,8 @@ def accept_invite(
         auth_provider="email",
     )
     session.add(user)
-    session.commit()
-    session.refresh(user)
-    rbac_repo.set_user_roles(session, user, roles)
+    session.flush()
+    rbac_repo.set_user_roles(session, user, roles, assigned_by=invite.invited_by, commit=False)
     invite.status = StaffInviteStatus.ACCEPTED
     invite.accepted_at = datetime.now(timezone.utc)
     session.add(invite)
@@ -364,15 +437,5 @@ def accept_invite(
     )
     session.commit()
 
-    from app.repositories import rbac as _rbac  # noqa: F811 (kept local: hot import path)
-
-    # Invite acceptance is an admin-panel flow (a new privileged account being
-    # onboarded), so it always mints an admin-scoped session.
-    access = create_access_token(
-        subject=user.email,
-        role=getattr(user.role, "value", user.role) or "customer",
-        permissions=_rbac.get_user_permissions(session, user.id),
-        audience="admin",
-    )
-    refresh = token_repo.issue_refresh_token(session, user.id, scope="admin")
-    return TokenPair(access_token=access, refresh_token=refresh).model_dump()
+    from app.api.v1.auth import _issue_tokens
+    return _issue_tokens(session, user, "admin").model_dump()

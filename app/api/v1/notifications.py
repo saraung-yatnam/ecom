@@ -38,6 +38,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = None):
     from app.core.security import decode_access_token
     from app.db.database import get_session
     from app.repositories.user import get_user_by_email
+    from app.repositories.token import session_is_valid
 
     await websocket.accept()
 
@@ -60,7 +61,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = None):
         session = next(session_gen)
         try:
             user = get_user_by_email(session, email) if email else None
-            if user is not None and user.is_active:
+            if user is not None and user.is_active and session_is_valid(session, user, payload):
                 user_id = str(user.id)
         finally:
             try:

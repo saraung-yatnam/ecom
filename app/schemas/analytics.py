@@ -58,6 +58,7 @@ class RevenuePeriodData(BaseModel):
     tax: float
     shipping: float
     net_revenue: float
+    refunds: float = 0
 
 
 class RevenueReportResponse(BaseModel):

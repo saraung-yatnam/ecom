@@ -19,6 +19,7 @@ from app.schemas.cart import (
 from app.models.coupon import CouponType
 from app.services.pricing import build_cart_read, resolve_cart_pricing
 from app.utils.cart import calculate_cart_total
+from app.core.region import format_money
 
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
@@ -76,7 +77,11 @@ def add_to_cart(
     cart = cart_repo.get_or_create_cart(session, user_id, session_id)
     
     try:
-        cart_repo.add_item_to_cart(session, cart, item_data.variant_id, item_data.quantity)
+        if item_data.merge_key is not None:
+            cart_repo.merge_cart_item(session, cart, item_data.variant_id,
+                                      item_data.quantity, item_data.merge_key)
+        else:
+            cart_repo.add_item_to_cart(session, cart, item_data.variant_id, item_data.quantity)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
@@ -273,7 +278,7 @@ def apply_coupon(
     if coupon.min_order_value and subtotal < coupon.min_order_value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Minimum order value of ₹{coupon.min_order_value} required. Current subtotal: ₹{subtotal}"
+            detail=f"Minimum order value of {format_money(coupon.min_order_value)} required. Current subtotal: {format_money(subtotal)}"
         )
     # ✅ END OF VALIDATION BLOCK
     

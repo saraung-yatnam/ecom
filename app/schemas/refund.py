@@ -11,6 +11,8 @@ class RefundRead(BaseModel):
 
     id: UUID
     order_id: UUID
+    return_request_id: UUID | None = None
+    manual_transfer_reference: str | None = None
     order_number: str | None = None
     amount: Decimal
     restocking_fee: Decimal = Decimal(0)

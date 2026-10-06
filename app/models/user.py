@@ -23,6 +23,7 @@ class User(SQLModel, table=True):
     full_name: str | None = None
     phone: str | None = None
     is_active: bool = Field(default=True)
+    token_version: int = Field(default=0)
     email_verified: bool = Field(default=False)
     
     # Google OAuth fields

@@ -37,7 +37,7 @@ from app.schemas.refund import (
 from app.services import refund_service
 from app.services.payment_service import get_payment_service
 from app.services.refund_service import restore_stock
-from app.services.email_service import email_service
+from app.services.email_outbox import enqueue_order_email
 from app.repositories import notification as notification_repo
 
 
@@ -88,6 +88,8 @@ def _refund_read(
     return RefundRead(
         id=ledger.id,
         order_id=ledger.order_id,
+        return_request_id=ledger.return_request_id,
+        manual_transfer_reference=ledger.manual_transfer_reference,
         order_number=order.order_number if order else None,
         amount=ledger.amount,
         restocking_fee=ledger.restocking_fee,
@@ -171,7 +173,7 @@ def refunds_attention(
         )
         if pending:
             continue
-        customer = session.get(User, order.user_id)
+        customer = order.customer_details
         items.append({
             "order_id": str(order.id),
             "order_number": order.order_number,
@@ -241,7 +243,7 @@ def approve_refund(
             status_code=status.HTTP_404_NOT_FOUND, detail="Refund not found"
         )
     try:
-        result = refund_service.approve_refund(session, ledger, current_user)
+        result = refund_service.approve_refund(session, ledger, current_user, commit=False)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
@@ -254,16 +256,13 @@ def approve_refund(
         after={"status": "executed", "amount": str(result.get("amount")),
                "refund_id": result.get("refund_id")},
     )
+    session.commit()
     # Customer notification (non-fatal).
     try:
         if order is not None:
             notification_repo.notify_customer_status_changed(
                 session, order, order.status.value
             )
-            if settings.SENDGRID_API_KEY and order.user_id:
-                user = session.get(User, order.user_id)
-                if user:
-                    email_service.send_order_refunded(order, user)
         session.commit()
     except Exception as e:
         session.rollback()
@@ -294,7 +293,7 @@ def reject_refund(
         )
     try:
         ledger = refund_service.reject_refund(
-            session, ledger, current_user, note=data.note
+            session, ledger, current_user, note=data.note, commit=False
         )
     except ValueError as e:
         raise HTTPException(
@@ -308,44 +307,6 @@ def reject_refund(
     )
     session.commit()
     return _refund_read(session, ledger)
-
-
-def _alert_approvers(
-    session: SessionDep, order: Order, refund_row_id: str | None,
-    requester: User,
-) -> None:
-    """Fan out approval alerts for a staged refund (non-fatal).
-
-    In-app rows for every eligible approver (lands in their admin bell via
-    the staff audience) + email. Called only when a refund actually stages
-    as pending_approval — never on direct executions.
-    """
-    if not refund_row_id:
-        return
-    try:
-        ledger = refund_repo.get_by_id(session, UUID(refund_row_id))
-        if ledger is None:
-            return
-        notified = notification_repo.notify_approvers_refund_pending(
-            session, order, ledger, requester
-        )
-        session.commit()
-        if settings.SENDGRID_API_KEY:
-            for approver in notified:
-                try:
-                    email_service.send_refund_approval_needed(
-                        approver.email,
-                        approver.full_name or approver.username,
-                        order.order_number,
-                        ledger.amount,
-                        requester.full_name or requester.email,
-                        ledger.reason,
-                    )
-                except Exception as e:
-                    print(f"Failed to send approval email to {approver.email}: {e}")
-    except Exception as e:
-        session.rollback()
-        print(f"Failed to fan out refund-approval alerts: {e}")
 
 
 def _raise_if_provider_mismatch(result: dict, order: Order) -> None:
@@ -401,17 +362,17 @@ def refund_cancelled_order(
     """
     from app.models.refund import RefundStatus
 
-    order = order_repo.get_order_by_id(session, order_id)
+    order = order_repo.get_order_by_id(session, order_id, for_update=True)
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Order not found"
         )
-    if order.status == OrderStatus.REFUNDED:
+    if order.status == OrderStatus.REFUNDED and order.payment_status != "refund_failed":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Order has already been refunded",
         )
-    if order.status not in (OrderStatus.CANCELLED, OrderStatus.DELIVERED):
+    if order.status not in (OrderStatus.CANCELLED, OrderStatus.DELIVERED, OrderStatus.REFUNDED):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -425,7 +386,7 @@ def refund_cancelled_order(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cash on Delivery orders have no captured payment to refund",
         )
-    if order.payment_status != "paid":
+    if order.payment_status not in ("paid", "refund_failed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -450,7 +411,7 @@ def refund_cancelled_order(
             ),
         )
 
-    basis = refund_service.status_at_cancellation(session, order)
+    basis = refund_service.status_at_cancellation(session, order) if order.cancelled_at or order.status == OrderStatus.CANCELLED else order.status
     result = refund_service.request_admin_refund(
         session,
         order,
@@ -459,6 +420,8 @@ def refund_cancelled_order(
         amount=data.amount,
         idempotency_key=data.idempotency_key,
         status_at=basis,
+        notify_customer=data.notify_customer,
+        commit=False,
     )
     _raise_if_provider_mismatch(result, order)
     _audit(
@@ -479,20 +442,12 @@ def refund_cancelled_order(
     session.commit()
     session.refresh(order)
 
-    # Approval alerts (non-fatal): tell every eligible approver.
-    if result.get("requires_approval"):
-        _alert_approvers(session, order, result.get("refund_row_id"), current_user)
-
     # Customer notification (non-fatal).
     try:
         if data.notify_customer and result.get("processed"):
             notification_repo.notify_customer_status_changed(
                 session, order, order.status.value
             )
-            if settings.SENDGRID_API_KEY and order.user_id:
-                user = session.get(User, order.user_id)
-                if user:
-                    email_service.send_order_refunded(order, user)
             session.commit()
     except Exception as e:
         session.rollback()
@@ -517,6 +472,14 @@ def reconcile_order_refunds(
     request: Request,
     current_user: User = Depends(require_perm("orders.refund")),
 ):
+    try:
+        return _reconcile_order_refunds(order_id, session, request, current_user)
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _reconcile_order_refunds(order_id, session, request, current_user):
     """Sync our ledger with provider-side truth (requires orders.refund).
 
     Pulls the charge's actual refunds from Stripe/Razorpay and records any
@@ -526,7 +489,7 @@ def reconcile_order_refunds(
     with "greater than unrefunded amount": sync first, then refund the
     remainder (if any).
     """
-    order = order_repo.get_order_by_id(session, order_id)
+    order = order_repo.get_order_by_id(session, order_id, for_update=True)
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Order not found"
@@ -566,9 +529,11 @@ def reconcile_order_refunds(
 
     synced = 0
     for pref in state.get("refunds") or []:
-        if str(pref.get("status") or "").lower() not in (
-            "succeeded", "processed",
-        ):
+        provider_status = str(pref.get("status") or "").lower()
+        accepted = provider_status in refund_service.REFUND_ACCEPTED_STATUSES
+        if accepted and not pref.get("id"):
+            raise HTTPException(502, "Provider refund is missing its stable identity")
+        if not accepted and provider_status not in ("failed", "canceled", "cancelled"):
             continue
         existing = None
         if pref.get("id"):
@@ -576,6 +541,18 @@ def reconcile_order_refunds(
                 select(Refund).where(Refund.provider_refund_id == pref.get("id"))
             ).scalars().first()
         if existing is not None:
+            if existing.order_id != order.id or existing.amount != Decimal(str(pref.get("amount") or 0)):
+                raise HTTPException(409, "Provider refund identity/amount disagrees with the ledger")
+            if existing.provider_status in refund_service.REFUND_COMPLETED_STATUSES:
+                continue
+            target = RefundStatus.EXECUTED if accepted else RefundStatus.FAILED
+            if existing.provider_status != provider_status or existing.status != target:
+                existing.provider_status, existing.status = provider_status, target
+                existing.error = None if accepted else "Provider reported refund failure"
+                session.add(existing)
+                synced += 1
+            continue
+        if not accepted:
             continue
         session.add(Refund(
             order_id=order.id,
@@ -583,11 +560,11 @@ def reconcile_order_refunds(
             restocking_fee=Decimal(0),
             idempotency_key=f"reconcile-{pref.get('id') or uuid4().hex}",
             status=RefundStatus.EXECUTED,
-            reason="Processed outside the app — reconciled from provider",
+            reason="Accepted outside the app — reconciled from provider",
             requested_by=None,
             approved_by=None,
             provider_refund_id=pref.get("id"),
-            provider_status=pref.get("status"),
+            provider_status=provider_status,
             decided_at=datetime.now(timezone.utc),
         ))
         synced += 1
@@ -599,13 +576,14 @@ def reconcile_order_refunds(
             Refund.status == RefundStatus.EXECUTED,
         )
     ).scalar_one()
+    if not order.refund_amount:
+        basis = refund_service.status_at_cancellation(session, order) if order.status == OrderStatus.CANCELLED else order.status
+        order.restocking_fee = refund_service.calculate_refund(order, basis, session=session)["restocking_fee"]
+    released_balance = total < order.refund_amount
     order.refund_amount = total
-    if (
-        order.status == OrderStatus.CANCELLED
-        and (order.grand_total or Decimal(0)) - (total or Decimal(0)) <= 0
-    ):
-        order.status = OrderStatus.REFUNDED
+    if total:
         order.refunded_at = order.refunded_at or datetime.now(timezone.utc)
+    refund_service.apply_refund_state(session, order, failed=released_balance)
     session.add(order)
     _audit(
         session, request, "refund.reconciled", "order", order.id,
@@ -645,7 +623,7 @@ def admin_cancel_order(
     - Paid online orders + refund_choice=later: cancel + restock, money
       stays captured, refundable balance left open and flagged.
     """
-    order = order_repo.get_order_by_id(session, order_id)
+    order = order_repo.get_order_by_id(session, order_id, for_update=True)
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Order not found"
@@ -666,6 +644,11 @@ def admin_cancel_order(
             detail=f"Order cannot be cancelled. Current status: {order.status.value}",
         )
 
+    paid_online = order.payment_method != "cod" and order.payment_status == "paid"
+    if paid_online and data.refund_choice == "now":
+        # Refuse before staging cancellation, restock or audit changes.
+        refund_service.assert_refund_permission(session, current_user)
+
     status_at_cancel = order.status
     order.status = OrderStatus.CANCELLED
     order.cancellation_reason = data.reason
@@ -674,6 +657,8 @@ def admin_cancel_order(
 
     if data.restock:
         restore_stock(session, order)
+    if data.notify_customer:
+        enqueue_order_email(session, order, "order_cancelled")
 
     _audit(
         session, request, "order.cancelled", "order", order.id,
@@ -695,6 +680,8 @@ def admin_cancel_order(
             reason=data.reason,
             idempotency_key=data.idempotency_key,
             status_at=status_at_cancel,
+            notify_customer=data.notify_customer,
+            commit=False,
         )
         refund_info = result
         _raise_if_provider_mismatch(result, order)
@@ -721,10 +708,6 @@ def admin_cancel_order(
     session.commit()
     session.refresh(order)
 
-    # Approval alerts (non-fatal): tell every eligible approver.
-    if refund_info and refund_info.get("requires_approval"):
-        _alert_approvers(session, order, refund_info.get("refund_row_id"), current_user)
-
     # Customer notification (non-fatal).
     try:
         if data.notify_customer:
@@ -732,12 +715,6 @@ def admin_cancel_order(
                 session, order, order.status.value
             )
             notification_repo.notify_admins_order_cancelled(session, order)
-            if settings.SENDGRID_API_KEY:
-                user = session.get(User, order.user_id)
-                if user:
-                    email_service.send_order_cancelled(order, user)
-                    if refund_info and refund_info.get("processed"):
-                        email_service.send_order_refunded(order, user)
             session.commit()
     except Exception as e:
         session.rollback()

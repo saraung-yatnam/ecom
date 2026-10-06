@@ -149,7 +149,7 @@ def bulk_delete_products(
             detail="No product IDs provided"
         )
     
-    deleted_count = product_repo.bulk_delete_products(session, product_ids)
+    deleted_count = product_repo.bulk_delete_products(session, product_ids, commit=False)
     audit_repo.log_and_commit(
         session, action="product.bulk_deleted", entity="product",
         entity_id=None, actor_id=current_user.id,
@@ -184,7 +184,7 @@ def bulk_update_product_status(
             detail="No product IDs provided"
         )
     
-    updated_count = product_repo.bulk_update_product_status(session, product_ids, is_active)
+    updated_count = product_repo.bulk_update_product_status(session, product_ids, is_active, commit=False)
     audit_repo.log_and_commit(
         session, action="product.bulk_status", entity="product",
         entity_id=None, actor_id=current_user.id,

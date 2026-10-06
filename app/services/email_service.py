@@ -1,14 +1,3 @@
-import os
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
-from decimal import Decimal
-
-from app.models.user import User
-from app.models.order import Order
-from app.core.config import settings
-
-
-import os
 import smtplib
 from email.message import EmailMessage
 from sendgrid import SendGridAPIClient
@@ -18,6 +7,7 @@ from decimal import Decimal
 from app.models.user import User
 from app.models.order import Order
 from app.core.config import settings
+from app.core.region import format_money
 
 
 class EmailService:
@@ -70,7 +60,9 @@ class EmailService:
         )
 
     def format_currency(self, amount: Decimal) -> str:
-        return f"₹{amount:,.2f}"
+        from app.core.region import format_money
+
+        return format_money(amount)
 
     def _send_email(self, to_email: str, subject: str, html_content: str, plain_text: str = None):
         """Internal method to send email via the configured provider."""
@@ -309,10 +301,7 @@ class EmailService:
     # ========== Order Emails ==========
     def send_order_confirmation(self, order: Order, user: User):
         """Send order confirmation email"""
-        if not self.client:
-            print("SendGrid not configured - skipping email")
-            return
-        
+        user = getattr(order, "customer_details", user)
         subject = f"Order Confirmed - #{order.order_number}"
         
         is_cod = (order.payment_method == "cod")
@@ -442,6 +431,7 @@ class EmailService:
 
     def send_order_shipped(self, order: Order, user: User):
         """Send order shipped notification"""
+        user = getattr(order, "customer_details", user)
         subject = f"Your Order Has Been Shipped - #{order.order_number}"
         html_content = f"""
         <!DOCTYPE html>
@@ -472,6 +462,7 @@ class EmailService:
 
     def send_order_delivered(self, order: Order, user: User):
         """Send order delivered notification"""
+        user = getattr(order, "customer_details", user)
         subject = f"Your Order Has Been Delivered - #{order.order_number}"
         html_content = f"""
         <!DOCTYPE html>
@@ -502,6 +493,7 @@ class EmailService:
 
     def send_order_cancelled(self, order: Order, user: User):
         """Send order cancelled notification"""
+        user = getattr(order, "customer_details", user)
         subject = f"Order Cancelled - #{order.order_number}"
         html_content = f"""
         <!DOCTYPE html>
@@ -535,7 +527,8 @@ class EmailService:
 
     def send_order_refunded(self, order: Order, user: User):
         """Send order refunded notification"""
-        subject = f"Order Refunded - #{order.order_number}"
+        user = getattr(order, "customer_details", user)
+        subject = f"Refund Initiated - #{order.order_number}"
         html_content = f"""
         <!DOCTYPE html>
         <html>
@@ -548,13 +541,13 @@ class EmailService:
         </head>
         <body>
             <div class="header">
-                <h1>Order Refunded 💰</h1>
+                <h1>Refund Initiated 💰</h1>
             </div>
             
             <p>Hi {user.full_name or 'Customer'},</p>
-            <p>Your order <strong>#{order.order_number}</strong> has been refunded.</p>
+            <p>A refund for order <strong>#{order.order_number}</strong> has been initiated.</p>
             <p><strong>Order Date:</strong> {order.placed_at.strftime('%B %d, %Y')}</p>
-            <p><strong>Refund Amount:</strong> {self.format_currency(order.grand_total)}</p>
+            <p><strong>Refund Amount:</strong> {self.format_currency(order.refund_amount or order.grand_total)}</p>
             
             <p>The refund will reflect in your account within 3-5 business days.</p>
             <p>If you have any questions, please contact our support team.</p>
@@ -572,7 +565,7 @@ class EmailService:
         amount, requester: str, reason: str | None,
     ):
         """Tell an eligible approver a refund awaits their decision."""
-        subject = f"Refund approval needed — Order #{order_number} (₹{amount})"
+        subject = f"Refund approval needed — Order #{order_number} ({format_money(amount)})"
         html_content = f"""
         <!DOCTYPE html>
         <html>
@@ -590,7 +583,7 @@ class EmailService:
 
             <p>Hi {to_name or 'Admin'},</p>
             <p><strong>{requester}</strong> requested a refund of
-            <strong>₹{amount}</strong> on order <strong>#{order_number}</strong>.</p>
+            <strong>{format_money(amount)}</strong> on order <strong>#{order_number}</strong>.</p>
             <p><strong>Reason:</strong> {reason or '—'}</p>
 
             <p>Review it in the admin panel under <strong>Refunds → Pending approval</strong>.
@@ -605,6 +598,7 @@ class EmailService:
         self._send_email(to_email, subject, html_content)
 
     def send_refund_completed(self, order: Order, user: User):
+        user = getattr(order, "customer_details", user)
         """Send refund completed notification"""
         subject = f"Refund Completed - #{order.order_number}"
         html_content = f"""
@@ -639,6 +633,7 @@ class EmailService:
         self._send_email(user.email, subject, html_content)
 
     def send_refund_failed(self, order: Order, user: User):
+        user = getattr(order, "customer_details", user)
         """Send refund failed notification"""
         subject = f"Refund Issue - #{order.order_number}"
         html_content = f"""

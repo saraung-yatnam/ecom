@@ -78,7 +78,7 @@ def get_role_permission_keys(
 
 
 def set_role_permissions(
-    session: Session, role: Role, permission_keys: list[str]
+    session: Session, role: Role, permission_keys: list[str], *, commit: bool = True
 ) -> Role:
     """Replace the role's permission set (keys must be pre-validated)."""
     unknown = validate_permission_keys(permission_keys)
@@ -102,8 +102,11 @@ def set_role_permissions(
             session.add(
                 RolePermissionLink(role_id=role.id, permission_id=perm.id)
             )
-    session.commit()
-    session.refresh(role)
+    if commit:
+        session.commit()
+        session.refresh(role)
+    else:
+        session.flush()
     return role
 
 
@@ -115,6 +118,7 @@ def create_role(
     permission_keys: list[str],
     created_by: UUID | None = None,
     max_refund_amount=None,
+    *, commit: bool = True,
 ) -> Role:
     unknown = validate_permission_keys(permission_keys)
     if unknown:
@@ -133,12 +137,12 @@ def create_role(
     session.add(role)
     session.flush()
     # Reuse the replace logic for the initial grant set.
-    set_role_permissions(session, role, permission_keys)
+    set_role_permissions(session, role, permission_keys, commit=commit)
     session.refresh(role)
     return role
 
 
-def delete_role(session: Session, role: Role) -> None:
+def delete_role(session: Session, role: Role, *, commit: bool = True) -> None:
     if role.is_system:
         raise ValueError("System roles cannot be deleted")
     assigned = session.execute(
@@ -158,7 +162,7 @@ def delete_role(session: Session, role: Role) -> None:
     for link in links:
         session.delete(link)
     session.delete(role)
-    session.commit()
+    session.commit() if commit else session.flush()
 
 
 def count_role_users(session: Session, role_id: UUID) -> int:
@@ -180,6 +184,83 @@ def get_user_roles(session: Session, user_id: UUID) -> list[Role]:
         .order_by(Role.name)
     )
     return list(result.scalars().all())
+
+
+def escalation_for_grant(
+    assigner_perms: set[str] | list[str] | None,
+    granted_keys: set[str] | list[str] | None,
+) -> set[str]:
+    """Keys in the grant the assigner does not hold (grant ⊆ held rule).
+
+    Pure helper behind every role/invite assignment path: you cannot
+    delegate authority you do not possess yourself. Empty set = allowed.
+    """
+    return set(granted_keys or []) - set(assigner_perms or [])
+
+
+def user_ids_with_role(session: Session, role_id: UUID) -> set[UUID]:
+    """Distinct user ids currently assigned a role."""
+    result = session.execute(
+        select(UserRoleLink.user_id)
+        .where(UserRoleLink.role_id == role_id)
+        .distinct()
+    )
+    return set(result.scalars().all())
+
+
+def user_ids_with_permission(
+    session: Session,
+    permission_key: str,
+    exclude_user_id: UUID | None = None,
+    exclude_role_id: UUID | None = None,
+) -> set[UUID]:
+    """Distinct user ids holding a permission through any role.
+
+    Optional exclusions simulate a change (user about to lose their grants,
+    or a role about to stop granting) so callers can test the post-change
+    world before committing to it.
+    """
+    statement = (
+        select(UserRoleLink.user_id)
+        .join(Role, Role.id == UserRoleLink.role_id)
+        .join(
+            RolePermissionLink,
+            RolePermissionLink.role_id == Role.id,
+        )
+        .join(
+            Permission,
+            Permission.id == RolePermissionLink.permission_id,
+        )
+        .where(Permission.key == permission_key)
+        .distinct()
+    )
+    if exclude_user_id is not None:
+        statement = statement.where(UserRoleLink.user_id != exclude_user_id)
+    if exclude_role_id is not None:
+        statement = statement.where(Role.id != exclude_role_id)
+    return set(session.execute(statement).scalars().all())
+
+
+def would_remove_last_holder(
+    session: Session,
+    permission_key: str,
+    user_id: UUID,
+    still_grants: bool,
+) -> bool:
+    """True if changing one user's grants would leave zero permission holders.
+
+    `still_grants` = whether the user's NEW grant set still includes the
+    key (i.e. False on demote/delete/deactivate, True when kept). Users
+    who never held the key can never orphan it.
+    """
+    holders = user_ids_with_permission(session, permission_key)
+    if user_id not in holders:
+        return False
+    post = set(holders)
+    post.discard(user_id)
+    if still_grants:
+        post.add(user_id)
+    return not post
 
 
 def get_user_role_slugs(session: Session, user_id: UUID) -> list[str]:
@@ -246,6 +327,7 @@ def set_user_roles(
     user: User,
     roles: list[Role],
     assigned_by: UUID | None = None,
+    *, commit: bool = True,
 ) -> list[Role]:
     """Replace a user's role set. Keeps legacy ``User.role`` in sync
     (primary role slug, for backward compatibility with old clients)."""
@@ -275,6 +357,9 @@ def set_user_roles(
             primary = max(candidates, key=legacy_role_rank)
             user.role = type(user.role)(primary)
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    if commit:
+        session.commit()
+        session.refresh(user)
+    else:
+        session.flush()
     return roles

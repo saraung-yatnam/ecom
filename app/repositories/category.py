@@ -23,25 +23,31 @@ def get_category_by_slug(session: Session, slug: str) -> Category | None:
     return result.scalar_one_or_none()
 
 
-def create_category(session: Session, category_data: CategoryCreate) -> Category:
+def create_category(session: Session, category_data: CategoryCreate, *, commit: bool = True) -> Category:
     category = Category(**category_data.model_dump())
     session.add(category)
-    session.commit()
-    session.refresh(category)
+    if commit:
+        session.commit()
+        session.refresh(category)
+    else:
+        session.flush()
     return category
 
 
-def update_category(session: Session, category: Category, category_data: CategoryUpdate) -> Category:
+def update_category(session: Session, category: Category, category_data: CategoryUpdate, *, commit: bool = True) -> Category:
     update_data = category_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(category, field, value)
 
     session.add(category)
-    session.commit()
-    session.refresh(category)
+    if commit:
+        session.commit()
+        session.refresh(category)
+    else:
+        session.flush()
     return category
 
 
-def delete_category(session: Session, category: Category) -> None:
+def delete_category(session: Session, category: Category, *, commit: bool = True) -> None:
     session.delete(category)
-    session.commit()
+    session.commit() if commit else session.flush()

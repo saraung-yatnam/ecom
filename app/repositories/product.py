@@ -15,6 +15,36 @@ from app.schemas.product import (
 )
 
 
+def _catalog_query(session, search=None, category_id=None, min_price=None, max_price=None, include_descendants=False):
+    from app.models.category import Category
+    statement = select(Product).where(Product.is_active == True)
+    if search and search.strip():
+        term = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{term}%"
+        statement = statement.where(Product.name.ilike(pattern, escape="\\") |
+                                    Product.slug.ilike(pattern, escape="\\") |
+                                    Product.description.ilike(pattern, escape="\\"))
+    if category_id:
+        ids = {category_id}
+        if include_descendants:
+            categories = session.execute(select(Category.id, Category.parent_id)).all()
+            while True:
+                children = {cid for cid, parent in categories if parent in ids} - ids
+                if not children:
+                    break
+                ids.update(children)
+        statement = statement.where(Product.category_id.in_(ids))
+    if min_price is not None:
+        statement = statement.where(Product.price >= min_price)
+    if max_price is not None:
+        statement = statement.where(Product.price <= max_price)
+    return statement
+
+
+def count_catalog_products(session, **filters):
+    return session.execute(select(func.count()).select_from(_catalog_query(session, **filters).subquery())).scalar_one()
+
+
 def get_products(
     session: Session,
     search: str | None = None,
@@ -24,36 +54,10 @@ def get_products(
     sort: str = "newest",
     skip: int = 0,
     limit: int = 20,
+    include_descendants: bool = False,
 ) -> list[Product]:
-
-    statement = (
-        select(Product)
-        .where(Product.is_active == True)
-        .options(
-            selectinload(Product.variants),
-            selectinload(Product.images)
-        )
-    )
-
-    if search:
-        statement = statement.where(
-            Product.name.ilike(f"%{search}%")
-        )
-
-    if category_id:
-        statement = statement.where(
-            Product.category_id == category_id
-        )
-
-    if min_price is not None:
-        statement = statement.where(
-            Product.price >= min_price
-        )
-
-    if max_price is not None:
-        statement = statement.where(
-            Product.price <= max_price
-        )
+    statement = _catalog_query(session, search, category_id, min_price, max_price, include_descendants).options(
+        selectinload(Product.variants), selectinload(Product.images))
 
     if sort == "price_asc":
         statement = statement.order_by(Product.price.asc())
@@ -68,7 +72,7 @@ def get_products(
     else:
         statement = statement.order_by(Product.created_at.desc())
 
-    statement = statement.offset(skip).limit(limit)
+    statement = statement.order_by(Product.id.asc()).offset(skip).limit(limit)
 
     result = session.execute(statement)
     return result.scalars().all()
@@ -153,6 +157,7 @@ def create_product(
     session: Session,
     product_data: ProductCreate,
     created_by: UUID,
+    *, commit: bool = True,
 ) -> Product:
 
     product = Product(
@@ -161,8 +166,11 @@ def create_product(
     )
 
     session.add(product)
-    session.commit()
-    session.refresh(product)
+    if commit:
+        session.commit()
+        session.refresh(product)
+    else:
+        session.flush()
 
     return product
 
@@ -171,6 +179,7 @@ def update_product(
     session: Session,
     product: Product,
     product_data: ProductUpdate,
+    *, commit: bool = True,
 ) -> Product:
 
     update_data = product_data.model_dump(
@@ -185,8 +194,11 @@ def update_product(
         )
 
     session.add(product)
-    session.commit()
-    session.refresh(product)
+    if commit:
+        session.commit()
+        session.refresh(product)
+    else:
+        session.flush()
 
     return product
 
@@ -194,13 +206,14 @@ def update_product(
 def delete_product(
     session: Session,
     product: Product,
+    *, commit: bool = True,
 ) -> None:
 
     # Soft delete.
     product.is_active = False
 
     session.add(product)
-    session.commit()
+    session.commit() if commit else session.flush()
 
 
 # =========================================================
@@ -352,14 +365,14 @@ def get_all_products_admin(
     result = session.execute(count_statement)
     total = result.scalar() or 0
     
-    statement = statement.order_by(Product.created_at.desc()).offset(skip).limit(limit)
+    statement = statement.order_by(Product.created_at.desc(), Product.id.asc()).offset(skip).limit(limit)
     result = session.execute(statement)
     products = result.scalars().all()
     
     return products, total
 
 
-def bulk_delete_products(session: Session, product_ids: list[UUID]) -> int:
+def bulk_delete_products(session: Session, product_ids: list[UUID], *, commit: bool = True) -> int:
     """Bulk delete products"""
     if not product_ids:
         return 0
@@ -372,11 +385,11 @@ def bulk_delete_products(session: Session, product_ids: list[UUID]) -> int:
     for product in products:
         session.delete(product)
     
-    session.commit()
+    session.commit() if commit else session.flush()
     return count
 
 
-def bulk_update_product_status(session: Session, product_ids: list[UUID], is_active: bool) -> int:
+def bulk_update_product_status(session: Session, product_ids: list[UUID], is_active: bool, *, commit: bool = True) -> int:
     """Bulk update product status"""
     if not product_ids:
         return 0
@@ -389,7 +402,7 @@ def bulk_update_product_status(session: Session, product_ids: list[UUID], is_act
     for product in products:
         product.is_active = is_active
     
-    session.commit()
+    session.commit() if commit else session.flush()
     return count
 
 

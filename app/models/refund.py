@@ -31,6 +31,9 @@ class Refund(SQLModel, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     order_id: UUID = Field(foreign_key="orders.id", index=True)
+    # Nullable additions: all existing cancellation refunds retain their path.
+    return_request_id: UUID | None = Field(default=None, foreign_key="return_requests.id", index=True)
+    manual_transfer_reference: str | None = Field(default=None, max_length=200)
 
     amount: Decimal = Field(max_digits=12, decimal_places=2)
     restocking_fee: Decimal = Field(

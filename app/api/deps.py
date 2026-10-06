@@ -52,7 +52,8 @@ def get_current_user(
         email,
     )
 
-    if user is None or not user.is_active:
+    from app.repositories.token import session_is_valid
+    if user is None or not user.is_active or not session_is_valid(session, user, payload):
         raise credentials_error
 
     return user

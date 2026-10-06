@@ -1,5 +1,6 @@
 from app.services.payment_service import PaymentService
 from app.core.config import settings
+from app.core.region import from_minor_units, minor_units
 
 # Try to import stripe
 try:
@@ -12,6 +13,7 @@ except ImportError:
 
 class StripePaymentService(PaymentService):
     """Stripe payment service implementation."""
+    provider_name = "stripe"
 
     @staticmethod
     def _get(obj, key, default=None):
@@ -57,27 +59,33 @@ class StripePaymentService(PaymentService):
         return None
 
     def _amount_in_smallest_unit(self, amount) -> int:
-        """Stripe minor units: cents for two-decimal currencies."""
-        return int(float(amount) * 100)
+        """Provider minor units via the regional helper (cents normally,
+        whole units for zero-decimal currencies like JPY — where ×100
+        would overcharge 100×)."""
+        return minor_units(amount)
 
-    def create_payment_intent(self, order, payment_method="card"):
+    def create_payment_intent(self, order, payment_method="card", *, idempotency_key=None, currency=None):
         """Create a Stripe PaymentIntent."""
         if not self.is_configured:
             if settings.ENVIRONMENT == "production":
                 raise RuntimeError("Stripe is not configured but ENVIRONMENT=production. No dummy fallback.")
             from app.services.payment_service import DummyPaymentService
             print("⚠️ Using dummy payment (Stripe not configured)")
+            if idempotency_key:
+                raise RuntimeError("Recorded Stripe provider is unavailable")
             return DummyPaymentService().create_payment_intent(order, payment_method)
 
         try:
             payment_intent = stripe.PaymentIntent.create(
-                amount=self._amount_in_smallest_unit(order.grand_total),
-                currency=self.currency,
+                amount=minor_units(order.grand_total, currency=currency),
+                currency=(currency or self.currency).lower(),
                 automatic_payment_methods={"enabled": True},
                 metadata={
                     "order_id": str(order.id),
                     "order_number": order.order_number,
+                    **({"creation_key": idempotency_key} if idempotency_key else {}),
                 },
+                **({"idempotency_key": idempotency_key} if idempotency_key else {}),
             )
 
             print(f"✅ Stripe PaymentIntent created: {payment_intent['id']}")
@@ -93,10 +101,38 @@ class StripePaymentService(PaymentService):
             }
         except Exception as e:
             print(f"❌ Stripe PaymentIntent creation failed: {str(e)}")
-            if settings.ENVIRONMENT == "production":
+            if settings.ENVIRONMENT == "production" or idempotency_key:
                 raise RuntimeError(f"Stripe PaymentIntent creation failed: {str(e)}")
             from app.services.payment_service import DummyPaymentService
             return DummyPaymentService().create_payment_intent(order, payment_method)
+
+    def recover_payment_creation(self, order, attempt):
+        from datetime import datetime, timedelta, timezone
+        created = attempt.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        # Stripe may prune idempotency keys after 24h. Beyond that window,
+        # recovery must be read-only rather than risk recreating a charge.
+        if created < datetime.now(timezone.utc) - timedelta(hours=20):
+            result = stripe.PaymentIntent.search(query=f"metadata['creation_key']:'{attempt.creation_key}'")
+            matches = list(self._get(result, "data", []))
+            if len(matches) != 1:
+                return None
+            remote = matches[0]
+            return self._creation_response(remote, order.id)
+        return self.create_payment_intent(order, attempt.payment_method,
+                                         idempotency_key=attempt.creation_key, currency=attempt.currency)
+
+    def _creation_response(self, intent, order_id):
+        currency = self._get(intent, "currency").upper()
+        return {"client_secret": self._get(intent, "client_secret"),
+                "payment_intent_id": self._get(intent, "id"), "order_id": str(order_id),
+                "amount": from_minor_units(
+                    self._get(intent, "amount"), currency=currency), "currency": currency, "is_dummy": False}
+
+    def get_payment_intent(self, payment_id):
+        intent = stripe.PaymentIntent.retrieve(payment_id)
+        return {"client_secret": self._get(intent, "client_secret")}
 
     def confirm_payment(self, payment_intent_id):
         """Fetch Stripe PaymentIntent status."""
@@ -184,7 +220,7 @@ class StripePaymentService(PaymentService):
             last = refunds[-1] if refunds else {}
             status = g(last, "status")
             return {
-                "event_type": "refund.processed" if status in ("succeeded", "pending", "processing", "requires_action") else "refund.failed",
+                "event_type": self._refund_event_type(status),
                 "payment_id": g(data, "payment_intent"),
                 "transaction_id": None,
                 "payment_method": None,
@@ -196,7 +232,7 @@ class StripePaymentService(PaymentService):
         if event_type == "refund.updated":
             status = g(data, "status")
             return {
-                "event_type": "refund.processed" if status in ("succeeded", "pending", "processing", "requires_action") else "refund.failed",
+                "event_type": self._refund_event_type(status),
                 "payment_id": g(data, "payment_intent"),
                 "transaction_id": None,
                 "payment_method": None,
@@ -227,6 +263,14 @@ class StripePaymentService(PaymentService):
             "is_dummy": False,
             "data": data,
         }
+
+    @staticmethod
+    def _refund_event_type(status):
+        if status == "succeeded":
+            return "refund.processed"
+        if status in ("failed", "canceled"):
+            return "refund.failed"
+        return "refund.pending"
 
     def refund_payment(self, payment_id):
         """Refund Stripe payment."""
@@ -275,7 +319,8 @@ class StripePaymentService(PaymentService):
             else:
                 params["payment_intent"] = payment_id
 
-            refund = stripe.Refund.create(**params)
+            refund = stripe.Refund.create(**params,
+                **({"idempotency_key": notes["refund_key"]} if notes and notes.get("refund_key") else {}))
             created_status = getattr(refund, "status", "pending")
             print(f"✅ Stripe refund created: {refund.id} (status: {created_status})")
 
@@ -283,12 +328,14 @@ class StripePaymentService(PaymentService):
                 "status": created_status,  # succeeded | pending | processing | requires_action | failed
                 "refund_id": refund.id,
                 "payment_id": payment_id,
-                "amount": float(refund.amount) / 100,
+                "amount": from_minor_units(refund.amount),
                 "is_dummy": False,
             }
         except Exception as e:
             print(f"❌ Stripe refund failed: {str(e)}")
-            return {"status": "failed", "payment_id": payment_id, "is_dummy": False, "error": str(e)}
+            definite = isinstance(e, stripe.InvalidRequestError)
+            return {"status": "failed" if definite else "unknown", "payment_id": payment_id,
+                    "is_dummy": False, "error": str(e)}
 
     def get_refund_status(self, refund_id):
         """Fetch a refund from Stripe by its refund ID (re_xxx)."""
@@ -301,7 +348,7 @@ class StripePaymentService(PaymentService):
             return {
                 "refund_id": refund.id,
                 "payment_id": refund.payment_intent,
-                "amount": float(refund.amount) / 100,
+                "amount": from_minor_units(refund.amount),
                 "status": getattr(refund, "status", "pending"),  # succeeded | pending | processing | requires_action | failed
                 "is_dummy": False,
             }
@@ -320,18 +367,19 @@ class StripePaymentService(PaymentService):
                 charge_id = self.get_payment_id_for_order(pid)
                 if not charge_id:
                     return None
-            charge = stripe.Charge.retrieve(charge_id, expand=["refunds"])
+            charge = stripe.Charge.retrieve(charge_id)
             refunds = []
-            for r in charge.refunds.auto_paging_iter():
+            for r in stripe.Refund.list(charge=charge_id, limit=100).auto_paging_iter():
                 refunds.append({
                     "id": r.id,
-                    "amount": float(r.amount) / 100,
+                    "amount": from_minor_units(r.amount, currency=charge.currency),
                     "status": getattr(r, "status", "unknown"),
+                    "notes": dict(getattr(r, "metadata", {}) or {}),
                 })
             succeeded = [r for r in refunds if r["status"] in ("succeeded",)]
             return {
                 "charge_id": charge.id,
-                "charge_total": float(charge.amount) / 100,
+                "charge_total": from_minor_units(charge.amount),
                 "currency": str(charge.currency or "").upper(),
                 "refunded_total": round(sum(r["amount"] for r in succeeded), 2),
                 "refunds": refunds,

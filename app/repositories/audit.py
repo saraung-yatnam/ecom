@@ -32,8 +32,12 @@ def log(
         after=after,
         ip_address=ip_address,
     )
-    session.add(entry)
-    session.flush()
+    try:
+        session.add(entry)
+        session.flush()
+    except Exception:
+        session.rollback()
+        raise
     return entry
 
 
@@ -60,7 +64,11 @@ def log_and_commit(
         after=after,
         ip_address=ip_address,
     )
-    session.commit()
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     session.refresh(entry)
     return entry
 

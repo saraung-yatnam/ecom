@@ -10,16 +10,18 @@ COD lifecycle:
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session
 
 from app.api.deps import SessionDep, require_perm
+from app.core.region import currency_code
 from app.models.user import User
-from app.models.order import Order
+from app.models.order import Order, OrderStatus
 from app.models.payment import Payment, PaymentProvider, PaymentStatus
 from app.repositories import order as order_repo
+from app.repositories import audit as audit_repo
 
 router = APIRouter(prefix="/admin/cod", tags=["Admin COD"])
 
@@ -36,6 +38,7 @@ def get_pending_cod_orders(
         select(Order)
         .where(Order.payment_method == "cod")
         .where(Order.payment_status == "cod_pending")
+        .where(Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.REFUNDED, OrderStatus.RTO]))
         .order_by(Order.placed_at.desc())
         .options(
             selectinload(Order.user),
@@ -52,15 +55,16 @@ def get_pending_cod_orders(
                 "id": str(o.id),
                 "order_number": o.order_number,
                 "customer": {
-                    "id": str(o.user.id),
-                    "full_name": o.user.full_name,
-                    "email": o.user.email,
-                    "phone": o.user.phone,
-                } if o.user else None,
+                    "id": str(o.customer_details.id),
+                    "full_name": o.customer_details.full_name,
+                    "email": o.customer_details.email,
+                    "phone": o.customer_details.phone,
+                } if o.customer_details else None,
                 "grand_total": float(o.grand_total),
                 "cod_fee": float(o.cod_fee or 0),
                 "status": o.status.value if hasattr(o.status, "value") else str(o.status),
                 "payment_status": o.payment_status,
+                "collectible": o.status == OrderStatus.DELIVERED,
                 "placed_at": o.placed_at.isoformat() if o.placed_at else None,
             }
             for o in orders
@@ -73,6 +77,7 @@ def collect_cod_payment(
     order_id: UUID,
     session: SessionDep,
     current_user: User = Depends(require_perm("orders.update")),
+    request: Request = None,
 ):
     """
     Mark a COD order's cash as COLLECTED ON DELIVERY.
@@ -80,7 +85,7 @@ def collect_cod_payment(
     - Creates a COD payment record (status=succeeded)
     - Flips the order to payment_status="paid"
     """
-    order = order_repo.get_order_by_id(session, order_id)
+    order = order_repo.get_order_by_id(session, order_id, for_update=True)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     
@@ -99,9 +104,14 @@ def collect_cod_payment(
             detail=f"Cannot collect COD for order with payment_status '{order.payment_status}'",
         )
     
-    order_status_value = getattr(order.status, "value", order.status)
-    if order_status_value == "cancelled":
-        raise HTTPException(status_code=400, detail="Cannot collect COD for a cancelled order")
+    if order.status != OrderStatus.DELIVERED:
+        raise HTTPException(status_code=400, detail="COD can only be collected for a delivered order")
+    existing = session.execute(select(Payment).where(
+        Payment.order_id == order.id, Payment.provider == PaymentProvider.COD,
+        Payment.status == PaymentStatus.SUCCEEDED,
+    )).scalars().first()
+    if existing:
+        raise HTTPException(status_code=409, detail="COD payment already recorded; reconcile order state")
     
     # Record the cash collection as a real payment (audit trail + analytics)
     now = datetime.now(timezone.utc)
@@ -110,7 +120,7 @@ def collect_cod_payment(
         provider=PaymentProvider.COD,
         provider_payment_id=f"cod_{order.order_number}",
         amount=order.grand_total,
-        currency="INR",
+        currency=currency_code(),
         status=PaymentStatus.SUCCEEDED,
         payment_method="cod",
         paid_at=now,
@@ -125,7 +135,10 @@ def collect_cod_payment(
     # Order is now paid
     order.payment_status = "paid"
     session.add(order)
-    session.commit()
+    audit_repo.log_and_commit(session, "cod.collected", "order", order.id, current_user.id,
+                              before={"payment_status": "cod_pending"},
+                              after={"payment_status": "paid", "amount": str(order.grand_total),
+                                     "payment_id": str(payment.id)}, ip_address=audit_repo.client_ip(request))
     session.refresh(order)
     
     print(f"✅ COD collected for order {order.order_number} by {current_user.email}")

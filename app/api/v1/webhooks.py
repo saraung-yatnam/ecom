@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+from decimal import Decimal
+import hmac
 
 from fastapi import APIRouter, Request, HTTPException
 from sqlmodel import Session
@@ -6,11 +8,14 @@ from sqlmodel import Session
 from app.api.deps import SessionDep
 from app.models.order import OrderStatus
 from app.core.config import settings
-from app.services.email_service import email_service
+from app.services.email_outbox import enqueue_order_email
 from app.repositories import order as order_repo
 from app.repositories import payment as payment_repo
 from app.repositories import notification as notification_repo
 from app.services.payment_service import get_payment_service
+from app.services.payment_settlement import settle_payment, record_payment_failure
+from app.models.order import Order
+from sqlalchemy import select
 from app.services.refund_service import process_refund, restore_stock
 from app.services.order_expiry import cancel_pending_online_order, notify_order_cancelled
 from app.services.shipping_status import (
@@ -25,7 +30,7 @@ from app.services.shipping_status import (
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
 
-def _handle_refund_webhook( 
+def _handle_legacy_refund_webhook(
     session: Session,
     event_type: str,
     refund_entity: dict,
@@ -48,6 +53,13 @@ def _handle_refund_webhook(
         print(f"⚠️ {event_type} webhook: no order found for refund_id {refund_id}")
         return
 
+    order = session.execute(
+        select(Order).where(Order.id == order.id).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().one()
+    if order.payment_status == "refund_completed":
+        return  # Neither duplicate completion nor a late failure can regress it.
+
     if event_type == "refund.processed":
         # Only flip to completed if we're still waiting on it — never downgrade
         if order.payment_status != "refund_completed":
@@ -68,83 +80,66 @@ def _handle_refund_webhook(
                     payment.refunded_at = order.refunded_at
                     session.add(payment)
 
+            enqueue_order_email(session, order, "refund_completed", event_id=refund_id)
             session.commit()
             session.refresh(order)
             print(f"✅ Refund COMPLETED for order {order.order_number} (webhook: refund.processed)")
 
-            # Email the customer that the money has arrived (non-fatal)
-            if settings.SENDGRID_API_KEY and order.user:
-                try:
-                    email_service.send_refund_completed(order, order.user)
-                    print(f"Refund-completed email sent to {order.user.email}")
-                except Exception as e:
-                    print(f"Failed to send refund-completed email: {str(e)}")
         else:
             print(f"Order {order.order_number} already marked refund_completed — ignoring duplicate event")
 
     elif event_type == "refund.failed":
         order.payment_status = "refund_failed"
         session.add(order)
+        enqueue_order_email(session, order, "refund_failed", event_id=refund_id)
         session.commit()
         session.refresh(order)
         print(f"❌ REFUND FAILED for order {order.order_number} (refund_id {refund_id}) — manual intervention needed")
 
-        # Alert the customer (non-fatal)
-        if settings.SENDGRID_API_KEY and order.user:
-            try:
-                email_service.send_refund_failed(order, order.user)
-                print(f"Refund-failed email sent to {order.user.email}")
-            except Exception as e:
-                print(f"Failed to send refund-failed email: {str(e)}")
-
         # TODO: alert admin (email / Slack / dashboard notification) here
 
 
-def _settle_payment(session: Session, payment, instrument: str | None, provider_payment_id: str | None):
-    """Mark a payment succeeded and flip its order to paid."""
-    payment = payment_repo.update_payment_status(
-        session,
-        payment,
-        "succeeded",
-        provider_payment_intent=provider_payment_id,
-        payment_method=instrument,  # real instrument: upi | card | netbanking | wallet | ...
-    )
-
-    order = order_repo.get_order_by_id(session, payment.order_id)
-    if order:
-        # A payment arriving for an already-CANCELLED order (e.g. the customer
-        # paid right as the expiry sweep cancelled it) must be refunded
-        # automatically — never hold money for a cancelled order.
-        if order.status == OrderStatus.CANCELLED:
-            try:
-                process_refund(
-                    session,
-                    order,
-                    OrderStatus.PENDING,  # 0% restocking fee
-                    reason="Paid after the order was cancelled",
-                )
-                print(f"♻️ Auto-refunded cancelled order {order.order_number}")
-            except Exception as e:
-                session.rollback()
-                print(f"⚠️ Auto-refund failed for cancelled order {order.order_number}: {e}")
-            return payment
-
-        if order.status == OrderStatus.PENDING:
-            order.status = OrderStatus.CONFIRMED
-        order.payment_status = "paid"
-        session.add(order)
+def _handle_refund_webhook(session, event_type, refund_entity):
+    from app.models.refund import Refund, RefundStatus
+    from app.services.refund_service import apply_refund_state, enqueue_refund_email, REFUND_COMPLETED_STATUSES
+    refund_id = (refund_entity or {}).get("id")
+    if not refund_id:
+        return
+    ledger = session.execute(select(Refund).where(Refund.provider_refund_id == refund_id)).scalars().first()
+    if ledger is None:
+        return _handle_legacy_refund_webhook(session, event_type, refund_entity)
+    try:
+        order = order_repo.get_order_by_id(session, ledger.order_id, for_update=True)
+        session.refresh(ledger, with_for_update=True)
+        if ledger.provider_status in REFUND_COMPLETED_STATUSES:
+            return
+        if event_type == "refund.processed":
+            if ledger.status != RefundStatus.EXECUTED:
+                order.refund_amount += ledger.amount
+            ledger.status, ledger.provider_status, ledger.error = RefundStatus.EXECUTED, "processed", None
+            event = "refund_completed"
+        elif event_type == "refund.failed":
+            if ledger.provider_status == "failed":
+                return
+            if ledger.status == RefundStatus.EXECUTED:
+                order.refund_amount = max(Decimal(0), order.refund_amount - ledger.amount)
+            ledger.status, ledger.provider_status = RefundStatus.FAILED, "failed"
+            ledger.error = "Provider reported refund failure"
+            event = "refund_failed"
+        else:
+            return
+        session.add_all([order, ledger])
+        apply_refund_state(session, order, failed=event_type == "refund.failed")
+        enqueue_refund_email(session, order, ledger, event)
         session.commit()
-        session.refresh(order)
+    except Exception:
+        session.rollback()
+        raise
 
-        # Payment-received confirmation email (non-fatal) — covers users who
-        # paid successfully but closed the browser before /payments/confirm
-        if settings.SENDGRID_API_KEY and order.user:
-            try:
-                email_service.send_order_confirmation(order, order.user)
-                print(f"Payment confirmation email sent to {order.user.email}")
-            except Exception as e:
-                print(f"Failed to send payment confirmation email: {str(e)}")
-    return payment
+
+def _settle_payment(session: Session, payment, instrument: str | None, provider_payment_id: str | None):
+    """Compatibility entry point; callback and webhook use the same reducer."""
+    return settle_payment(session, payment, instrument, provider_payment_id)
 
 
 @router.post("/payment")
@@ -187,7 +182,7 @@ async def payment_webhook(
         payment_id = event.get("payment_id") or (event.get("data") or {}).get("payment_intent_id")
         if payment_id:
             payment = payment_repo.get_payment_by_provider_id(session, payment_id)
-            if payment and payment.status != "succeeded":
+            if payment:
                 _settle_payment(
                     session,
                     payment,
@@ -206,16 +201,7 @@ async def payment_webhook(
         if payment_id:
             payment = payment_repo.get_payment_by_provider_id(session, payment_id)
             if payment:
-                order = order_repo.get_order_by_id(session, payment.order_id)
-                if order:
-                    cancelled = cancel_pending_online_order(
-                        session,
-                        order,
-                        reason="Payment was cancelled or failed before it completed — order cancelled.",
-                    )
-                    if cancelled:
-                        notify_order_cancelled(session, order)
-                        print(f"🗑️ Order {order.order_number} cancelled (webhook {event_type})")
+                record_payment_failure(session, payment, cancel_order=True)
 
     # Any other event — acknowledged, no action
     return {"status": "received", "event_type": event_type}
@@ -246,19 +232,19 @@ async def shiprocket_tracking_webhook(
     tests post that shape. All status parsing/transition logic lives in
     ``services.shipping_status`` so this endpoint and the simulator cannot drift.
     """
+    webhook_token = settings.SHIPROCKET_WEBHOOK_TOKEN
+    if not webhook_token or not webhook_token.strip():
+        raise HTTPException(503, "Shipping webhook authentication is not configured")
+    header_token = request.headers.get("x-shiprocket-token", "")
+    if not hmac.compare_digest(header_token.encode(), webhook_token.encode()):
+        raise HTTPException(401, "Unauthorized webhook token")
+
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(400, "Invalid JSON payload")
     if not isinstance(payload, dict):
         raise HTTPException(400, "Webhook payload must be a JSON object")
-
-    # Optional signature / auth check
-    webhook_token = getattr(settings, "SHIPROCKET_WEBHOOK_TOKEN", None)
-    if webhook_token:
-        header_token = request.headers.get("x-shiprocket-token")
-        if header_token != webhook_token:
-            raise HTTPException(401, "Unauthorized webhook token")
 
     return process_tracking_event(session, payload)
 
@@ -285,9 +271,21 @@ def process_tracking_event(session: Session, payload: dict) -> dict:
         return {"status": "ignored", "reason": "No AWB present in payload"}
     awb = str(awb).strip()
 
+    # Reverse tracking is a separate item-return lifecycle, never outbound RTO.
+    from app.services.product_return import tracking_event as return_tracking_event
+    returned = return_tracking_event(session, awb, data)
+    if returned is not None:
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        return returned
+
     order = order_repo.get_order_by_awb(session, awb)
     if not order:
         return {"status": "ignored", "reason": f"No order found with AWB {awb}"}
+    order = order_repo.get_order_by_id(session, order.id, for_update=True)
 
     # Prefer the human-readable current_status; fall back to the numeric code
     # (which normalize_status resolves via Shiprocket's status table). The old
@@ -354,22 +352,12 @@ def process_tracking_event(session: Session, payload: dict) -> dict:
         if target_status == OrderStatus.SHIPPED:
             if not order.shipped_at:
                 order.shipped_at = datetime.now(timezone.utc)
-            if settings.SENDGRID_API_KEY and order.user:
-                try:
-                    email_service.send_order_shipped(order, order.user)
-                except Exception:
-                    pass
+            enqueue_order_email(session, order, "order_shipped")
 
         elif target_status == OrderStatus.DELIVERED:
             if not order.delivered_at:
                 order.delivered_at = datetime.now(timezone.utc)
-            if order.payment_method == "cod" and order.payment_status != "paid":
-                order.payment_status = "paid"
-            if settings.SENDGRID_API_KEY and order.user:
-                try:
-                    email_service.send_order_delivered(order, order.user)
-                except Exception:
-                    pass
+            enqueue_order_email(session, order, "order_delivered")
 
         elif target_status == OrderStatus.RTO:
             # Stock restoration is handled below by the label-based,
@@ -389,9 +377,14 @@ def process_tracking_event(session: Session, payload: dict) -> dict:
         and current_status != OrderStatus.DELIVERED
         and not order.rto_stock_restored
     ):
-        restore_stock(session, order)
-        order.rto_stock_restored = True
-        session.add(order)
+        from app.models.product_return import ReturnRequest
+        # A fully refunded delivered return may project Order.REFUNDED. Its
+        # original outbound AWB still must not restock the entire purchase.
+        has_customer_return = session.execute(select(ReturnRequest.id).where(ReturnRequest.order_id == order.id)).first()
+        if not has_customer_return:
+            restore_stock(session, order)
+            order.rto_stock_restored = True
+            session.add(order)
 
     # Always record the courier's own status (even for events we do not model,
     # like NOC) so the admin timeline reflects reality.
@@ -426,4 +419,3 @@ def process_tracking_event(session: Session, payload: dict) -> dict:
         "status_changed": status_changed,
         "duplicate": is_duplicate,
     }
-

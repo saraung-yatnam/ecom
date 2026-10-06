@@ -50,6 +50,13 @@ class CheckoutConfigResponse(BaseModel):
     free_shipping_threshold: float
     shipping_cost: float
     tax_rate: float
+    # Regionalization: the storefront formats ALL money/labels from these —
+    # never hardcoded symbols. Single currency per deployment.
+    currency: str = "INR"
+    locale: str = "en-IN"
+    tax_label: str = "GST"
+    country: str = "India"
+    support_phone: str = ""
 
 
 class OrderRead(BaseModel):

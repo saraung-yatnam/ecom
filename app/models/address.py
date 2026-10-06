@@ -3,6 +3,8 @@ from uuid import UUID, uuid4
 
 from sqlmodel import Field, Relationship, SQLModel
 
+from app.core.region import default_country
+
 
 class Address(SQLModel, table=True):
     __tablename__ = "addresses"
@@ -16,7 +18,7 @@ class Address(SQLModel, table=True):
     city: str
     state: str
     postal_code: str
-    country: str = Field(default="India")
+    country: str = Field(default_factory=default_country)
     is_default: bool = Field(default=False)
     
     created_at: datetime = Field(

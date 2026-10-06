@@ -1,5 +1,29 @@
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+
+#: Canonical store-policy defaults — the SINGLE source of truth for every
+#: other default in the system (pydantic fields below, SQLModel field
+#: defaults, the snapshot fallback, fresh-DB seeds). Values match the live
+#: production row (verified 2026-10-01, incl. the 10-minute unpaid-order
+#: expiry the old code default of 30 had drifted from). Change a default
+#: here, not in four places. Runtime values still come from the
+#: `store_settings` DB row once it exists — these only seed fresh
+#: databases and back the DB-outage fallback.
+STORE_DEFAULTS: dict = {
+    "tax_rate": 0.18,
+    "free_shipping_threshold": 1000.00,
+    "shipping_cost": 50.00,
+    "cod_fee": 50.00,
+    "cod_min_order_value": 0.00,
+    "cod_max_order_value": 10000.00,
+    "restocking_fee_pending": 0.0,
+    "restocking_fee_confirmed": 5.0,
+    "restocking_fee_processing": 15.0,
+    "refund_processing_days": 5,
+    "pending_order_expiry_minutes": 10,
+}
 
 
 class Settings(BaseSettings):
@@ -27,7 +51,23 @@ class Settings(BaseSettings):
 
     # Payment
     PAYMENT_PROVIDER: str = "dummy"
+    # THE currency switch for the whole deployment (INR | EUR | USD …).
+    # Providers charge in this currency and every display layer formats
+    # from it — see app/core/region.py. Pair with PAYMENT_PROVIDER:
+    # razorpay for INR, stripe for anything else.
     PAYMENT_CURRENCY: str = "INR"
+
+    # ========== Regionalization (one currency/locale per deployment) ==========
+    # BCP-47 locale for number/date grouping. Unset = derived from currency
+    # (en-IN for INR with lakh/crore grouping, en-US otherwise).
+    DISPLAY_LOCALE: str | None = None
+    # Customer-facing tax name. Unset = derived (GST for INR, VAT otherwise);
+    # set explicitly for cases like US "Sales Tax".
+    TAX_LABEL: str | None = None
+    # Store home country: address defaults and country fallbacks.
+    DEFAULT_COUNTRY: str = "India"
+    # Public support phone shown in chat prompts and receipts.
+    STORE_SUPPORT_PHONE: str = "+91-00000-00000"
     RAZORPAY_KEY_ID: str | None = None
     RAZORPAY_KEY_SECRET: str | None = None
     RAZORPAY_WEBHOOK_SECRET: str | None = None
@@ -58,27 +98,30 @@ class Settings(BaseSettings):
     ADMIN_FRONTEND_URL: str = "http://localhost:3001"
     RESET_TOKEN_EXPIRE_HOURS: int = 1
 
-    # ========== NEW: Tax & Shipping Settings ==========
+    # ========== Store policy (tax, shipping, COD, refunds, expiry) ==========
     # NOTE: boot defaults only. Live values live in the `store_settings`
-    # DB row, editable (audited) in Admin → Store Settings. Changing these
-    # here affects fresh databases (first-read seed) and the DB-outage
-    # fallback — not a running server. See app/core/store_settings.py.
-    TAX_RATE: float = 0.18  # 18% GST
-    FREE_SHIPPING_THRESHOLD: float = 1000.00
-    SHIPPING_COST: float = 50.00
+    # DB row, editable (audited) in Admin → Store Settings. These fields
+    # (and the .env keys of the same name) affect fresh databases
+    # (startup seed) and the DB-outage fallback — never a running server
+    # whose row already exists. Canonical values live in STORE_DEFAULTS
+    # below; the fields just expose them as env-overridable settings.
+    # See app/core/store_settings.py.
+    TAX_RATE: float = STORE_DEFAULTS["tax_rate"]  # 18% GST
+    FREE_SHIPPING_THRESHOLD: float = STORE_DEFAULTS["free_shipping_threshold"]
+    SHIPPING_COST: float = STORE_DEFAULTS["shipping_cost"]
 
     # ========== COD (Cash on Delivery) Settings ==========
     # Same note as above: DB-overridable boot defaults.
-    COD_FEE: float = 50.00                 # flat fee added to COD orders
-    COD_MIN_ORDER_VALUE: float = 0.00      # grand_total must be >= this for COD
-    COD_MAX_ORDER_VALUE: float = 10000.00  # grand_total must be <= this for COD
+    COD_FEE: float = STORE_DEFAULTS["cod_fee"]                 # flat fee added to COD orders
+    COD_MIN_ORDER_VALUE: float = STORE_DEFAULTS["cod_min_order_value"]      # grand_total must be >= this for COD
+    COD_MAX_ORDER_VALUE: float = STORE_DEFAULTS["cod_max_order_value"]  # grand_total must be <= this for COD
 
     # ========== Cancellation & Refund Settings ==========
     # Same note as above: DB-overridable boot defaults.
-    REFUND_PROCESSING_DAYS: int = 5           # days for refund to reflect in account
-    RESTOCKING_FEE_PENDING: float = 0.0       # % fee when cancelling a PENDING order
-    RESTOCKING_FEE_CONFIRMED: float = 5.0     # % fee when cancelling a CONFIRMED order
-    RESTOCKING_FEE_PROCESSING: float = 15.0   # % fee when cancelling a PROCESSING order
+    REFUND_PROCESSING_DAYS: int = STORE_DEFAULTS["refund_processing_days"]           # days for refund to reflect in account
+    RESTOCKING_FEE_PENDING: float = STORE_DEFAULTS["restocking_fee_pending"]       # % fee when cancelling a PENDING order
+    RESTOCKING_FEE_CONFIRMED: float = STORE_DEFAULTS["restocking_fee_confirmed"]     # % fee when cancelling a CONFIRMED order
+    RESTOCKING_FEE_PROCESSING: float = STORE_DEFAULTS["restocking_fee_processing"]   # % fee when cancelling a PROCESSING order
 
     # ========== Abandoned unpaid online orders ==========
     # Same note as above for PENDING_ORDER_EXPIRY_MINUTES (DB-overridable).
@@ -87,7 +130,7 @@ class Settings(BaseSettings):
     # Online orders that are still PENDING/payment_status "pending" longer than
     # PENDING_ORDER_EXPIRY_MINUTES get auto-cancelled by the sweep job (stock
     # restored, provider PaymentIntent cancelled, customer emailed).
-    PENDING_ORDER_EXPIRY_MINUTES: int = 30
+    PENDING_ORDER_EXPIRY_MINUTES: int = STORE_DEFAULTS["pending_order_expiry_minutes"]
     # How often the sweep job runs (seconds between runs via APScheduler)
     PENDING_ORDER_EXPIRY_JOB_MINUTES: int = 2
 
@@ -99,7 +142,21 @@ class Settings(BaseSettings):
     SHIPROCKET_PICKUP_PINCODE: str = "110001"
     SHIPROCKET_WEBHOOK_TOKEN: str | None = None
 
+    # Delivered-product returns: isolated from pre-shipping cancellation policy.
+    RETURNS_ENABLED: bool = True
+    RETURN_WINDOW_DAYS: int | None = Field(default=None, ge=1, le=3650)
+    RETURN_EXCLUDED_VARIANT_IDS: List[str] = []
+    RETURN_REQUIRED_PHOTO_REASONS: List[str] = []
+    RETURN_FEE_PERCENT: float = Field(default=0, ge=0, lt=100)
+    RETURN_MAX_IMAGES: int = Field(default=6, ge=1, le=12)
+    RETURN_IMAGE_MAX_BYTES: int = Field(default=5 * 1024 * 1024, ge=1024, le=20 * 1024 * 1024)
+    RETURN_STORAGE_DIR: str = "private_storage/returns"
+
     GROQ_API_KEY:str|None=None
+    CHAT_MESSAGES_PER_MINUTE: int = Field(default=10, ge=1, le=1000)
+    CHAT_SESSIONS_PER_MINUTE: int = Field(default=5, ge=1, le=100)
+    CHAT_GLOBAL_MESSAGES_PER_MINUTE: int = Field(default=100, ge=1, le=10000)
+    CHAT_SESSION_TTL_HOURS: int = Field(default=24, ge=1, le=168)
 
     @property
     def cors_origins_list(self) -> List[str]:

@@ -13,6 +13,7 @@ def create_coupon(
     session: Session,
     coupon_data: dict,
     created_by: UUID,
+    *, commit: bool = True,
 ) -> Coupon:
     """Create a new coupon"""
     coupon = Coupon(
@@ -21,8 +22,11 @@ def create_coupon(
         times_used=0,
     )
     session.add(coupon)
-    session.commit()
-    session.refresh(coupon)
+    if commit:
+        session.commit()
+        session.refresh(coupon)
+    else:
+        session.flush()
     return coupon
 
 
@@ -67,6 +71,7 @@ def update_coupon(
     coupon: Coupon,
     coupon_data: dict,
     none_fields: list[str] | None = None,
+    *, commit: bool = True,
 ) -> Coupon:
     """Update coupon.
 
@@ -84,29 +89,38 @@ def update_coupon(
     
     coupon.updated_at = datetime.now(timezone.utc)
     session.add(coupon)
-    session.commit()
-    session.refresh(coupon)
+    if commit:
+        session.commit()
+        session.refresh(coupon)
+    else:
+        session.flush()
     return coupon
 
 
 def delete_coupon(
     session: Session,
     coupon: Coupon,
+    *, commit: bool = True,
 ) -> None:
     """Delete coupon"""
     session.delete(coupon)
-    session.commit()
+    session.commit() if commit else session.flush()
 
 
 def increment_coupon_usage(
     session: Session,
     coupon: Coupon,
+    *,
+    commit: bool = True,
 ) -> Coupon:
-    """Increment coupon usage count"""
+    """Increment usage, optionally within the caller's checkout transaction."""
     coupon.times_used += 1
     session.add(coupon)
-    session.commit()
-    session.refresh(coupon)
+    if commit:
+        session.commit()
+        session.refresh(coupon)
+    else:
+        session.flush()
     return coupon
 
 

@@ -76,8 +76,33 @@ def create_role(
     request: Request,
     current_user: User = Depends(require_perm("roles.manage")),
 ):
-    """Create a custom role from catalog permission keys."""
+    """Create a custom role from catalog permission keys.
+
+    Grant ⊆ held: the new role may not grant permissions the creator does
+    not hold themselves (a roles.manage-only holder cannot mint a role
+    carrying settings.manage they lack).
+    """
     slug = data.slug or data.name.strip().lower().replace(" ", "-")
+    # Unknown keys are a validation error (400) and take precedence over
+    # the escalation check below — same order as set_role_permissions.
+    unknown = rbac_repo.validate_permission_keys(data.permission_keys)
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown permission keys: {', '.join(unknown)}",
+        )
+    creator_perms = set(rbac_repo.get_user_permissions(session, current_user.id))
+    escalating = rbac_repo.escalation_for_grant(
+        creator_perms, data.permission_keys
+    )
+    if escalating:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Role would grant {sorted(escalating)} which you do not "
+                "hold — creation blocked (privilege escalation)"
+            ),
+        )
     try:
         role = rbac_repo.create_role(
             session,
@@ -87,6 +112,7 @@ def create_role(
             permission_keys=data.permission_keys,
             created_by=current_user.id,
             max_refund_amount=data.max_refund_amount,
+            commit=False,
         )
     except ValueError as e:
         raise HTTPException(
@@ -149,9 +175,43 @@ def update_role(
     if "max_refund_amount" in data.model_fields_set:
         role.max_refund_amount = data.max_refund_amount
     if data.permission_keys is not None:
+        unknown = rbac_repo.validate_permission_keys(data.permission_keys)
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown permission keys: {', '.join(unknown)}",
+            )
+        editor_perms = set(rbac_repo.get_user_permissions(session, current_user.id))
+        escalating = rbac_repo.escalation_for_grant(
+            editor_perms, data.permission_keys
+        )
+        if escalating:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Role would grant {sorted(escalating)} which you do not "
+                    "hold — update blocked (privilege escalation)"
+                ),
+            )
+        if "users.manage_roles" in before["permissions"] and (
+            "users.manage_roles" not in data.permission_keys
+        ):
+            # Stripping the key: the role's assignees must not be its last
+            # holders, or the tenant loses its administrators.
+            others = rbac_repo.user_ids_with_permission(
+                session, "users.manage_roles", exclude_role_id=role.id
+            )
+            if rbac_repo.user_ids_with_role(session, role.id) and not others:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Cannot strip users.manage_roles — this role's "
+                        "assignees are its last holders"
+                    ),
+                )
         try:
             rbac_repo.set_role_permissions(
-                session, role, data.permission_keys
+                session, role, data.permission_keys, commit=False
             )
         except ValueError as e:
             raise HTTPException(
@@ -159,14 +219,10 @@ def update_role(
             )
     else:
         session.add(role)
-        session.commit()
-        session.refresh(role)
 
     from datetime import datetime, timezone
     role.updated_at = datetime.now(timezone.utc)
     session.add(role)
-    session.commit()
-    session.refresh(role)
     audit_repo.log_and_commit(
         session, action="role.updated", entity="role", entity_id=role.id,
         actor_id=current_user.id,
@@ -195,7 +251,7 @@ def delete_role(
         )
     snapshot = {"name": role.name, "slug": role.slug}
     try:
-        rbac_repo.delete_role(session, role)
+        rbac_repo.delete_role(session, role, commit=False)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
@@ -235,9 +291,11 @@ def set_user_roles(
 ):
     """REPLACE a user's role set with existing role slugs.
 
-    Guardrail: granting ``users.manage_roles``/``roles.manage`` (directly or
-    via any assigned role's permission set) requires the assigner to hold
-    that permission — same privilege-escalation block as the invite path.
+    Guardrails (shared with the invite path):
+    - grant ⊆ held: no role in the new set may grant a permission the
+      assigner does not hold themselves (privilege escalation block);
+    - the change may not remove the last holder of ``users.manage_roles``
+      (availability block — an unadministered tenant cannot recover).
     """
     user = user_repo.get_user_by_id(session, user_id)
     if not user:
@@ -251,6 +309,7 @@ def set_user_roles(
         )
     assigner_perms = set(rbac_repo.get_user_permissions(session, current_user.id))
     roles = []
+    new_keys: set[str] = set()
     for slug in data.role_slugs:
         role = rbac_repo.get_role_by_slug(session, slug)
         if role is None:
@@ -259,7 +318,7 @@ def set_user_roles(
                 detail=f"Unknown role: {slug}",
             )
         role_keys = set(rbac_repo.get_role_permission_keys(session, role.id))
-        escalating = (role_keys & {"users.manage_roles", "roles.manage"}) - assigner_perms
+        escalating = rbac_repo.escalation_for_grant(assigner_perms, role_keys)
         if escalating:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -268,10 +327,22 @@ def set_user_roles(
                     "not hold — assignment blocked (privilege escalation)"
                 ),
             )
+        new_keys |= role_keys
         roles.append(role)
+    if rbac_repo.would_remove_last_holder(
+        session, "users.manage_roles", user.id,
+        still_grants="users.manage_roles" in new_keys,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Cannot remove the last holder of users.manage_roles — "
+                "assign it to someone else first"
+            ),
+        )
     before = rbac_repo.get_user_role_slugs(session, user.id)
     rbac_repo.set_user_roles(
-        session, user, roles, assigned_by=current_user.id
+        session, user, roles, assigned_by=current_user.id, commit=False
     )
     audit_repo.log_and_commit(
         session, action="user.roles_assigned", entity="user", entity_id=user.id,

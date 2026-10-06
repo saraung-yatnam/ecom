@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from uuid import UUID, uuid4
+from types import SimpleNamespace
 
 from sqlalchemy import Column, JSON
 from sqlmodel import Field, Relationship, SQLModel
@@ -50,6 +51,10 @@ class Order(SQLModel, table=True):
     # Addresses
     shipping_address_id: UUID = Field(foreign_key="addresses.id")
     billing_address_id: UUID = Field(foreign_key="addresses.id")
+    # Immutable purchase-time data; foreign keys continue to establish ownership.
+    customer_snapshot: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    shipping_snapshot: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    billing_snapshot: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     
     # 👇 ADD THESE TWO RELATIONSHIPS
     shipping_address: "Address" = Relationship(
@@ -127,6 +132,7 @@ class Order(SQLModel, table=True):
     # (INITIATED then DELIVERED), so "did the status just change" is not a
     # sufficient condition — this flag is.
     rto_stock_restored: bool = Field(default=False, index=True)
+    stock_released: bool = Field(default=False)
 
     # Timestamps
     placed_at: datetime = Field(
@@ -148,6 +154,18 @@ class Order(SQLModel, table=True):
     # ---------------------------------------------------------
     # Computed helpers (not DB columns)
     # ---------------------------------------------------------
+    @property
+    def customer_details(self):
+        return SimpleNamespace(**self.customer_snapshot) if self.customer_snapshot is not None else self.user
+
+    @property
+    def shipping_details(self):
+        return SimpleNamespace(**self.shipping_snapshot) if self.shipping_snapshot is not None else self.shipping_address
+
+    @property
+    def billing_details(self):
+        return SimpleNamespace(**self.billing_snapshot) if self.billing_snapshot is not None else self.billing_address
+
     @property
     def succeeded_payment(self):
         """The payment that captured money for this order (None if never paid).
@@ -187,17 +205,18 @@ class Order(SQLModel, table=True):
     @property
     def can_refund(self) -> bool:
         """Refund is possible only for paid online orders not fully refunded."""
-        if self.payment_method == "cod" or self.payment_status != "paid":
+        if self.payment_method == "cod" or self.payment_status not in ("paid", "refund_failed"):
             return False
         already_refunded = self.refund_amount or Decimal(0)
-        return already_refunded < self.grand_total
+        return already_refunded < self.grand_total - (self.restocking_fee or Decimal(0))
 
     @property
     def restocking_fee_percentage(self) -> float:
         """Restocking fee % based on the order status at cancellation time."""
         from app.core.store_settings import get_store_settings
 
-        store = get_store_settings()
+        from sqlalchemy.orm import object_session
+        store = get_store_settings(object_session(self), seed=False)
         if self.status == OrderStatus.PROCESSING:
             return store.restocking_fee_processing
         if self.status == OrderStatus.CONFIRMED:
