@@ -12,6 +12,7 @@ from app.models.address import Address
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.payment import Payment, PaymentStatus, PaymentProvider
 from app.models.review import Review  # 👈 ADD THIS LINE
+from app.models.review_image import ReviewImage
 from app.models.wishlist import Wishlist
 from app.models.coupon import Coupon, CouponType, DiscountType, TriggerType  # Add this
 from app.models.password_reset import PasswordResetToken  # Add this
@@ -50,6 +51,7 @@ __all__ = [
     "PaymentStatus",
     "PaymentProvider",
     "Review",  # 👈 ADD THIS
+    "ReviewImage",
     "Wishlist",
     "Coupon",
     "CouponType",

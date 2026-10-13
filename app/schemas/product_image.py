@@ -22,6 +22,8 @@ class ProductImageRead(BaseModel):
     id: UUID
     product_id: UUID
     url: str
+    secure_url: str | None
+    cloudinary_public_id: str | None
     alt_text: str | None
     sort_order: int
     created_at: datetime

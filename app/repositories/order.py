@@ -391,6 +391,7 @@ def get_all_orders_with_filters(
     search: str | None = None,
     from_date: date | None = None,
     to_date: date | None = None,
+    payment_status: str | None = None,
 ) -> tuple[list[Order], int]:
     """Get all orders with filters and user data"""
     # Build base query with eager loading
@@ -404,6 +405,9 @@ def get_all_orders_with_filters(
     # Apply filters
     if status:
         statement = statement.where(Order.status == status)
+
+    if payment_status:
+        statement = statement.where(Order.payment_status == payment_status)
     
     if search:
         # Search by order number or customer name/email

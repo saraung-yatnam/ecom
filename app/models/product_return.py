@@ -116,6 +116,9 @@ class ReturnEvidence(SQLModel, table=True):
     filename: str = Field(max_length=160)
     size_bytes: int
     sha256: str = Field(max_length=64)
+    secure_url: str | None = Field(default=None, max_length=1000)
+    cloudinary_public_id: str | None = Field(default=None, max_length=500, index=True)
+    cloudinary_type: str | None = Field(default=None, max_length=30)
     created_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
 
 

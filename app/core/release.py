@@ -32,6 +32,9 @@ def validate_production_settings(config):
     for key in ("SHIPROCKET_EMAIL", "SHIPROCKET_PASSWORD", "SHIPROCKET_WEBHOOK_TOKEN", "GROQ_API_KEY"):
         if not str(getattr(config, key) or "").strip():
             errors.append(f"{key} is required")
+    for key in ("CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"):
+        if not str(getattr(config, key) or "").strip():
+            errors.append(f"{key} is required")
     email = (config.EMAIL_PROVIDER or ("gmail" if config.GMAIL_ADDRESS and config.GMAIL_APP_PASSWORD else "sendgrid")).lower()
     if email == "gmail":
         if not str(config.GMAIL_ADDRESS or "").strip() or not str(config.GMAIL_APP_PASSWORD or "").strip():

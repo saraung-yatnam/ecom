@@ -2,7 +2,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
@@ -11,6 +11,7 @@ from app.models.product_return import ReturnEvidence
 from app.schemas.product_return import ReturnCreate, ReturnNote, ReturnTracking
 from app.services import product_return as service
 from app.services.return_evidence import decode_images, evidence_path
+from app.services.cloudinary_service import delete_image, fetch_private_image
 
 router = APIRouter(tags=["Product Returns"])
 
@@ -24,8 +25,11 @@ def mutation(session, call, *, admin=False, written=None):
         return result
     except Exception as exc:
         session.rollback()
-        for path in written or []:
-            path.unlink(missing_ok=True)
+        for item in written or []:
+            if isinstance(item, dict) and item.get("public_id"):
+                delete_image(item["public_id"], private=bool(item.get("private")))
+            else:
+                item.unlink(missing_ok=True)
         if isinstance(exc, IntegrityError):
             raise HTTPException(409, "This return action conflicts with an existing request or shipment") from exc
         if isinstance(exc, OSError):
@@ -37,6 +41,10 @@ def evidence_response(session, return_id, evidence_id):
     image = session.get(ReturnEvidence, evidence_id)
     if image is None or image.return_id != return_id:
         raise HTTPException(404, "Evidence not found")
+    if image.cloudinary_public_id:
+        content, media_type = fetch_private_image(image.cloudinary_public_id)
+        return Response(content=content, media_type=media_type,
+                        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
     path = evidence_path(image.storage_key)
     if not path.is_file():
         raise HTTPException(404, "Evidence not found")

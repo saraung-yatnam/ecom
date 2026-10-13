@@ -142,6 +142,12 @@ class Settings(BaseSettings):
     SHIPROCKET_PICKUP_PINCODE: str = "110001"
     SHIPROCKET_WEBHOOK_TOKEN: str | None = None
 
+    # ========== Cloudinary media storage ==========
+    CLOUDINARY_CLOUD_NAME: str | None = None
+    CLOUDINARY_API_KEY: str | None = None
+    CLOUDINARY_API_SECRET: str | None = None
+    CLOUDINARY_SECURE: bool = True
+
     # Delivered-product returns: isolated from pre-shipping cancellation policy.
     RETURNS_ENABLED: bool = True
     RETURN_WINDOW_DAYS: int | None = Field(default=None, ge=1, le=3650)
@@ -153,6 +159,13 @@ class Settings(BaseSettings):
     RETURN_STORAGE_DIR: str = "private_storage/returns"
 
     GROQ_API_KEY:str|None=None
+    GEMINI_API_KEY:str|None=None
+    # MCP chatbot LLM provider: "groq" (default) or "gemini". Switching
+    # providers requires only changing env vars and restarting the backend.
+    MCP_LLM_PROVIDER: str = "groq"
+    # Model override; when empty, the provider default is used
+    # (groq: openai/gpt-oss-120b, gemini: gemini-3.1-flash-lite).
+    MCP_LLM_MODEL: str | None = None
     CHAT_MESSAGES_PER_MINUTE: int = Field(default=10, ge=1, le=1000)
     CHAT_SESSIONS_PER_MINUTE: int = Field(default=5, ge=1, le=100)
     CHAT_GLOBAL_MESSAGES_PER_MINUTE: int = Field(default=100, ge=1, le=10000)

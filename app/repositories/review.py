@@ -4,6 +4,7 @@ from sqlalchemy import select, func
 from sqlmodel import Session
 
 from app.models.review import Review
+from app.models.review_image import ReviewImage
 from app.models.user import User
 from app.schemas.review import ReviewRead
 
@@ -15,6 +16,7 @@ def create_review(
     review_data: dict,
     order_id: UUID | None = None,
     is_verified_purchase: bool = False,
+    *, commit: bool = True,
 ) -> Review:
     """Create a new review"""
     review = Review(
@@ -25,12 +27,20 @@ def create_review(
         **review_data
     )
     session.add(review)
-    session.commit()
-    session.refresh(review)
+    if commit:
+        session.commit()
+        session.refresh(review)
+    else:
+        session.flush()
     return review
 
 
-def _to_review_read(review: Review, full_name: str | None) -> ReviewRead:
+def get_review_images(session: Session, review_id: UUID) -> list[ReviewImage]:
+    return session.execute(select(ReviewImage).where(ReviewImage.review_id == review_id)
+                           .order_by(ReviewImage.sort_order, ReviewImage.id)).scalars().all()
+
+
+def _to_review_read(session: Session, review: Review, full_name: str | None) -> ReviewRead:
     """Shared builder so the field list only lives in one place"""
     return ReviewRead(
         id=review.id,
@@ -45,6 +55,7 @@ def _to_review_read(review: Review, full_name: str | None) -> ReviewRead:
         created_at=review.created_at,
         updated_at=review.updated_at,
         user_full_name=full_name,
+        images=get_review_images(session, review.id),
     )
 
 
@@ -68,7 +79,7 @@ def get_reviews_by_product(
         .limit(limit)
     )
     result = session.execute(statement)
-    return [_to_review_read(review, full_name) for review, full_name in result]
+    return [_to_review_read(session, review, full_name) for review, full_name in result]
 
 
 def get_review_by_id(session: Session, review_id: UUID) -> Review | None:
@@ -92,7 +103,7 @@ def get_reviews_by_user(
         .limit(limit)
     )
     result = session.execute(statement)
-    return [_to_review_read(review, full_name) for review, full_name in result]
+    return [_to_review_read(session, review, full_name) for review, full_name in result]
 
 
 def has_reviewed_product(session: Session, user_id: UUID, product_id: UUID) -> bool:
@@ -200,6 +211,7 @@ def list_reviews_admin(
                 "is_hidden": r.is_hidden,
                 "created_at": r.created_at,
                 "updated_at": r.updated_at,
+                "images": get_review_images(session, r.id),
             }
             for r, fname, email, pname in rows
         ],

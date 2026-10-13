@@ -25,6 +25,7 @@ class ContentBlock(SQLModel, table=True):
     title: str = Field(min_length=1, max_length=120)
     body: str | None = Field(default=None, max_length=2000)
     image_url: str | None = Field(default=None, max_length=500)
+    image_public_id: str | None = Field(default=None, max_length=500)
     link: str | None = Field(default=None, max_length=300)
     link_label: str | None = Field(default=None, max_length=60)
     sort_order: int = Field(default=0)

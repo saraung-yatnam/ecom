@@ -118,6 +118,17 @@ def env(tmp_path, monkeypatch):
     ids, headers = seed(engine)
     gateway = Gateway()
     monkeypatch.setattr(refund_service, "get_payment_service_for_payment", lambda payment: gateway)
+    assets, deleted = {}, []
+    def upload(blob, folder, private=False, filename=None):
+        public_id = f"{folder}/test-{uuid4().hex}"
+        assets[public_id] = blob
+        return {"public_id": public_id, "secure_url": f"https://res.cloudinary.test/{public_id}.jpg",
+                "type": "authenticated" if private else "upload", "bytes": len(blob)}
+    def delete(public_id, private=False):
+        deleted.append((public_id, private))
+        assets.pop(public_id, None)
+    monkeypatch.setattr(service, "upload_image", upload)
+    monkeypatch.setattr(returns, "delete_image", delete)
     monkeypatch.setattr(settings, "RETURN_STORAGE_DIR", str(tmp_path / "private"))
     for key, value in {"RETURNS_ENABLED": True, "RETURN_WINDOW_DAYS": None, "RETURN_EXCLUDED_VARIANT_IDS": [],
                        "RETURN_REQUIRED_PHOTO_REASONS": [], "RETURN_FEE_PERCENT": 0, "RETURN_MAX_IMAGES": 6,
@@ -133,8 +144,10 @@ def env(tmp_path, monkeypatch):
         with Session(engine) as session:
             yield session
     app.dependency_overrides[get_session] = db
+    monkeypatch.setattr(returns, "fetch_private_image", lambda public_id: (assets[public_id], "image/jpeg"))
     with TestClient(app, raise_server_exceptions=False) as client:
-        yield SimpleNamespace(client=client, engine=engine, ids=ids, headers=headers, gateway=gateway, path=tmp_path)
+        yield SimpleNamespace(client=client, engine=engine, ids=ids, headers=headers, gateway=gateway,
+                              path=tmp_path, assets=assets, deleted=deleted)
     engine.dispose()
 
 
@@ -267,7 +280,7 @@ def test_same_submission_replays_identically_and_rejects_key_reuse(env):
     with Session(env.engine) as s:
         assert len(s.execute(select(ReturnRequest)).scalars().all()) == 1
         assert len(s.execute(select(ReturnEvidence)).scalars().all()) == 2
-    assert len(list((env.path / "private").iterdir())) == 2
+    assert len(env.assets) == 2
 
 
 def test_active_quantities_are_reserved_and_rejection_and_cancel_release_them(env):
@@ -542,7 +555,12 @@ def test_private_images_are_multiple_sanitized_and_owner_admin_only(env):
     assert env.client.get(f"/api/v1/admin/returns/{row['id']}/evidence/{image_id}", headers=env.headers["buyer"]).status_code == 403
     with Session(env.engine) as s:
         image = s.get(ReturnEvidence, UUID(image_id))
+        assert image.cloudinary_public_id and image.cloudinary_type == "authenticated"
+        assert image.cloudinary_public_id.startswith(f"com/returns/{row['id']}/")
         assert env.client.get("/uploads/returns/" + image.storage_key).status_code == 404
+    assert env.client.get(path).status_code == 401
+    assert env.client.get(path, headers=env.headers["other"]).status_code == 404
+    assert all("secure_url" not in evidence and "cloudinary_public_id" not in evidence for evidence in row["evidence"])
     another = create(env)
     assert env.client.get(f"/api/v1/returns/{another['id']}/evidence/{image_id}", headers=env.headers["buyer"]).status_code == 404
 
@@ -585,7 +603,8 @@ def test_evidence_and_audit_roll_back_together_on_failed_commit(env):
         assert s.execute(select(ReturnEvidence)).scalars().all() == []
         assert s.execute(select(ReturnEvent)).scalars().all() == []
         assert s.execute(select(AdminAuditLog)).scalars().all() == []
-    assert list((env.path / "private").iterdir()) == []
+    assert env.assets == {} and len(env.deleted) == 1
+    assert env.deleted[0][1] is True
 
 
 def test_admin_filters_pagination_and_return_audit_history(env):
@@ -743,25 +762,21 @@ def test_integer_cent_allocation_cannot_overpay_repeated_partial_quantities(env)
     assert submit(env).status_code == 409
 
 
-def test_image_pixel_limit_and_public_storage_misconfiguration_fail_closed(env, monkeypatch):
+def test_image_pixel_limit_and_legacy_storage_setting_is_ignored(env, monkeypatch):
     from app.services import return_evidence
     monkeypatch.setattr(return_evidence, "MAX_PIXELS", 100)
     assert submit(env, images=[photo()]).status_code == 415
     monkeypatch.setattr(return_evidence, "MAX_PIXELS", 20_000_000)
     monkeypatch.setattr(settings, "RETURN_STORAGE_DIR", str(return_evidence.ROOT / "uploads" / "returns"))
-    assert submit(env, images=[photo()]).status_code == 503
+    assert submit(env, images=[photo()]).status_code == 201
     with Session(env.engine) as s:
-        assert s.execute(select(ReturnRequest)).scalars().all() == []
+        assert len(s.execute(select(ReturnRequest)).scalars().all()) == 1
 
 
 def test_evidence_storage_failure_rolls_back_request_and_audit(env, monkeypatch):
-    from pathlib import Path
-    original = Path.open
-    def unavailable(path, *args, **kwargs):
-        if path.suffix == ".jpg" and "private" in path.parts:
-            raise OSError("storage unavailable")
-        return original(path, *args, **kwargs)
-    monkeypatch.setattr(Path, "open", unavailable)
+    def unavailable(*args, **kwargs):
+        raise OSError("storage unavailable")
+    monkeypatch.setattr(service, "upload_image", unavailable)
     assert submit(env, images=[photo()]).status_code == 503
     with Session(env.engine) as s:
         assert s.execute(select(ReturnRequest)).scalars().all() == []

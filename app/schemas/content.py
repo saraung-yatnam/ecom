@@ -13,6 +13,7 @@ class ContentBlockRead(BaseModel):
     title: str
     body: str | None = None
     image_url: str | None = None
+    image_public_id: str | None = None
     link: str | None = None
     link_label: str | None = None
     sort_order: int = 0
@@ -28,6 +29,7 @@ class ContentBlockCreate(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     body: str | None = Field(default=None, max_length=2000)
     image_url: str | None = Field(default=None, max_length=500)
+    image_public_id: str | None = Field(default=None, max_length=500)
     link: str | None = Field(default=None, max_length=300)
     link_label: str | None = Field(default=None, max_length=60)
     sort_order: int = Field(default=0, ge=0, le=999)
@@ -40,6 +42,7 @@ class ContentBlockUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=120)
     body: str | None = Field(default=None, max_length=2000)
     image_url: str | None = Field(default=None, max_length=500)
+    image_public_id: str | None = Field(default=None, max_length=500)
     link: str | None = Field(default=None, max_length=300)
     link_label: str | None = Field(default=None, max_length=60)
     sort_order: int | None = Field(default=None, ge=0, le=999)
@@ -64,6 +67,7 @@ class PublicBlocksResponse(BaseModel):
 
 class ContentImageUploadResponse(BaseModel):
     url: str
+    public_id: str | None = None
     width: int
     height: int
     size_bytes: int

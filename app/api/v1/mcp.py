@@ -1,0 +1,335 @@
+"""Thin authenticated MCP-agent chat endpoint (first real connection).
+
+Auth/RBAC: reuses the existing REST chain only —
+  app/api/deps.py:get_current_user (JWT -> User, session validity)
+  app/api/deps.py:TokenPayload + _assert_admin_audience (admin audience)
+Per-tool RBAC (e.g. orders.view on get_order) is enforced inside the MCP
+tools themselves; this endpoint adds no permission system of its own.
+
+The caller's raw access JWT (same token get_current_user validated) is
+forwarded to the MCP server as an HTTP Authorization header by
+app/mcp/agent.py:run_chat. It is never placed in tool arguments and the
+LLM never sees it (the `token` param is stripped from LLM schemas/args).
+"""
+
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
+
+from app.api.deps import CurrentUser, TokenPayload, _assert_admin_audience, oauth2_scheme
+from app.mcp.agent import run_chat
+
+router = APIRouter(prefix="/mcp", tags=["MCP Agent"])
+
+
+class McpHistoryToolCall(BaseModel):
+    """One client-reported assistant tool call (validated server-side)."""
+
+    id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=100)
+    arguments: Any = None
+
+
+class McpHistoryMessage(BaseModel):
+    """One prior chat turn. Roles are restricted: never system/developer."""
+
+    role: Literal["user", "assistant", "tool"]
+    content: str = Field(default="", max_length=8000)
+    tool_calls: list[McpHistoryToolCall] = Field(default_factory=list, max_length=10)
+    tool_call_id: str = Field(default="", max_length=200)
+
+
+class McpChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    history: list[McpHistoryMessage] = Field(default_factory=list, max_length=20)
+
+
+class McpChatResponse(BaseModel):
+    reply: str
+    tools_used: list[str] = []
+    pending_action: dict | None = None
+
+
+def llm_group_detail(eg: BaseExceptionGroup) -> str | None:
+    """Unwrap an anyio task-group error; return LLM-failure detail, if any.
+
+    The MCP client runs inside an anyio task group, which wraps errors
+    raised in its body (e.g. run_chat's RuntimeError on LLM failure) in
+    an ExceptionGroup. A contained LLM failure still maps to 502.
+    """
+    flat: list[BaseException] = list(eg.exceptions)
+    llm_errors: list[str] = []
+    while flat:
+        err = flat.pop()
+        if isinstance(err, BaseExceptionGroup):
+            flat.extend(err.exceptions)
+        elif isinstance(err, RuntimeError):
+            llm_errors.append(str(err))
+    return "; ".join(llm_errors) if llm_errors else None
+
+
+@router.post("/chat", response_model=McpChatResponse)
+async def mcp_chat(
+    data: McpChatRequest,
+    request: Request,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> McpChatResponse:
+    _ = user
+    _assert_admin_audience(payload)
+
+    # Same process serves /mcp, so loop back to our own origin instead of
+    # hardcoding a host/port. request.base_url ends with "/".
+    mcp_url = f"{request.base_url}mcp/"
+
+    try:
+        result = await run_chat(
+            data.message,
+            auth_token=token,
+            mcp_url=mcp_url,
+            history=[item.model_dump() for item in data.history],
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        ) from exc
+    except BaseExceptionGroup as eg:
+        # anyio wraps errors raised inside the MCP client's task group.
+        detail = llm_group_detail(eg)
+        if detail is not None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail=detail
+            ) from eg
+        raise
+    return McpChatResponse(
+        reply=result["reply"],
+        tools_used=result["tools_used"],
+        pending_action=result.get("pending_action"),
+    )
+
+
+class McpCancelRequest(BaseModel):
+    order_id: str = Field(min_length=1, max_length=100)
+    preview_token: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(default="", max_length=500)
+
+
+@router.post("/cancel", response_model=dict)
+async def mcp_cancel(
+    data: McpCancelRequest,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> dict:
+    """Execute a button-confirmed MCP order cancellation.
+
+    The click alone authorizes nothing: the tool re-resolves the caller
+    from the session JWT, re-checks orders.update, validates the signed
+    preview (same user/order/status, unexpired), re-locks the row, and
+    re-validates state before the shared service commits.
+    """
+    _ = user
+    _assert_admin_audience(payload)
+    from app.mcp.tools.orders import cancel_order as cancel_order_tool
+
+    result = await cancel_order_tool(
+        order_id=data.order_id,
+        reason=data.reason,
+        preview_token=data.preview_token,
+        confirmed=True,
+        ctx=None,
+        token=token,
+    )
+    if result.get("success") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get("error", "Cancellation failed"),
+        )
+    return result
+
+
+class McpRefundRequest(BaseModel):
+    order_id: str = Field(min_length=1, max_length=100)
+    amount: str | None = Field(default=None, max_length=20)
+    reason: str = Field(default="", max_length=500)
+    preview_token: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/refund", response_model=dict)
+async def mcp_refund(
+    data: McpRefundRequest,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> dict:
+    """Execute a button-confirmed MCP refund.
+
+    The click alone authorizes nothing: the tool re-resolves the caller
+    from the session JWT, re-checks orders.refund, validates the signed
+    preview (same user/order/amount/reason/basis, unexpired), recomputes
+    the refundable balance, and executes through request_admin_refund
+    (role limits, approval staging, ledger idempotency, PSP handling).
+    """
+    _ = user
+    _assert_admin_audience(payload)
+    from app.mcp.tools.orders import issue_refund as issue_refund_tool
+
+    result = await issue_refund_tool(
+        order_id=data.order_id,
+        amount=data.amount,
+        reason=data.reason,
+        preview_token=data.preview_token,
+        confirmed=True,
+        ctx=None,
+        token=token,
+    )
+    if result.get("success") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get("error", "Refund failed"),
+        )
+    return result
+
+
+def _mcp_write_error(result: dict, fallback: str) -> None:
+    if result.get("success") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get("error", fallback),
+        )
+
+
+class McpProductUpdateRequest(BaseModel):
+    product_id: str = Field(min_length=1, max_length=200)
+    changes: dict = Field(default_factory=dict)
+    preview_token: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/products/update", response_model=dict)
+async def mcp_product_update(
+    data: McpProductUpdateRequest,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> dict:
+    """Execute a button-confirmed MCP product edit.
+
+    The click alone authorizes nothing: the tool re-resolves the caller
+    from the session JWT, re-checks products.update, validates the signed
+    preview (same user/target/exact changes/fingerprint, unexpired),
+    re-locks the row, and re-validates before the repo function commits.
+    """
+    _ = user
+    _assert_admin_audience(payload)
+    from app.mcp.tools.products import update_product as update_product_tool
+
+    result = await update_product_tool(
+        product_id=data.product_id,
+        changes=data.changes,
+        preview_token=data.preview_token,
+        confirmed=True,
+        ctx=None,
+        token=token,
+    )
+    _mcp_write_error(result, "Product update failed")
+    return result
+
+
+class McpProductPriceRequest(BaseModel):
+    product_id: str = Field(min_length=1, max_length=200)
+    price: Any = None
+    compare_at_price: Any = None
+    variant_id: str | None = Field(default=None, max_length=200)
+    preview_token: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/products/price", response_model=dict)
+async def mcp_product_price(
+    data: McpProductPriceRequest,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> dict:
+    """Execute a button-confirmed MCP price change (same guarantees as above)."""
+    _ = user
+    _assert_admin_audience(payload)
+    from app.mcp.tools.products import update_product_price as price_tool
+
+    result = await price_tool(
+        product_id=data.product_id,
+        price=data.price,
+        compare_at_price=data.compare_at_price,
+        variant_id=data.variant_id,
+        preview_token=data.preview_token,
+        confirmed=True,
+        ctx=None,
+        token=token,
+    )
+    _mcp_write_error(result, "Price update failed")
+    return result
+
+
+class McpProductDeleteRequest(BaseModel):
+    product_id: str = Field(min_length=1, max_length=200)
+    preview_token: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/products/delete", response_model=dict)
+async def mcp_product_delete(
+    data: McpProductDeleteRequest,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> dict:
+    """Execute a button-confirmed MCP product deactivation (soft-delete only)."""
+    _ = user
+    _assert_admin_audience(payload)
+    from app.mcp.tools.products import delete_product as delete_product_tool
+
+    result = await delete_product_tool(
+        product_id=data.product_id,
+        preview_token=data.preview_token,
+        confirmed=True,
+        ctx=None,
+        token=token,
+    )
+    _mcp_write_error(result, "Product deletion failed")
+    return result
+
+
+class McpStockAdjustRequest(BaseModel):
+    variant_id: str = Field(min_length=1, max_length=200)
+    delta: int
+    reason: str = Field(min_length=1, max_length=500)
+    preview_token: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/inventory/adjust", response_model=dict)
+async def mcp_stock_adjust(
+    data: McpStockAdjustRequest,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> dict:
+    """Execute a button-confirmed MCP stock adjustment (same guarantees)."""
+    _ = user
+    _assert_admin_audience(payload)
+    from app.mcp.tools.inventory import adjust_stock as adjust_stock_tool
+
+    result = await adjust_stock_tool(
+        variant_id=data.variant_id,
+        delta=data.delta,
+        reason=data.reason,
+        preview_token=data.preview_token,
+        confirmed=True,
+        ctx=None,
+        token=token,
+    )
+    _mcp_write_error(result, "Stock adjustment failed")
+    return result

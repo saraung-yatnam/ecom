@@ -335,17 +335,37 @@ def get_all_products(session: Session) -> list[Product]:
     return result.scalars().all()
 
 
+#: Allowed sort keys for get_all_products_admin (column whitelist — the
+#: sort key is never interpolated raw, so arbitrary column access is out).
+PRODUCT_ADMIN_SORTS = {
+    "name": "name",
+    "price": "price",
+    "created_at": "created_at",
+}
+
+
 def get_all_products_admin(
     session: Session,
     skip: int = 0,
     limit: int = 20,
     search: str | None = None,
     is_active: bool | None = None,
+    sort_by: str = "created_at",
+    sort_dir: str = "desc",
 ) -> tuple[list[Product], int]:
     """
     Get all products with filters (Admin only).
     Includes inactive products.
+    sort_by is one of name | price | created_at (default created_at);
+    sort_dir is asc | desc (default desc). Unknown values raise ValueError
+    so callers surface a clean validation error instead of SQL text.
     """
+    key = PRODUCT_ADMIN_SORTS.get((sort_by or "").strip().lower())
+    if key is None:
+        raise ValueError(f"sort_by must be one of: {', '.join(sorted(PRODUCT_ADMIN_SORTS))}")
+    direction = (sort_dir or "").strip().lower()
+    if direction not in ("asc", "desc"):
+        raise ValueError("sort_dir must be 'asc' or 'desc'")
     statement = select(Product).options(
         selectinload(Product.variants),
         selectinload(Product.images)
@@ -364,8 +384,12 @@ def get_all_products_admin(
     count_statement = select(func.count()).select_from(statement.subquery())
     result = session.execute(count_statement)
     total = result.scalar() or 0
-    
-    statement = statement.order_by(Product.created_at.desc(), Product.id.asc()).offset(skip).limit(limit)
+
+    column = getattr(Product, key)
+    ordering = column.asc() if direction == "asc" else column.desc()
+    statement = (
+        statement.order_by(ordering, Product.id.asc()).offset(skip).limit(limit)
+    )
     result = session.execute(statement)
     products = result.scalars().all()
     

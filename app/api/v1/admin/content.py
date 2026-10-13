@@ -5,10 +5,11 @@ Every create/update/delete writes an audit entry (entity "content" —
 operational, visible to reports.view). Publish windows make campaigns
 self-expiring; flipping ``is_active`` is the kill switch.
 """
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, status
 from fastapi import UploadFile
+from sqlmodel import select
 
 import io
 
@@ -24,6 +25,7 @@ from app.schemas.content import (
     ContentBlockUpdate,
     ContentImageUploadResponse,
 )
+from app.services.cloudinary_service import delete_image, upload_image
 
 router = APIRouter(prefix="/admin/content", tags=["Admin Content"])
 
@@ -128,7 +130,11 @@ def update_block(
     starts = data.get("starts_at", block.starts_at)
     ends = data.get("ends_at", block.ends_at)
     _assert_window(starts, ends)
-    before = {"title": block.title, "is_active": block.is_active}
+    before = {"title": block.title, "is_active": block.is_active, "image_public_id": block.image_public_id}
+    if "image_url" in data and data["image_url"] != block.image_url and "image_public_id" not in data:
+        data["image_public_id"] = None
+    if "image_url" in data and not data["image_url"]:
+        data["image_public_id"] = None
     for key, value in data.items():
         setattr(block, key, value)
     from datetime import datetime, timezone
@@ -145,6 +151,8 @@ def update_block(
         after={"title": block.title, "is_active": block.is_active},
         ip_address=audit_repo.client_ip(request),
     )
+    if "image_public_id" in data and data["image_public_id"] != before.get("image_public_id"):
+        _delete_unused_image(session, before.get("image_public_id"))
     return ContentBlockRead.model_validate(block)
 
 
@@ -161,7 +169,7 @@ def delete_block(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Content block not found"
         )
-    snapshot = {"key": block.key, "title": block.title}
+    snapshot = {"key": block.key, "title": block.title, "image_public_id": block.image_public_id}
     session.delete(block)
     audit_repo.log_and_commit(
         session,
@@ -172,6 +180,7 @@ def delete_block(
         before=snapshot,
         ip_address=audit_repo.client_ip(request),
     )
+    _delete_unused_image(session, snapshot.get("image_public_id"))
     return None
 
 
@@ -181,6 +190,11 @@ def _assert_window(starts_at, ends_at) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="ends_at must be after starts_at",
         )
+
+
+def _delete_unused_image(session, public_id: str | None) -> None:
+    if public_id and session.exec(select(ContentBlock.id).where(ContentBlock.image_public_id == public_id)).first() is None:
+        delete_image(public_id)
 
 
 @router.post("/images", response_model=ContentImageUploadResponse)
@@ -193,8 +207,8 @@ async def upload_content_image(
     """Upload a slot image (multipart). Returns an absolute URL for image_url.
 
     Size caps are enforced (413 over); aspect mismatches return a warning
-    string but still succeed. Files land in ``uploads/content/`` (served at
-    ``/uploads`` — back this dir up, it is user content, not code).
+     string but still succeed. Files are stored in Cloudinary under
+     ``com/banners``.
     """
     from pathlib import Path
 
@@ -269,16 +283,15 @@ async def upload_content_image(
             out_blob = buf.getvalue()
             width, height = resized.size
 
-    upload_dir = Path(__file__).resolve().parents[4] / "uploads" / "content"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{uuid4().hex}{ext}"
-    (upload_dir / filename).write_bytes(out_blob)
-
-    base = str(request.base_url).rstrip("/")
+    uploaded = upload_image(out_blob, folder="com/banners", filename=file.filename)
+    if not uploaded.get("secure_url") or not uploaded.get("public_id"):
+        delete_image(uploaded.get("public_id"))
+        raise HTTPException(status_code=502, detail="Cloudinary returned incomplete image metadata")
     return ContentImageUploadResponse(
-        url=f"{base}/uploads/content/{filename}",
+        url=uploaded["secure_url"],
+        public_id=uploaded["public_id"],
         width=width,
         height=height,
-        size_bytes=len(out_blob),
+        size_bytes=uploaded.get("bytes") or len(out_blob),
         aspect_warning=aspect_warning,
     )

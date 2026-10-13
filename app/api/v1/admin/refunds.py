@@ -35,8 +35,8 @@ from app.schemas.refund import (
     RefundRejectRequest,
 )
 from app.services import refund_service
+from app.services import order_cancel as order_cancel_service
 from app.services.payment_service import get_payment_service
-from app.services.refund_service import restore_stock
 from app.services.email_outbox import enqueue_order_email
 from app.repositories import notification as notification_repo
 
@@ -141,58 +141,7 @@ def refunds_attention(
     Fully refunded orders, COD/unpaid orders, and orders with a pending
     approval are excluded.
     """
-    from app.models.refund import RefundStatus
-
-    candidates = session.exec(
-        select(Order).where(
-            Order.status == OrderStatus.CANCELLED,
-            Order.payment_method != "cod",
-            Order.payment_status == "paid",
-        )
-        .order_by(col(Order.placed_at).desc())
-        .limit(limit * 2)  # over-fetch: some drop out below
-    ).all()
-
-    items = []
-    for order in candidates:
-        refunded = order.refund_amount or Decimal(0)
-        # Policy-aware remainder: the restocking fee (keyed on the
-        # pre-cancel status) is retained revenue, not owed money. Without
-        # this, every fee-retained order would sit in the queue forever
-        # with no valid action (any refund attempt answers "Nothing to
-        # refund").
-        policy = refund_service.calculate_refund(
-            order, refund_service.status_at_cancellation(session, order)
-        )
-        remaining = policy["refund_amount"]
-        if remaining <= 0:
-            continue
-        pending, _ = refund_repo.list_refunds(
-            session, skip=0, limit=1, order_id=order.id,
-            status=RefundStatus.PENDING_APPROVAL,
-        )
-        if pending:
-            continue
-        customer = order.customer_details
-        items.append({
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "status": order.status.value,
-            "customer_email": customer.email if customer else None,
-            "customer_name": (
-                customer.full_name or customer.username
-            ) if customer else None,
-            "grand_total": float(order.grand_total or 0),
-            "refunded": float(refunded),
-            "remaining": float(remaining),
-            "cancelled_at": (
-                order.cancelled_at.isoformat() if order.cancelled_at else None
-            ),
-            "cancellation_reason": order.cancellation_reason,
-        })
-        if len(items) >= limit:
-            break
-    return {"count": len(items), "orders": items}
+    return refund_service.get_attention_queue(session, limit=limit)
 
 
 @router.get("/admin/refunds", response_model=RefundListResponse)
@@ -316,25 +265,7 @@ def _raise_if_provider_mismatch(result: dict, order: Order) -> None:
     sync instead of another doomed retry. Plain failures keep flowing to
     the normal response shape.
     """
-    state = result.get("provider_state")
-    if not state:
-        return
-    raise HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail={
-            "message": result.get(
-                "message",
-                "The payment provider disagrees with our refund records.",
-            ),
-            "code": "provider_mismatch",
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "provider": state.get("provider"),
-            "provider_refunded": state.get("provider_refunded"),
-            "provider_remaining": state.get("provider_remaining"),
-            "recorded_refunded": state.get("recorded_refunded"),
-        },
-    )
+    order_cancel_service.raise_if_provider_mismatch(result, order)
 
 
 # ============ FOLLOW-UP REFUND (CANCELLED ORDER) ============
@@ -623,106 +554,15 @@ def admin_cancel_order(
     - Paid online orders + refund_choice=later: cancel + restock, money
       stays captured, refundable balance left open and flagged.
     """
-    order = order_repo.get_order_by_id(session, order_id, for_update=True)
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Order not found"
-        )
-    if order.status in (OrderStatus.CANCELLED, OrderStatus.REFUNDED):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Order is already {order.status.value}",
-        )
-    if order.status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Order cannot be cancelled. Current status: {order.status.value}",
-        )
-    if not order.can_cancel:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Order cannot be cancelled. Current status: {order.status.value}",
-        )
-
-    paid_online = order.payment_method != "cod" and order.payment_status == "paid"
-    if paid_online and data.refund_choice == "now":
-        # Refuse before staging cancellation, restock or audit changes.
-        refund_service.assert_refund_permission(session, current_user)
-
-    status_at_cancel = order.status
-    order.status = OrderStatus.CANCELLED
-    order.cancellation_reason = data.reason
-    order.cancelled_at = datetime.now(timezone.utc)
-    session.add(order)
-
-    if data.restock:
-        restore_stock(session, order)
-    if data.notify_customer:
-        enqueue_order_email(session, order, "order_cancelled")
-
-    _audit(
-        session, request, "order.cancelled", "order", order.id,
-        current_user,
-        before={"status": status_at_cancel.value},
-        after={"status": "cancelled", "reason": data.reason,
-               "refund_choice": data.refund_choice},
+    return order_cancel_service.cancel_order_as_admin(
+        session,
+        order_id=order_id,
+        actor=current_user,
+        reason=data.reason,
+        refund_choice=data.refund_choice,
+        restock=data.restock,
+        notify_customer=data.notify_customer,
+        idempotency_key=data.idempotency_key,
+        request=request,
+        commit=True,
     )
-
-    refund_info: dict | None = None
-    paid_online = (
-        order.payment_method != "cod" and order.payment_status == "paid"
-    )
-    if paid_online and data.refund_choice == "now":
-        result = refund_service.request_admin_refund(
-            session,
-            order,
-            requested_by=current_user,
-            reason=data.reason,
-            idempotency_key=data.idempotency_key,
-            status_at=status_at_cancel,
-            notify_customer=data.notify_customer,
-            commit=False,
-        )
-        refund_info = result
-        _raise_if_provider_mismatch(result, order)
-        _audit(
-            session, request,
-            "refund.approval_requested"
-            if result.get("requires_approval") else "refund.executed",
-            "refund", result.get("refund_row_id") or order.id,
-            current_user,
-            after={"amount": str(result.get("amount")),
-                   "requires_approval": result.get("requires_approval")},
-        )
-    elif paid_online:
-        refund_info = {
-            "processed": False,
-            "requires_approval": False,
-            "message": (
-                "Order cancelled without refund (refund later). "
-                "The refundable balance is left open — follow up to avoid "
-                "a chargeback on captured funds."
-            ),
-        }
-
-    session.commit()
-    session.refresh(order)
-
-    # Customer notification (non-fatal).
-    try:
-        if data.notify_customer:
-            notification_repo.notify_customer_status_changed(
-                session, order, order.status.value
-            )
-            notification_repo.notify_admins_order_cancelled(session, order)
-            session.commit()
-    except Exception as e:
-        session.rollback()
-        print(f"Failed to send admin-cancel notifications: {e}")
-
-    return {
-        "order_id": str(order.id),
-        "order_number": order.order_number,
-        "status": order.status.value,
-        "refund": refund_info,
-    }

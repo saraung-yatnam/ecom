@@ -12,8 +12,9 @@ def production(**overrides):
     values = dict(ENVIRONMENT="production", DATABASE_URL="postgresql://test:test@localhost/release",
                   JWT_SECRET_KEY="a-unique-release-secret-at-least-32-characters", CORS_ORIGINS="https://shop.example.com,https://admin.example.com",
                   PAYMENT_PROVIDER="stripe", STRIPE_SECRET_KEY="secret", STRIPE_PUBLISHABLE_KEY="public", STRIPE_WEBHOOK_SECRET="webhook",
-                  SHIPPING_PROVIDER="shiprocket", SHIPROCKET_EMAIL="shipping@example.com", SHIPROCKET_PASSWORD="password", SHIPROCKET_WEBHOOK_TOKEN="shipping-token",
-                  EMAIL_PROVIDER="gmail", GMAIL_ADDRESS="mail@example.com", GMAIL_APP_PASSWORD="app-password",
+                   SHIPPING_PROVIDER="shiprocket", SHIPROCKET_EMAIL="shipping@example.com", SHIPROCKET_PASSWORD="password", SHIPROCKET_WEBHOOK_TOKEN="shipping-token",
+                   CLOUDINARY_CLOUD_NAME="test-cloud", CLOUDINARY_API_KEY="test-key", CLOUDINARY_API_SECRET="test-secret",
+                   EMAIL_PROVIDER="gmail", GMAIL_ADDRESS="mail@example.com", GMAIL_APP_PASSWORD="app-password",
                   GROQ_API_KEY="chat-key", FRONTEND_URL="https://shop.example.com", ADMIN_FRONTEND_URL="https://admin.example.com")
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -29,6 +30,7 @@ def production(**overrides):
     ({"SHIPROCKET_WEBHOOK_TOKEN": " "}, "SHIPROCKET_WEBHOOK_TOKEN"),
     ({"GMAIL_APP_PASSWORD": " "}, "Gmail"),
     ({"GROQ_API_KEY": ""}, "GROQ_API_KEY"),
+    ({"CLOUDINARY_API_SECRET": ""}, "CLOUDINARY_API_SECRET"),
     ({"FRONTEND_URL": "http://localhost:3000"}, "FRONTEND_URL"),
 ])
 def test_missing_production_configuration_fails_closed(overrides, expected):
@@ -103,7 +105,7 @@ def test_new_migrations_form_one_ordered_head():
     from app.core.release import ROOT
     scripts = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
     expected = ["n9b0c1d2e3f4", "o0c1d2e3f4a5", "p1d2e3f4a5b6", "q2e3f4a5b6c7",
-                "r3f4a5b6c7d8", "s4a5b6c7d8e9", "t5b6c7d8e9f0", "u6c7d8e9f0a1", "v7d8e9f0a1b2", "w8e9f0a1b2c3", "x9f0a1b2c3d4"]
+                "r3f4a5b6c7d8", "s4a5b6c7d8e9", "t5b6c7d8e9f0", "u6c7d8e9f0a1", "v7d8e9f0a1b2", "w8e9f0a1b2c3", "x9f0a1b2c3d4", "y0a1b2c3d4e5"]
     assert migration_heads() == (expected[-1],)
     for parent, child in zip(expected, expected[1:]):
         assert scripts.get_revision(child).down_revision == parent

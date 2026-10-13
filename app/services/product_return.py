@@ -5,10 +5,9 @@ to the existing authority, ledger and provider-recovery pipeline.
 """
 import hashlib
 import json
-import os
 from datetime import timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from sqlalchemy import func, or_, select
@@ -23,7 +22,7 @@ from app.models.refund import Refund, RefundStatus
 from app.models.user import User
 from app.repositories import audit, order as order_repo, rbac
 from app.services import refund_service
-from app.services.return_evidence import evidence_path
+from app.services.cloudinary_service import upload_image
 from app.services.shipping_status import map_shiprocket_status, normalize_location, normalize_status
 
 RELEASED = (ReturnStatus.REJECTED, ReturnStatus.CANCELLED)
@@ -188,16 +187,13 @@ def attach_evidence(session, row, actor, images, written):
     if existing + len(images) > settings.RETURN_MAX_IMAGES:
         raise HTTPException(422, f"At most {settings.RETURN_MAX_IMAGES} images are allowed")
     for image in images:
-        evidence = ReturnEvidence(return_id=row.id, uploaded_by=actor.id, storage_key="",
-                                  filename=image["filename"], size_bytes=len(image["blob"]), sha256=image["hash"])
-        evidence.storage_key = evidence.id.hex + ".jpg"
-        path = evidence_path(evidence.storage_key)
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with path.open("xb") as file:
-            # Track only a file we actually created, never an existing collision.
-            written.append(path)
-            os.fchmod(file.fileno(), 0o600)
-            file.write(image["blob"])
+        uploaded = upload_image(image["blob"], folder=f"com/returns/{row.id}", private=True, filename=image["filename"])
+        written.append({"public_id": uploaded["public_id"], "private": True})
+        evidence = ReturnEvidence(return_id=row.id, uploaded_by=actor.id, storage_key=uuid4().hex,
+                                   filename=image["filename"], size_bytes=len(image["blob"]), sha256=image["hash"])
+        evidence.secure_url = uploaded["secure_url"]
+        evidence.cloudinary_public_id = uploaded["public_id"]
+        evidence.cloudinary_type = uploaded.get("type")
         session.add(evidence)
 
 

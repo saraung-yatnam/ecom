@@ -114,11 +114,16 @@ def _request():
     return types.SimpleNamespace(base_url="http://testserver/")
 
 
-def test_5_upload_accepts_and_warns_on_aspect(seeded):
+def test_5_upload_accepts_and_warns_on_aspect(seeded, monkeypatch):
     import asyncio as _asyncio
 
     from fastapi import HTTPException
     from app.api.v1.admin import content as admin_content
+    monkeypatch.setattr(admin_content, "upload_image", lambda blob, folder, filename: {
+        "secure_url": "https://res.cloudinary.com/test/image/upload/banner.jpg",
+        "public_id": f"{folder}/banner",
+        "bytes": len(blob),
+    })
 
     def _call(slot, upload):
         return _asyncio.new_event_loop().run_until_complete(
@@ -127,7 +132,7 @@ def test_5_upload_accepts_and_warns_on_aspect(seeded):
 
     # 800x80 PNG for the strip: correct 10:1, no warning.
     res = _call("announcement.bar", _upload_file("strip.png", _png(800, 80)))
-    assert res.url.startswith("http://testserver/uploads/content/")
+    assert res.url.startswith("https://res.cloudinary.com/test/")
     assert (res.width, res.height) == (800, 80)
     assert res.aspect_warning is None
 

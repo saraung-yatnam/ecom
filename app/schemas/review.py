@@ -32,6 +32,17 @@ class ReviewRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     user_full_name: str | None = None
+    images: list["ReviewImageRead"] = Field(default_factory=list)
+
+
+class ReviewImageRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    review_id: UUID
+    secure_url: str
+    filename: str
+    sort_order: int
 
 
 class AdminReviewRead(ReviewRead):

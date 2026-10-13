@@ -20,6 +20,8 @@ PERMISSIONS: list[tuple[str, str, str, str]] = [
     ("products.update", "Update products", "products", "Edit products, variants and bulk status"),
     ("products.delete", "Delete products", "products", "Delete products (single + bulk)"),
     ("products.export", "Export products", "products", "Export product catalog"),
+    ("products.manage_prices", "Manage product prices", "products", "Change product and variant prices"),
+    ("inventory.adjust", "Adjust inventory", "inventory", "Adjust variant stock levels"),
     ("product_images.manage", "Manage product images", "products", "Add/update/delete/reorder product images"),
     # Categories
     ("categories.view", "View categories", "categories", "List categories in admin"),
@@ -61,6 +63,8 @@ _MANAGER_PERMS: list[str] = [
     "products.view",
     "products.create",
     "products.update",
+    "products.manage_prices",
+    "inventory.adjust",
     "product_images.manage",
     "categories.view",
     "categories.manage",

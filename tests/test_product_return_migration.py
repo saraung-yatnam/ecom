@@ -15,15 +15,20 @@ from app.models.product_return import ReturnReason, ReturnRequest
 
 NEW = {"return_requests", "return_items", "return_evidence", "return_events"}
 FIELDS = {"return_request_id", "manual_transfer_reference"}
+CLOUDINARY_FIELDS = {"secure_url", "cloudinary_public_id", "cloudinary_type"}
 
 
 def feature_only(obj, name, kind, reflected, compare_to):
+    if kind == "column" and name in CLOUDINARY_FIELDS:
+        return False
+    if kind == "index" and "cloudinary_public_id" in name:
+        return False
     if kind == "table":
         return name in NEW or name == "refunds"
     if obj.table.name in NEW:
         return True
     if kind == "column":
-        return name in FIELDS
+        return name in FIELDS or name in CLOUDINARY_FIELDS
     return bool(set(obj.columns.keys()) & FIELDS)
 
 

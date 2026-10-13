@@ -4,7 +4,8 @@ from app.core.config import settings
 engine = create_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,   # drops dead connections instead of erroring
-    echo=settings.ENVIRONMENT == "development",
+    # echo=settings.ENVIRONMENT == "development",
+    echo=False,
 )
 
 

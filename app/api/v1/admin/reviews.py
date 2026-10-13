@@ -18,6 +18,7 @@ from app.schemas.review import (
     ReviewListResponse,
     ReviewVisibilityUpdate,
 )
+from app.services.cloudinary_service import delete_image
 
 router = APIRouter(prefix="/admin/reviews", tags=["Admin Reviews"])
 
@@ -102,6 +103,7 @@ def set_review_visibility(
         is_hidden=fresh.is_hidden,
         created_at=fresh.created_at,
         updated_at=fresh.updated_at,
+        images=review_repo.get_review_images(session, fresh.id),
     )
 
 
@@ -124,6 +126,11 @@ def delete_review(
         "rating": review.rating,
         "title": review.title,
     }
+    images = review_repo.get_review_images(session, review.id)
+    public_ids = [image.cloudinary_public_id for image in images]
+    for image in images:
+        session.delete(image)
+    session.flush()
     review_repo.delete_review(session, review, commit=False)
     audit_repo.log_and_commit(
         session,
@@ -134,4 +141,6 @@ def delete_review(
         before=snapshot,
         ip_address=audit_repo.client_ip(request),
     )
+    for public_id in public_ids:
+        delete_image(public_id)
     return None

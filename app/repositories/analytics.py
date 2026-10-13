@@ -431,3 +431,268 @@ def get_dashboard_stats(
             "total_products": total_products,
         },
     }
+
+
+def revenue_totals(
+    session: Session,
+    from_date: date,
+    to_date: date,
+) -> dict:
+    """Single-row revenue totals (same scope as get_revenue_report)."""
+    row = session.exec(
+        select(
+            func.sum(net_sale_amount()).label("net_revenue"),
+            func.sum(Order.grand_total).label("gross"),
+            func.sum(Order.discount_total).label("discounts"),
+            func.sum(Order.tax_total).label("tax"),
+            func.sum(Order.shipping_total).label("shipping"),
+            func.sum(Order.refund_amount).label("refunds"),
+            func.count(Order.id).label("orders"),
+        ).where(
+            *date_filters(Order.placed_at, from_date, to_date), settled_sale(),
+        )
+    ).first()
+    return {
+        "net_revenue": float(row[0] or 0),
+        "gross": float(row[1] or 0),
+        "discounts": float(row[2] or 0),
+        "tax": float(row[3] or 0),
+        "shipping": float(row[4] or 0),
+        "refunds": float(row[5] or 0),
+        "orders": row[6] or 0,
+    }
+
+
+def payment_status_summary(
+    session: Session,
+    from_date: date,
+    to_date: date,
+) -> list[dict]:
+    """Payment rows grouped by status for orders placed in range.
+
+    Counts payment records (multi-attempt orders contribute multiple rows),
+    attributed to the order's placed date. Amounts are what the rows state,
+    not proof of settlement — see collected revenue in revenue_totals.
+    """
+    from app.models.payment import Payment
+
+    rows = session.exec(
+        select(
+            Payment.status,
+            func.count(Payment.id),
+            func.coalesce(func.sum(Payment.amount), 0),
+        )
+        .join(Order, Payment.order_id == Order.id)
+        .where(*date_filters(Order.placed_at, from_date, to_date))
+        .group_by(Payment.status)
+        .order_by(Payment.status)
+    ).all()
+    return [
+        {
+            "status": getattr(row[0], "value", str(row[0])),
+            "count": row[1] or 0,
+            "amount": float(row[2] or 0),
+        }
+        for row in rows
+    ]
+
+
+def refund_ledger_summary(
+    session: Session,
+    from_date: date,
+    to_date: date,
+) -> list[dict]:
+    """Refund ledger rows grouped by status (created in range)."""
+    from app.models.refund import Refund
+
+    rows = session.exec(
+        select(
+            Refund.status,
+            func.count(Refund.id),
+            func.coalesce(func.sum(Refund.amount), 0),
+        )
+        .where(*date_filters(Refund.created_at, from_date, to_date))
+        .group_by(Refund.status)
+        .order_by(Refund.status)
+    ).all()
+    return [
+        {
+            "status": getattr(row[0], "value", str(row[0])),
+            "count": row[1] or 0,
+            "amount": float(row[2] or 0),
+        }
+        for row in rows
+    ]
+
+
+def category_sales(
+    session: Session,
+    limit: int = 10,
+    from_date: date | None = None,
+    to_date: date | None = None,
+) -> list[dict]:
+    """Revenue/units rolled up to categories (same proration as top products)."""
+    from app.models.category import Category
+
+    item_totals = select(OrderItem.order_id, func.sum(OrderItem.line_total).label("total")) \
+        .group_by(OrderItem.order_id).subquery()
+    discounted = item_totals.c.total - Order.discount_total
+    discount_ratio = case((discounted > 0, discounted / func.nullif(item_totals.c.total, 0)), else_=0)
+    refund_ratio = net_sale_amount() / func.nullif(Order.grand_total, 0)
+    merchandise_revenue = OrderItem.line_total * discount_ratio * refund_ratio
+    rows = session.exec(
+        select(
+            Category.id,
+            Category.name,
+            func.coalesce(func.sum(OrderItem.quantity), 0).label("units"),
+            func.coalesce(func.sum(merchandise_revenue), 0).label("revenue"),
+            func.count(Order.id.distinct()).label("orders"),
+        )
+        .select_from(Category)
+        .join(Product, Product.category_id == Category.id)
+        .join(ProductVariant, ProductVariant.product_id == Product.id)
+        .join(OrderItem, OrderItem.variant_id == ProductVariant.id)
+        .join(Order, OrderItem.order_id == Order.id)
+        .join(item_totals, item_totals.c.order_id == Order.id)
+        .where(*date_filters(Order.placed_at, from_date, to_date), settled_sale())
+        .group_by(Category.id, Category.name)
+        .order_by(func.sum(merchandise_revenue).desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "category_id": str(row[0]),
+            "category_name": row[1],
+            "units_sold": int(row[2] or 0),
+            "revenue": float(row[3] or 0),
+            "order_count": int(row[4] or 0),
+        }
+        for row in rows
+    ]
+
+
+def slow_products(
+    session: Session,
+    days: int = 30,
+    limit: int = 20,
+) -> list[dict]:
+    """Products with zero settled units in the last `days` days.
+
+    Includes last settled sale date (None when never sold) so "no recent
+    sales" and "never sold" stay distinguishable. DB-side throughout.
+    """
+    today = datetime.now(timezone.utc).date()
+    window_start = today - timedelta(days=max(days - 1, 0))
+    settled_units = (
+        select(
+            Product.id.label("product_id"),
+            func.sum(OrderItem.quantity).label("units"),
+            func.max(Order.placed_at).label("last_sale"),
+        )
+        .select_from(Product)
+        .join(ProductVariant, ProductVariant.product_id == Product.id)
+        .join(OrderItem, OrderItem.variant_id == ProductVariant.id)
+        .join(Order, OrderItem.order_id == Order.id)
+        .where(
+            *date_filters(Order.placed_at, window_start, today), settled_sale(),
+        )
+        .group_by(Product.id)
+        .subquery()
+    )
+    rows = session.exec(
+        select(
+            Product.id,
+            Product.name,
+            Product.slug,
+            settled_units.c.last_sale,
+        )
+        .select_from(Product)
+        .outerjoin(settled_units, settled_units.c.product_id == Product.id)
+        .where(
+            Product.is_active.is_(True),
+            func.coalesce(settled_units.c.units, 0) == 0,
+        )
+        .order_by(Product.name.asc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "product_id": str(row[0]),
+            "product_name": row[1],
+            "product_slug": row[2],
+            "last_sale_date": str(row[3].date()) if row[3] is not None else None,
+            "window_days": days,
+        }
+        for row in rows
+    ]
+
+
+def declining_products(
+    session: Session,
+    days: int = 7,
+    min_prior_units: int = 5,
+    drop_ratio: float = 0.5,
+    limit: int = 20,
+) -> list[dict]:
+    """Products whose settled units fell by >= drop_ratio vs the prior window.
+
+    Compares [today-days+1, today] against the equal-length window before
+    it; only products with >= min_prior_units prior units qualify, so the
+    percentage is meaningful. Transparent arithmetic, DB-side.
+    """
+    today = datetime.now(timezone.utc).date()
+    cur_start = today - timedelta(days=max(days - 1, 0))
+    prev_start = cur_start - timedelta(days=days)
+    prev_end = cur_start - timedelta(days=1)
+
+    def units_in(start, end):
+        return (
+            select(
+                Product.id.label("product_id"),
+                func.sum(OrderItem.quantity).label("units"),
+            )
+            .select_from(Product)
+            .join(ProductVariant, ProductVariant.product_id == Product.id)
+            .join(OrderItem, OrderItem.variant_id == ProductVariant.id)
+            .join(Order, OrderItem.order_id == Order.id)
+            .where(*date_filters(Order.placed_at, start, end), settled_sale())
+            .group_by(Product.id)
+            .subquery()
+        )
+
+    cur, prev = units_in(cur_start, today), units_in(prev_start, prev_end)
+    rows = session.exec(
+        select(
+            Product.id,
+            Product.name,
+            func.coalesce(prev.c.units, 0).label("prior_units"),
+            func.coalesce(cur.c.units, 0).label("recent_units"),
+        )
+        .select_from(Product)
+        .outerjoin(prev, prev.c.product_id == Product.id)
+        .outerjoin(cur, cur.c.product_id == Product.id)
+        .where(
+            Product.is_active.is_(True),
+            func.coalesce(prev.c.units, 0) >= min_prior_units,
+            func.coalesce(cur.c.units, 0)
+            <= func.coalesce(prev.c.units, 0) * (1.0 - drop_ratio),
+        )
+        .order_by(
+            (func.coalesce(prev.c.units, 0) - func.coalesce(cur.c.units, 0)).desc()
+        )
+        .limit(limit)
+    ).all()
+    out = []
+    for row in rows:
+        prior, recent = int(row[2] or 0), int(row[3] or 0)
+        out.append(
+            {
+                "product_id": str(row[0]),
+                "product_name": row[1],
+                "prior_units": prior,
+                "recent_units": recent,
+                "drop_pct": round((prior - recent) / prior * 100, 1) if prior else 0.0,
+                "window_days": days,
+            }
+        )
+    return out

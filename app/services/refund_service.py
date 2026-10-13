@@ -777,6 +777,68 @@ def _ledger_suffix() -> str:
     return uuid4().hex[:8]
 
 
+def get_attention_queue(session: Session, limit: int = 100) -> dict:
+    """Cancelled paid-online orders holding captured money, no refund in flight.
+
+    Shared by the REST attention route and MCP inspection: only cancelled
+    orders qualify (a delivered order with nothing refunded is normal, not
+    work to do); fee-retained fully-covered orders and orders with a
+    pending approval are excluded. Read-only: no ledger rows, no PSP calls.
+    """
+    from sqlmodel import col, select
+
+    candidates = session.exec(
+        select(Order).where(
+            Order.status == OrderStatus.CANCELLED,
+            Order.payment_method != "cod",
+            Order.payment_status == "paid",
+        )
+        .order_by(col(Order.placed_at).desc())
+        .limit(limit * 2)  # over-fetch: some drop out below
+    ).all()
+
+    items = []
+    for order in candidates:
+        refunded = order.refund_amount or Decimal(0)
+        # Policy-aware remainder: the restocking fee (keyed on the
+        # pre-cancel status) is retained revenue, not owed money. Without
+        # this, every fee-retained order would sit in the queue forever
+        # with no valid action (any refund attempt answers "Nothing to
+        # refund").
+        policy = calculate_refund(
+            order, status_at_cancellation(session, order)
+        )
+        remaining = policy["refund_amount"]
+        if remaining <= 0:
+            continue
+        pending, _ = refund_repo.list_refunds(
+            session, skip=0, limit=1, order_id=order.id,
+            status=RefundStatus.PENDING_APPROVAL,
+        )
+        if pending:
+            continue
+        customer = order.customer_details
+        items.append({
+            "order_id": str(order.id),
+            "order_number": order.order_number,
+            "status": order.status.value,
+            "customer_email": customer.email if customer else None,
+            "customer_name": (
+                customer.full_name or customer.username
+            ) if customer else None,
+            "grand_total": float(order.grand_total or 0),
+            "refunded": float(refunded),
+            "remaining": float(remaining),
+            "cancelled_at": (
+                order.cancelled_at.isoformat() if order.cancelled_at else None
+            ),
+            "cancellation_reason": order.cancellation_reason,
+        })
+        if len(items) >= limit:
+            break
+    return {"count": len(items), "orders": items}
+
+
 def approve_refund(
     session: Session, ledger: Refund, approver: User, *, commit: bool = True
 ) -> dict:
