@@ -22,6 +22,7 @@ from app.mcp.guards import (
     require_mcp_perm,
 )
 from app.repositories import analytics as analytics_repo
+from app.repositories import product_image as product_image_repo
 
 try:
     from mcp.server.mcpserver.context import Context
@@ -251,7 +252,13 @@ async def product_performance(
     slow (zero settled sales in window) | declining (recent drop vs prior).
 
     Top views rank the full window server-side (up to 200 rows) before
-    taking the requested top N, so rank order is exact.
+    taking the requested top N, so rank order is exact. Top rows carry
+    `image_url` (primary image, one extra query — same pattern as the
+    dashboard widget) so chat cards can render; a product card renders
+    automatically from returned product rows — describe in text, never
+    paste image URLs or markdown images yourself. Always let this tool
+    run before describing ranked products, even when names are already
+    in context, so the cards render every time.
     """
     denied = _check_auth(ctx, token)
     if denied is not None:
@@ -279,6 +286,20 @@ async def product_performance(
                 session, limit=200, from_date=start, to_date=today)
             key = "total_quantity_sold" if cleaned_view == "top_units" else "total_revenue"
             rows = sorted(rows, key=lambda r: (r[key] or 0), reverse=True)[:eff_limit]
+            # Primary thumbnails, one extra query (dashboard-widget pattern).
+            try:
+                from uuid import UUID as _UUID
+                thumbs = product_image_repo.get_first_images_for_products(
+                    session,
+                    [_UUID(r["product_id"]) for r in rows if r.get("product_id")],
+                )
+            except Exception:
+                thumbs = {}
+            for r in rows:
+                try:
+                    r["image_url"] = thumbs.get(_UUID(r["product_id"]))
+                except Exception:
+                    r["image_url"] = None
             return {
                 "success": True,
                 "view": cleaned_view,

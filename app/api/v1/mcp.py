@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, TokenPayload, _assert_admin_audience, oauth2_scheme
+from app.core.config import settings
 from app.mcp.agent import run_chat
 
 router = APIRouter(prefix="/mcp", tags=["MCP Agent"])
@@ -49,6 +50,33 @@ class McpChatResponse(BaseModel):
     reply: str
     tools_used: list[str] = []
     pending_action: dict | None = None
+    product_cards: list[dict] = []
+
+
+def resolve_mcp_url(request_base_url: str) -> str:
+    """Loopback origin for the agent's internal MCP hop.
+
+    Defaults to our own request origin (correct on localhost). Behind
+    tunnels/proxies with a public Host, MCP_LOOPBACK_URL pins it local
+    so the hop never traverses the tunnel edge.
+    """
+    override = (settings.MCP_LOOPBACK_URL or "").strip()
+    if override:
+        from urllib.parse import urlparse
+
+        parts = urlparse(override if "://" in override else f"http://{override}")
+        if parts.scheme == "https" and (parts.hostname or "") in (
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        ):
+            raise ValueError(
+                "MCP_LOOPBACK_URL uses https:// for a localhost target, but "
+                "local uvicorn serves plain HTTP — use http://127.0.0.1:8001/mcp/"
+            )
+        return override.rstrip("/") + "/"
+    base = request_base_url if request_base_url.endswith("/") else request_base_url + "/"
+    return f"{base}mcp/"
 
 
 def llm_group_detail(eg: BaseExceptionGroup) -> str | None:
@@ -82,7 +110,7 @@ async def mcp_chat(
 
     # Same process serves /mcp, so loop back to our own origin instead of
     # hardcoding a host/port. request.base_url ends with "/".
-    mcp_url = f"{request.base_url}mcp/"
+    mcp_url = resolve_mcp_url(str(request.base_url))
 
     try:
         result = await run_chat(
@@ -101,16 +129,26 @@ async def mcp_chat(
         ) from exc
     except BaseExceptionGroup as eg:
         # anyio wraps errors raised inside the MCP client's task group.
+        # Log every sub-exception server-side: the group repr alone
+        # ("1 sub-exception") never says what actually failed.
         detail = llm_group_detail(eg)
+        sub = "; ".join(
+            f"{type(e).__name__}: {e}" for e in getattr(eg, "exceptions", [])
+        )
+        print(f"❌ MCP transport failed [{mcp_url}]: {sub or eg}")
         if detail is not None:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY, detail=detail
             ) from eg
-        raise
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Agent transport failed",
+        ) from eg
     return McpChatResponse(
         reply=result["reply"],
         tools_used=result["tools_used"],
         pending_action=result.get("pending_action"),
+        product_cards=result.get("product_cards") or [],
     )
 
 

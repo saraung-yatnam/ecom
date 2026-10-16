@@ -304,7 +304,8 @@ def test_registered_tools():
     assert names == {"whoami", "check_orders_view", "get_order", "list_orders", "cancel_order", "issue_refund",
                       "list_products", "get_product", "compare_products", "update_product",
                       "update_product_price", "delete_product", "check_stock",
-                      "check_product_inventory", "adjust_stock", "list_low_stock_products",
+                      "check_product_inventory", ""
+                      "k", "list_low_stock_products",
                       "sales_summary", "sales_trend", "product_performance",
                       "get_payment_status", "list_refunds", "list_payment_issues",
                       "get_refund_status"}

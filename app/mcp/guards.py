@@ -37,8 +37,10 @@ ORDERS_UPDATE = "orders.update"
 # app/api/v1/admin/refunds.py:refund_cancelled_order (require_perm("orders.refund")).
 ORDERS_REFUND = "orders.refund"
 
-# Product/inventory permissions gating the MCP product tools. Mirror the
-# REST guards in app/api/v1/product.py and app/api/v1/admin/products.py.
+# Product/inventory permissions gating the MCP product tools. The agent
+# mirrors the UI keys: stock and prices are edited through the product
+# endpoints (products.update), so the stock/price tools accept that key
+# OR the narrower specialist key (inventory.adjust / manage_prices).
 PRODUCTS_VIEW = "products.view"
 PRODUCTS_UPDATE = "products.update"
 PRODUCTS_DELETE = "products.delete"
@@ -91,6 +93,41 @@ def require_mcp_perm(
 
     with Session(engine) as session:
         allowed = user_has_permission(session, user_id, permission)
+
+    if not allowed:
+        raise MCPForbiddenError("Insufficient permissions")
+
+    return user_info, payload
+
+
+def require_mcp_perm_any(
+    ctx: Any | None = None,
+    token: str | None = None,
+    *permissions: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Same as require_mcp_perm but passes when the user holds ANY key.
+
+    Used where the agent must mirror the UI: e.g. stock lives on the
+    variant edited via products.update, so adjust_stock accepts
+    products.update OR inventory.adjust. Revoking every listed key still
+    blocks both paths together.
+    """
+    user_info, payload = require_mcp_user(ctx, token)
+
+    try:
+        _assert_admin_audience(payload)
+    except HTTPException as exc:
+        raise MCPForbiddenError(str(exc.detail or "Insufficient permissions"))
+
+    user_id = parse_user_id(user_info)
+    if user_id is None:
+        raise MCPAuthError("Could not validate credentials")
+
+    with Session(engine) as session:
+        allowed = any(
+            user_has_permission(session, user_id, permission)
+            for permission in permissions
+        )
 
     if not allowed:
         raise MCPForbiddenError("Insufficient permissions")

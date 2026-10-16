@@ -360,10 +360,14 @@ def test_price_validation_and_variant(env):
     assert res["success"] is True and res["variant"]["sku"] == "MCP-SKU-2"
 
 
-def test_price_perm_least_privilege(env):
-    # staff holds products.update on REST but NOT the MCP price key
-    res = run(mcp_products.update_product_price(
+def test_price_perm_mirrors_ui(env):
+    # staff holds products.update (the UI price-edit key), so the agent
+    # allows them too; customers holding nothing are still refused.
+    pre = run(mcp_products.update_product_price(
         env["ids"]["p1"], price="10.00", token=env["staff"]))
+    assert pre["success"] is True and pre["requires_confirmation"] is True
+    res = run(mcp_products.update_product_price(
+        env["ids"]["p1"], price="10.00", token=env["customer"]))
     assert res == {"success": False, "error": "Insufficient permissions"}
 
 
@@ -414,8 +418,13 @@ def test_adjust_validation(env):
         "MCP-SKU-2", 0, reason="x", token=env["manager"]))["error"]
     assert "reason is required" in run(mcp_inventory.adjust_stock(
         "MCP-SKU-2", 1, reason="  ", token=env["manager"]))["error"]
+    # staff holds products.update (the UI stock-edit key) so the agent
+    # allows them; the customer holding nothing is still refused.
+    pre = run(mcp_inventory.adjust_stock(
+        "MCP-SKU-2", 1, reason="x", token=env["staff"]))
+    assert pre["success"] is True and pre["requires_confirmation"] is True
     assert run(mcp_inventory.adjust_stock(
-        "MCP-SKU-2", 1, reason="x", token=env["staff"])) == {
+        "MCP-SKU-2", 1, reason="x", token=env["customer"])) == {
         "success": False, "error": "Insufficient permissions"}
 
 

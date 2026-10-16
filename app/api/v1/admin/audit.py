@@ -47,6 +47,7 @@ def list_audit_entries(
     limit: int = Query(default=20, ge=1, le=100),
     action: str | None = Query(default=None),
     entity: str | None = Query(default=None),
+    entity_id: UUID | str | None = Query(default=None),
     actor_id: UUID | None = Query(default=None),
 ):
     """List audit entries, newest first (requires reports.view).
@@ -67,6 +68,7 @@ def list_audit_entries(
         limit=limit,
         action=action,
         entity=entity,
+        entity_id=entity_id,
         actor_id=actor_id,
         exclude_entities=None if full_access else sorted(SENSITIVE_ENTITIES),
     )

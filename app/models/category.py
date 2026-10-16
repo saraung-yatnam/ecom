@@ -31,6 +31,14 @@ class Category(SQLModel, table=True):
         index=True,
     )
 
+    image_url: str | None = Field(default=None, max_length=1000)
+
+    image_public_id: str | None = Field(default=None, max_length=500)
+
+    is_active: bool = Field(default=True, index=True)
+
+    sort_order: int = Field(default=0)
+
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
     )

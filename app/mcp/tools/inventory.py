@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import Any
+from typing import Any, TypeAlias
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
@@ -22,8 +22,10 @@ from app.mcp.auth import MCPAuthError, parse_user_id
 from app.mcp.guards import (
     MCPForbiddenError,
     INVENTORY_ADJUST,
+    PRODUCTS_UPDATE,
     PRODUCTS_VIEW,
     require_mcp_perm,
+    require_mcp_perm_any,
 )
 from app.mcp.preview import (
     WRITE_PREVIEW_TTL_MINUTES,
@@ -32,12 +34,12 @@ from app.mcp.preview import (
 )
 from app.repositories import audit as audit_repo
 from app.repositories import product as product_repo
-from app.mcp.tools.products import _resolve_variant, _variant_summary
+from app.mcp.tools.products import _resolve_variant, _variant_summary, _product_summary
 
 try:
     from mcp.server.mcpserver.context import Context
 except Exception:  # pragma: no cover - type-checking fallback
-    Context = Any  # type: ignore[no-redef,misc]
+    Context: TypeAlias = Any
 
 
 DEFAULT_LIST_LIMIT = 20
@@ -157,6 +159,7 @@ def _fuzzy_stock_lookup(session: Session, ref: str) -> dict | None:
         return {
             "success": True,
             "variant": _variant_summary(variant),
+            "product": _product_summary(product, None),
             "product_name": product.name,
             "match": "fuzzy",
             "matched_on": sorted(set(hits)),
@@ -182,6 +185,7 @@ def _fuzzy_stock_lookup(session: Session, ref: str) -> dict | None:
     }
 
 
+
 async def check_stock(
     product_id: str | int | None = None,
     ctx: Context | None = None,
@@ -191,7 +195,11 @@ async def check_stock(
 
     Exact identifiers resolve directly; anything else falls back to a
     bounded product/variant word match (single result flagged
-    match=fuzzy, several returned as candidates)."""
+    match=fuzzy, several returned as candidates). A product card renders
+    automatically from returned product data — describe in text, never
+    paste image URLs or markdown images yourself. Always call a product
+    tool before describing any product, even when details are already in
+    context, so the card renders every time."""
     try:
         require_mcp_perm(ctx, token, PRODUCTS_VIEW)
     except MCPAuthError as exc:
@@ -211,6 +219,9 @@ async def check_stock(
             return {
                 "success": True,
                 "variant": _variant_summary(variant),
+                "product": _product_summary(variant.product, None)
+                if getattr(variant, "product", None) is not None
+                else None,
                 **money_envelope(),
             }
         try:
@@ -238,6 +249,7 @@ async def check_stock(
             "success": True,
             "product_id": str(product.id),
             "product_name": product.name,
+            "product": _product_summary(product, len(variants)),
             "variants": [_variant_summary(v) for v in variants],
             "total_stock": sum(int(v.stock) for v in variants),
             **money_envelope(),
@@ -357,9 +369,13 @@ async def adjust_stock(
     reason. Execution re-locks the variant row, re-checks the fingerprint
     (concurrent adjustments fail closed), floors at zero, and audits
     before/after. No RAG sync: stock is not catalog text.
+
+    Permission mirrors the UI: stock lives on the variant edited via
+    products.update, so that key (or the specialist inventory.adjust)
+    grants access — revoking both blocks page and agent together.
     """
     try:
-        user_info, _ = require_mcp_perm(ctx, token, INVENTORY_ADJUST)
+        user_info, _ = require_mcp_perm_any(ctx, token, PRODUCTS_UPDATE, INVENTORY_ADJUST)
     except MCPAuthError as exc:
         return exc.to_dict()
     except MCPForbiddenError as exc:

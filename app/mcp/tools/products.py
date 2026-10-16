@@ -30,6 +30,7 @@ from app.mcp.guards import (
     PRODUCTS_UPDATE,
     PRODUCTS_VIEW,
     require_mcp_perm,
+    require_mcp_perm_any,
 )
 from app.mcp.preview import (
     WRITE_PREVIEW_TTL_MINUTES,
@@ -56,6 +57,19 @@ MAX_COMPARE = 5
 UPDATE_ALLOWLIST = ("name", "description", "category_id", "is_active")
 
 
+def _primary_image_url(product) -> str | None:
+    """First product image URL (front-of-catalog), secure URL preferred."""
+    try:
+        images = sorted(product.images or [], key=lambda i: (i.sort_order or 0))
+    except Exception:
+        return None
+    for img in images:
+        url = getattr(img, "secure_url", None) or getattr(img, "url", None)
+        if url:
+            return url
+    return None
+
+
 def _product_summary(product: Product, variant_count: int | None = None) -> dict:
     return {
         "id": str(product.id),
@@ -66,6 +80,7 @@ def _product_summary(product: Product, variant_count: int | None = None) -> dict
         "is_active": bool(product.is_active),
         "category_id": str(product.category_id) if product.category_id else None,
         "variant_count": variant_count,
+        "image_url": _primary_image_url(product),
     }
 
 
@@ -132,6 +147,10 @@ async def list_products(
     sort_by is name | price | created_at, sort_dir asc | desc — sorting
     happens in PostgreSQL, so cheapest/most-expensive questions need one
     call (e.g. sort_by=price, sort_dir=asc, limit=1), never a page scan.
+    A product card renders automatically from returned product data —
+    describe in text, never paste image URLs or markdown images yourself.
+    Always call a product tool before describing any product, even when
+    details are already in context, so the card renders every time.
     """
     try:
         require_mcp_perm(ctx, token, PRODUCTS_VIEW)
@@ -188,7 +207,13 @@ async def get_product(
     ctx: Context | None = None,
     token: str | None = None,
 ) -> dict:
-    """Product detail by UUID, slug, or variant SKU (read-only)."""
+    """Product detail by UUID, slug, or variant SKU (read-only).
+
+    A product card renders automatically from the returned product —
+    describe in text, never paste image URLs or markdown images yourself.
+    Always call this tool before describing any product, even when details
+    are already in context, so the card renders every time.
+    """
     try:
         require_mcp_perm(ctx, token, PRODUCTS_VIEW)
     except MCPAuthError as exc:
@@ -404,9 +429,14 @@ async def update_product_price(
     ctx: Context | None = None,
     token: str | None = None,
 ) -> dict:
-    """Preview then change a product price or variant override (two-step)."""
+    """Preview then change a product price or variant override (two-step).
+
+    Permission mirrors the UI: prices are edited through the product
+    endpoints via products.update, so that key (or the specialist
+    products.manage_prices) grants access.
+    """
     try:
-        user_info, _ = require_mcp_perm(ctx, token, PRODUCTS_MANAGE_PRICES)
+        user_info, _ = require_mcp_perm_any(ctx, token, PRODUCTS_UPDATE, PRODUCTS_MANAGE_PRICES)
     except MCPAuthError as exc:
         return exc.to_dict()
     except MCPForbiddenError as exc:

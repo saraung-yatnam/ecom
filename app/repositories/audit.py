@@ -101,6 +101,7 @@ def list_entries(
     limit: int = 20,
     action: str | None = None,
     entity: str | None = None,
+    entity_id: UUID | str | None = None,
     actor_id: UUID | None = None,
     exclude_entities: list[str] | None = None,
 ) -> tuple[list[AdminAuditLog], int]:
@@ -111,6 +112,8 @@ def list_entries(
         statement = statement.where(AdminAuditLog.action == action)
     if entity:
         statement = statement.where(AdminAuditLog.entity == entity)
+    if entity_id is not None:
+        statement = statement.where(AdminAuditLog.entity_id == str(entity_id))
     if actor_id:
         statement = statement.where(AdminAuditLog.actor_id == actor_id)
     if exclude_entities:

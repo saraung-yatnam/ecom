@@ -350,6 +350,7 @@ def get_all_products_admin(
     limit: int = 20,
     search: str | None = None,
     is_active: bool | None = None,
+    category_id: UUID | None = None,
     sort_by: str = "created_at",
     sort_dir: str = "desc",
 ) -> tuple[list[Product], int]:
@@ -379,6 +380,9 @@ def get_all_products_admin(
     
     if is_active is not None:
         statement = statement.where(Product.is_active == is_active)
+
+    if category_id is not None:
+        statement = statement.where(Product.category_id == category_id)
     
     # Get total count
     count_statement = select(func.count()).select_from(statement.subquery())
@@ -396,21 +400,112 @@ def get_all_products_admin(
     return products, total
 
 
-def bulk_delete_products(session: Session, product_ids: list[UUID], *, commit: bool = True) -> int:
-    """Bulk delete products"""
+def bulk_delete_products(session: Session, product_ids: list[UUID], *, commit: bool = True) -> dict:
+    """Hard-delete products with dependent cleanup.
+
+    - BLOCKED (order history): products whose variants appear in any
+      order_items are never deleted — financial records must survive.
+    - Otherwise removes: cart items, wishlist entries, reviews (+ their
+      images), product images, variants, then the product row itself.
+    - External side effects (Cloudinary, RAG) are NOT done here — the
+      caller receives `cloudinary_public_ids` / `rag_product_ids` and
+      cleans those up after commit (same pattern as admin review delete).
+
+    Returns {"deleted": [id-str], "blocked": [{"id", "name", "reason"}],
+             "cloudinary_public_ids": [...], "rag_product_ids": [...]}.
+    """
+    from app.models.cart import CartItem
+    from app.models.order import OrderItem
+    from app.models.product_image import ProductImage
+    from app.models.review import Review
+    from app.models.review_image import ReviewImage
+    from app.models.wishlist import Wishlist
+
     if not product_ids:
-        return 0
-    
-    statement = select(Product).where(Product.id.in_(product_ids))
-    result = session.execute(statement)
-    products = result.scalars().all()
-    
-    count = len(products)
+        return {"deleted": [], "blocked": [],
+                "cloudinary_public_ids": [], "rag_product_ids": []}
+
+    statement = (
+        select(Product)
+        .where(Product.id.in_(product_ids))
+        .options(
+            selectinload(Product.images),
+            selectinload(Product.variants),
+        )
+    )
+    products = session.execute(statement).scalars().all()
+
+    deleted: list[str] = []
+    blocked: list[dict] = []
+    cloudinary_public_ids: list[str] = []
+    rag_product_ids: list[str] = []
+
     for product in products:
+        variant_ids = [v.id for v in product.variants]
+
+        # Financial history guard: never hard-delete an ordered product.
+        has_orders = False
+        if variant_ids:
+            has_orders = session.execute(
+                select(OrderItem.id).where(
+                    OrderItem.variant_id.in_(variant_ids)
+                ).limit(1)
+            ).first() is not None
+        if has_orders:
+            blocked.append({
+                "id": str(product.id),
+                "name": product.name,
+                "reason": "has order history",
+            })
+            continue
+
+        # Transient dependents: cart items + wishlist entries.
+        if variant_ids:
+            for item in session.execute(
+                select(CartItem).where(
+                    CartItem.variant_id.in_(variant_ids)
+                )
+            ).scalars().all():
+                session.delete(item)
+        for entry in session.execute(
+            select(Wishlist).where(Wishlist.product_id == product.id)
+        ).scalars().all():
+            session.delete(entry)
+
+        # Reviews (+ their images) are product-scoped: removed with it.
+        for review in session.execute(
+            select(Review).where(Review.product_id == product.id)
+        ).scalars().all():
+            for img in session.execute(
+                select(ReviewImage).where(
+                    ReviewImage.review_id == review.id
+                )
+            ).scalars().all():
+                if img.cloudinary_public_id:
+                    cloudinary_public_ids.append(img.cloudinary_public_id)
+                session.delete(img)
+            session.delete(review)
+
+        # Product images (DB rows now, Cloudinary after commit).
+        for img in product.images:
+            if isinstance(img, ProductImage) and img.cloudinary_public_id:
+                cloudinary_public_ids.append(img.cloudinary_public_id)
+            session.delete(img)
+
+        for variant in product.variants:
+            session.delete(variant)
+
         session.delete(product)
-    
+        deleted.append(str(product.id))
+        rag_product_ids.append(str(product.id))
+
     session.commit() if commit else session.flush()
-    return count
+    return {
+        "deleted": deleted,
+        "blocked": blocked,
+        "cloudinary_public_ids": cloudinary_public_ids,
+        "rag_product_ids": rag_product_ids,
+    }
 
 
 def bulk_update_product_status(session: Session, product_ids: list[UUID], is_active: bool, *, commit: bool = True) -> int:

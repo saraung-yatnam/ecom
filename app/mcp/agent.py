@@ -636,7 +636,12 @@ PRESENTATION_GUIDANCE = (
     "For order line items from get_order, list each item as "
     "'product_name × quantity @ unit_price = line_total' with variant_sku "
     "in parentheses; quote every value verbatim from items[] and never "
-    "substitute a catalog product or price guess."
+    "substitute a catalog product or price guess. "
+    "Keep answers compact: separate list items, numbered items, and table "
+    "rows with single newlines — never blank lines between them, one blank "
+    "line only between sections. Variant lists with 3 or more variants "
+    "render as a markdown table (SKU | attributes | price | stock), never "
+    "as spaced-out bullets."
 )
 # Short-term memory of the last successful list_orders page per user
 # (JWT subject). Lets stateless follow-ups like "show me the next 5"
@@ -1052,7 +1057,7 @@ async def _groq_complete(messages, tools, *, stage: str = "initial"):
             if attempt < len(delays):
                 wait = _retry_after_seconds(exc, delays[attempt])
                 print(
-                    f"MCP agent LLM transient failure at {where}, "
+                    f"MCP agent LLM transient failure at {where}, " 
                     f"retrying in {wait}s: {type(exc).__name__}: {exc}"
                 )
                 await asyncio.sleep(wait)
@@ -1091,6 +1096,120 @@ def _pending_action_summary(pending_action: dict | None) -> str | None:
         suffix = f" — {reason}" if reason else ""
         return f"Stock adjustment preview: SKU {sku} {signed}{span}{suffix}. Confirm to apply."
     return "A confirmation preview is ready — review the details and confirm to proceed."
+
+
+# Product cards for the chat UI. Whitelisted fields only (same rule as
+# pending_action): the frontend renders thumb + name + price + stock from
+# these — never raw tool internals, never LLM-written URLs.
+MAX_PRODUCT_CARDS = 4
+CARD_TOOLS = {
+    "get_product",
+    "list_products",
+    "compare_products",
+    "check_stock",
+    "check_product_inventory",
+    "product_performance",
+}
+
+
+def _to_product_card(product: dict | None, stock=None) -> dict | None:
+    if not isinstance(product, dict) or not product.get("id"):
+        return None
+    try:
+        stock_int = int(stock) if stock is not None else None
+    except (TypeError, ValueError):
+        stock_int = None
+    return {
+        "id": product.get("id"),
+        "name": product.get("name"),
+        "slug": product.get("slug"),
+        "price": product.get("price"),
+        "compare_at_price": product.get("compare_at_price"),
+        "image_url": product.get("image_url"),
+        "stock": stock_int,
+        "is_active": product.get("is_active"),
+    }
+
+
+def _card_candidates(tool_name: str, result: dict) -> list[tuple[dict, object]]:
+    """(product-dict, stock) pairs worth showing as chat cards."""
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return []
+    if tool_name == "get_product":
+        product = result.get("product")
+        if not isinstance(product, dict):
+            return []
+        total = None
+        try:
+            stocks = [
+                v.get("stock") for v in (product.get("variants") or [])
+                if isinstance(v, dict) and v.get("stock") is not None
+            ]
+            total = sum(int(s) for s in stocks) or None
+        except (TypeError, ValueError):
+            total = None
+        return [(product, total)]
+    if tool_name in ("list_products", "compare_products"):
+        products = result.get("products")
+        if isinstance(products, list):
+            return [(p, None) for p in products[:MAX_PRODUCT_CARDS]]
+        return []
+    if tool_name == "product_performance":
+        # Analytics rows use product_* keys (plus units sold, not stock —
+        # never mislabel units as stock, so stock stays None).
+        products = result.get("products")
+        cards = []
+        if isinstance(products, list):
+            for r in products[:MAX_PRODUCT_CARDS]:
+                if not isinstance(r, dict):
+                    continue
+                cards.append((
+                    {
+                        "id": r.get("product_id"),
+                        "name": r.get("product_name"),
+                        "slug": r.get("product_slug"),
+                        "price": r.get("average_price"),
+                        "image_url": r.get("image_url"),
+                        "is_active": r.get("is_active"),
+                    },
+                    None,
+                ))
+        return cards
+    if tool_name in ("check_stock", "check_product_inventory"):
+        product = result.get("product")
+        if isinstance(product, dict):
+            variant = result.get("variant")
+            stock = None
+            if isinstance(variant, dict) and variant.get("stock") is not None:
+                stock = variant.get("stock")
+            elif result.get("total_stock") is not None:
+                stock = result.get("total_stock")
+            return [(product, stock)]
+    return []
+
+
+def collect_product_cards(
+    tool_name: str,
+    result_data: dict,
+    product_cards: list,
+    seen_card_ids: set,
+) -> None:
+    """Append chat cards for a successful tool result (mutates in place).
+
+    Call for EVERY successful tool result — never gate on
+    requires_confirmation: read-only lookups never set that flag, and
+    gating collection on it silently attached zero cards forever.
+    """
+    if tool_name not in CARD_TOOLS or len(product_cards) >= MAX_PRODUCT_CARDS:
+        return
+    for product, stock in _card_candidates(tool_name, result_data):
+        card = _to_product_card(product, stock)
+        if card is None or card["id"] in seen_card_ids:
+            continue
+        seen_card_ids.add(card["id"])
+        product_cards.append(card)
+        if len(product_cards) >= MAX_PRODUCT_CARDS:
+            break
 
 
 def _today_context() -> str:
@@ -1160,11 +1279,21 @@ async def run_chat(
     user_key = _pagination_user_key(auth_token)
 
     http_client = httpx2.AsyncClient(
-        headers={"Authorization": f"Bearer {auth_token}"},
+        headers={
+            "Authorization": f"Bearer {auth_token}",
+            # ngrok free serves a browser-warning interstitial page to
+            # non-browser clients unless this header is present. The MCP
+            # loopback below calls our own public origin (request.base_url),
+            # so without it every tunneled chat turn dies parsing HTML.
+            # Harmless everywhere else (plain unknown header).
+            "ngrok-skip-browser-warning": "true",
+        },
         timeout=30.0,
     )
     tools_used: list[str] = []
     pending_action: dict | None = None
+    product_cards: list[dict] = []
+    seen_card_ids: set[str] = set()
     async with Client(streamable_http_client(mcp_url, http_client=http_client)) as mcp_client:
         listed = await mcp_client.list_tools()
         tools = _groq_tool_specs(listed.tools)
@@ -1270,6 +1399,14 @@ async def run_chat(
                 )
                 try:
                     result_data = json.loads(result_text)
+                    if not isinstance(result_data, dict):
+                        # Valid JSON but not an object (array/scalar) — never
+                        # let .get() below turn it into a 500; degrade to a
+                        # plain tool error the model can react to instead.
+                        result_data = {
+                            "success": False,
+                            "error": "Tool returned an unexpected shape",
+                        }
                     if result_data.get("success") is False:
                         if result_data.get("retryable") is True:
                             retry_counts[retry_key] = retry_counts.get(retry_key, 0) + 1
@@ -1327,6 +1464,10 @@ async def run_chat(
                                 )
                                 pending_action["reason"] = result_data.get("reason")
                                 pending_action["consequence"] = result_data.get("consequence")
+                        # Product cards for the chat UI (see collect_product_cards:
+                        # deliberately outside requires_confirmation — read
+                        # lookups never set that flag).
+                        collect_product_cards(tool_name, result_data, product_cards, seen_card_ids)
                 except json.JSONDecodeError:
                     pass
                 messages.append(
@@ -1350,6 +1491,8 @@ async def run_chat(
         }
         if pending_action is not None:
             result["pending_action"] = pending_action
+        if product_cards:
+            result["product_cards"] = product_cards
         return result
 
 

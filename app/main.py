@@ -236,6 +236,11 @@ print(
     f"{settings.cors_origins_list}"
 )
 
+print(
+    f"MCP_LOOPBACK_URL: "
+    f"{settings.MCP_LOOPBACK_URL or '(auto: request origin)'}"
+)
+
 
 # ---------------------------------------------------------
 # EXISTING API ROUTES

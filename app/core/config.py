@@ -171,6 +171,13 @@ class Settings(BaseSettings):
     CHAT_GLOBAL_MESSAGES_PER_MINUTE: int = Field(default=100, ge=1, le=10000)
     CHAT_SESSION_TTL_HOURS: int = Field(default=24, ge=1, le=168)
 
+    # MCP self-call loopback. Unset = derive from the request origin
+    # (correct on localhost). Behind tunnels/proxies that rewrite or
+    # expose a public Host (ngrok etc.), set this to the local origin,
+    # e.g. MCP_LOOPBACK_URL=http://127.0.0.1:8001/mcp/, so the agent's
+    # internal HTTP hop never leaves the machine.
+    MCP_LOOPBACK_URL: str | None = None
+
     @property
     def cors_origins_list(self) -> List[str]:
         if self.CORS_ORIGINS == "*":
