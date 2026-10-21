@@ -24,6 +24,13 @@ from app.models.email_outbox import EmailOutbox
 from app.models.payment_creation import PaymentCreation
 from app.models.chat import ChatSession, ChatRateLimit
 from app.models.product_return import ReturnRequest, ReturnItem, ReturnEvidence, ReturnEvent
+from app.models.cod_remittance import (
+    CodRemittance,
+    CodRemittanceItem,
+    CodRemittanceItemStatus,
+    CodRemittanceSource,
+    CodRemittanceStatus,
+)
 
 __all__ = [
     "User",
@@ -72,4 +79,9 @@ __all__ = [
     "ReturnItem",
     "ReturnEvidence",
     "ReturnEvent",
+    "CodRemittance",
+    "CodRemittanceItem",
+    "CodRemittanceStatus",
+    "CodRemittanceSource",
+    "CodRemittanceItemStatus",
 ]

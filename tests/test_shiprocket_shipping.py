@@ -319,7 +319,7 @@ def test_4_simulator_event_transitions():
             s, ADMIN,
         )
     assert res["order_status"] == "delivered", res
-    assert res["payment_status"] == "cod_pending", res  # Delivery is not proof of cash collection
+    assert res["payment_status"] == "paid", res  # DELIVERED webhook auto-collects COD cash
     order = _order(order_id)
     assert order.delivered_at is not None
     print(f"  ✅ delivered -> {res['order_status']}, COD payment_status={res['payment_status']}")
@@ -406,7 +406,7 @@ def test_7_shiprocket_webhook_endpoint():
     fire({"awb": awb, "current_status": "DELIVERED", "location": "Doorstep"})
     order = _order(order_id)
     assert order.status == OrderStatus.DELIVERED, order.status
-    assert order.payment_status == "cod_pending", "Delivery must not imply cash collection"
+    assert order.payment_status == "paid", "DELIVERED webhook auto-collects COD cash"
 
     # Unknown AWB is ignored (never 500s the provider)
     ignored = fire({"awb": "NOPE-123", "current_status": "DELIVERED"})

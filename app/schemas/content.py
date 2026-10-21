@@ -2,7 +2,13 @@
 from datetime import datetime
 from uuid import UUID
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
+
+
+LayoutMode = Literal["split", "overlay", "artwork"]
+ImagePosition = Literal["center", "top", "bottom", "left", "right"]
 
 
 class ContentBlockRead(BaseModel):
@@ -12,8 +18,13 @@ class ContentBlockRead(BaseModel):
     key: str
     title: str
     body: str | None = None
+    layout_mode: LayoutMode = "split"
     image_url: str | None = None
     image_public_id: str | None = None
+    mobile_image_url: str | None = None
+    mobile_image_public_id: str | None = None
+    image_alt: str | None = None
+    image_position: ImagePosition = "center"
     link: str | None = None
     link_label: str | None = None
     sort_order: int = 0
@@ -28,8 +39,13 @@ class ContentBlockCreate(BaseModel):
     key: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9._-]+$")
     title: str = Field(min_length=1, max_length=120)
     body: str | None = Field(default=None, max_length=2000)
+    layout_mode: LayoutMode = "split"
     image_url: str | None = Field(default=None, max_length=500)
     image_public_id: str | None = Field(default=None, max_length=500)
+    mobile_image_url: str | None = Field(default=None, max_length=500)
+    mobile_image_public_id: str | None = Field(default=None, max_length=500)
+    image_alt: str | None = Field(default=None, max_length=500)
+    image_position: ImagePosition = "center"
     link: str | None = Field(default=None, max_length=300)
     link_label: str | None = Field(default=None, max_length=60)
     sort_order: int = Field(default=0, ge=0, le=999)
@@ -41,8 +57,13 @@ class ContentBlockCreate(BaseModel):
 class ContentBlockUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=120)
     body: str | None = Field(default=None, max_length=2000)
+    layout_mode: LayoutMode = "split"
     image_url: str | None = Field(default=None, max_length=500)
     image_public_id: str | None = Field(default=None, max_length=500)
+    mobile_image_url: str | None = Field(default=None, max_length=500)
+    mobile_image_public_id: str | None = Field(default=None, max_length=500)
+    image_alt: str | None = Field(default=None, max_length=500)
+    image_position: ImagePosition = "center"
     link: str | None = Field(default=None, max_length=300)
     link_label: str | None = Field(default=None, max_length=60)
     sort_order: int | None = Field(default=None, ge=0, le=999)

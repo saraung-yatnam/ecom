@@ -31,6 +31,9 @@ PERMISSIONS: list[tuple[str, str, str, str]] = [
     ("orders.update", "Update orders", "orders", "Change order status, cancel, collect COD"),
     ("orders.refund", "Refund orders", "orders", "Issue refunds on paid orders"),
     ("shipping.manage", "Manage shipping", "shipping", "Shiprocket dispatch, AWB, pickup, simulator"),
+    # COD reconciliation (courier remittance, separate from customer collection)
+    ("cod.view", "View COD reconciliation", "cod", "View COD collection and remittance batches"),
+    ("cod.reconcile", "Reconcile COD remittances", "cod", "Import batches, confirm bank receipts and resolve discrepancies"),
     # Coupons / promotions
     ("coupons.view", "View coupons", "coupons", "List and view coupons"),
     ("coupons.manage", "Manage coupons", "coupons", "Create/update/delete coupons"),
@@ -72,6 +75,8 @@ _MANAGER_PERMS: list[str] = [
     "orders.update",
     "orders.refund",
     "shipping.manage",
+    "cod.view",
+    "cod.reconcile",
     "coupons.view",
     "coupons.manage",
     "promotions.send",

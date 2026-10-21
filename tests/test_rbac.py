@@ -233,6 +233,50 @@ def test_custom_role_cannot_manage_users(client):
     assert resp.status_code == 403, resp.text
 
 
+def test_staff_direct_calls_to_cod_reconciliation_are_forbidden(client):
+    """The API must enforce cod.view/cod.reconcile even if the UI is bypassed."""
+    rid = uuid4()
+    csv_file = ("cod.csv", b"awb,order_number\n", "text/csv")
+    cases = [
+        ("get", "/api/v1/admin/cod/summary", {}),
+        ("get", "/api/v1/admin/cod/remittances", {}),
+        ("get", f"/api/v1/admin/cod/remittances/{rid}", {}),
+        ("get", f"/api/v1/admin/cod/remittances/{rid}/export", {}),
+        ("post", f"/api/v1/admin/cod/remittances/{rid}/resolve", {
+            "json": {"item_id": str(rid), "action": "exclude"},
+        }),
+        ("post", f"/api/v1/admin/cod/remittances/{rid}/confirm", {
+            "json": {
+                "utr": "UTR-STAFF",
+                "bank_credit_amount": 1,
+                "bank_credit_date": "2026-10-20",
+            },
+        }),
+        ("post", f"/api/v1/admin/cod/remittances/{rid}/void", {}),
+        ("post", "/api/v1/admin/cod/remittances", {
+            "json": {
+                "crf_id": "CRF-STAFF",
+                "remittance_date": "2026-10-20",
+                "items": [{"awb": "AWB-STAFF", "cod_amount": 1, "net_amount": 1}],
+            },
+        }),
+        ("post", "/api/v1/admin/cod/remittances/simulate", {}),
+        ("post", "/api/v1/admin/cod/collect-bulk", {
+            "json": {"order_ids": [str(rid)]},
+        }),
+        ("post", "/api/v1/admin/cod/remittances/import/preview", {
+            "files": {"file": csv_file},
+        }),
+        ("post", "/api/v1/admin/cod/remittances/import", {
+            "files": {"file": csv_file},
+            "data": {"crf_id": "CRF-STAFF", "remittance_date": "2026-10-20"},
+        }),
+    ]
+    for method, path, kwargs in cases:
+        resp = client.request(method, path, headers=_packer_headers, **kwargs)
+        assert resp.status_code == 403, f"{method.upper()} {path}: {resp.text}"
+
+
 # ---------- Role CRUD guards ----------
 
 def test_role_crud_requires_roles_manage(client):

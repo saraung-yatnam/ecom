@@ -17,13 +17,15 @@ import hashlib
 
 from fastapi import HTTPException
 from jose import JWTError, jwt
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.core.config import settings
 from app.db.database import engine
 from app.mcp.tools import money_envelope
 from app.models.order import OrderStatus
+from app.models.product import Product, ProductVariant
 from app.models.user import User
+from app.repositories import product_image as product_image_repo
 from app.mcp.auth import MCPAuthError, parse_user_id
 from app.mcp.guards import (
     MCPForbiddenError,
@@ -124,6 +126,62 @@ def _order_items(order, cap: int = 50) -> list[dict]:
     return [_order_item_summary(i) for i in raw[:cap]]
 
 
+def _order_product_cards(order, session, cap: int = 4) -> list[dict]:
+    """Card-ready product rows for the chat UI, resolved from order items.
+
+    Order items are variant snapshots: item.variant_id -> product -> slug +
+    first image (same resolution as the admin order detail). Whitelisted
+    display fields only (id/name/slug/price/image_url). Missing variant or
+    product rows degrade to no card for that line, never a crash.
+    """
+    try:
+        raw = list(order.items or [])
+    except Exception:
+        return []
+    variant_ids = [
+        item.variant_id for item in raw if getattr(item, "variant_id", None) is not None
+    ]
+    if not variant_ids:
+        return []
+    variants = session.exec(
+        select(ProductVariant).where(ProductVariant.id.in_(variant_ids))
+    ).all()
+    variant_to_product = {variant.id: variant.product_id for variant in variants}
+    product_ids = list(set(variant_to_product.values()))
+    if not product_ids:
+        return []
+    products = session.exec(select(Product).where(Product.id.in_(product_ids))).all()
+    product_slug = {product.id: product.slug for product in products}
+    first_images = product_image_repo.get_first_images_for_products(session, product_ids)
+
+    cards: list[dict] = []
+    seen: set = set()
+    for item in raw:
+        product_id = variant_to_product.get(getattr(item, "variant_id", None))
+        if product_id is None or product_id in seen:
+            continue
+        seen.add(product_id)
+        try:
+            price = float(item.unit_price)
+        except (TypeError, ValueError):
+            price = None
+        cards.append(
+            {
+                "id": str(product_id),
+                "name": getattr(item, "product_name", None),
+                "slug": product_slug.get(product_id),
+                "price": price,
+                "compare_at_price": None,
+                "image_url": first_images.get(product_id),
+                "stock": None,
+                "is_active": None,
+            }
+        )
+        if len(cards) >= cap:
+            break
+    return cards
+
+
 async def get_order(
     order_id: str | int | None = None,
     ctx: Context | None = None,
@@ -137,6 +195,9 @@ async def get_order(
     Returns a safe whitelist plus item_count and items (line-item
     snapshots: product_name, variant_sku, quantity, unit_price,
     line_total — quote verbatim, never infer products from grand_total).
+    Also returns product_cards: card-ready display rows (id/name/slug/price/
+    image_url) resolved from the item variants, consumed by the chat UI —
+    never raw tool internals, never LLM-written URLs.
     """
 
     try:
@@ -171,11 +232,18 @@ async def get_order(
         except Exception:
             items = []
             item_count = None
-        return {
+        result = {
             "success": True,
             "order": {**_order_summary(order), "item_count": item_count, "items": items},
             **money_envelope(),
         }
+        try:
+            cards = _order_product_cards(order, session)
+        except Exception:
+            cards = []
+        if cards:
+            result["product_cards"] = cards
+        return result
 
 
 async def list_orders(

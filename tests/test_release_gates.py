@@ -105,7 +105,8 @@ def test_new_migrations_form_one_ordered_head():
     from app.core.release import ROOT
     scripts = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
     expected = ["n9b0c1d2e3f4", "o0c1d2e3f4a5", "p1d2e3f4a5b6", "q2e3f4a5b6c7",
-                "r3f4a5b6c7d8", "s4a5b6c7d8e9", "t5b6c7d8e9f0", "u6c7d8e9f0a1", "v7d8e9f0a1b2", "w8e9f0a1b2c3", "x9f0a1b2c3d4", "y0a1b2c3d4e5"]
+                "r3f4a5b6c7d8", "s4a5b6c7d8e9", "t5b6c7d8e9f0", "u6c7d8e9f0a1", "v7d8e9f0a1b2", "w8e9f0a1b2c3", "x9f0a1b2c3d4", "y0a1b2c3d4e5",
+                "c1d2e3f4a5b6", "d2e3f4a5b6c7", "e3f4a5b6c7d8", "z1b2c3d4e5f6", "a1b2c3d4e5f7"]
     assert migration_heads() == (expected[-1],)
     for parent, child in zip(expected, expected[1:]):
         assert scripts.get_revision(child).down_revision == parent

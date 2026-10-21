@@ -3,7 +3,7 @@ import json
 import re
 
 import httpx2
-from groq import APIConnectionError, APITimeoutError, APIStatusError, Groq
+from groq import APIConnectionError, APITimeoutError, APIStatusError, AsyncGroq, Groq
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
@@ -122,6 +122,39 @@ def _active_client():
             model,
         )
     return groq, model
+
+
+def _active_async_client():
+    """Async client for the selected provider (streaming path only).
+
+    Mirrors _active_client but returns the asyncio flavour so the SSE
+    endpoint can stream deltas without bridging a worker thread. Only the
+    streaming code path uses this; the non-streaming path (and its tests)
+    keep the sync client via _groq_complete.
+    """
+    provider, model = _llm_config()
+    if provider == "gemini":
+        from openai import AsyncOpenAI
+
+        return (
+            AsyncOpenAI(
+                base_url=GEMINI_BASE_URL,
+                api_key=settings.GEMINI_API_KEY,
+                timeout=LLM_TIMEOUT_SECONDS,
+                max_retries=0,
+            ),
+            model,
+            provider,
+        )
+    return (
+        AsyncGroq(
+            api_key=settings.GROQ_API_KEY,
+            timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=0,
+        ),
+        model,
+        provider,
+    )
 
 
 async def main():
@@ -643,6 +676,16 @@ PRESENTATION_GUIDANCE = (
     "render as a markdown table (SKU | attributes | price | stock), never "
     "as spaced-out bullets."
 )
+# Encourage batching independent lookups into one assistant turn so they
+# execute concurrently instead of across multiple model round trips
+# (Groq: "parallel tool use dramatically reduces latency").
+PARALLEL_TOOL_GUIDANCE = (
+    "Latency rule: when a request needs several INDEPENDENT lookups, request "
+    "them together in the same turn as multiple parallel tool calls instead "
+    "of one call per turn. Only sequence calls when a later call depends on "
+    "an earlier result (for example resolving an order before acting on it). "
+)
+
 # Short-term memory of the last successful list_orders page per user
 # (JWT subject). Lets stateless follow-ups like "show me the next 5"
 # resolve to a real offset. Plain in-process dict: bounded, no new system.
@@ -1009,6 +1052,46 @@ def _retry_after_seconds(exc: Exception, default: float) -> float:
     return default
 
 
+def _usage_suffix(usage) -> str:
+    """Compact token/cache/reasoning usage for latency logging.
+
+    Pass the provider `usage` object (or a completion; its `.usage` is
+    unwrapped). Never raises: providers vary in which detail fields they
+    return, and logging must not break a successful turn. `cached`
+    (prompt cache hits) is the signal to watch for prompt-caching wins.
+    """
+    try:
+        usage = getattr(usage, "usage", usage)
+        if usage is None:
+            return ""
+        prompt = getattr(usage, "prompt_tokens", None)
+        out = getattr(usage, "completion_tokens", None)
+        cached = None
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details is not None:
+            cached = getattr(details, "cached_tokens", None)
+            if cached is None and isinstance(details, dict):
+                cached = details.get("cached_tokens")
+        reasoning = None
+        cdetails = getattr(usage, "completion_tokens_details", None)
+        if cdetails is not None:
+            reasoning = getattr(cdetails, "reasoning_tokens", None)
+            if reasoning is None and isinstance(cdetails, dict):
+                reasoning = cdetails.get("reasoning_tokens")
+        bits = []
+        if prompt is not None:
+            bits.append(f"prompt={prompt}")
+        if cached is not None:
+            bits.append(f"cached={cached}")
+        if out is not None:
+            bits.append(f"out={out}")
+        if reasoning is not None:
+            bits.append(f"reasoning={reasoning}")
+        return (" tokens[" + " ".join(bits) + "]") if bits else ""
+    except Exception:
+        return ""
+
+
 async def _groq_complete(messages, tools, *, stage: str = "initial"):
     """LLM chat call with bounded retries on transient failures.
 
@@ -1038,6 +1121,7 @@ async def _groq_complete(messages, tools, *, stage: str = "initial"):
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
+                parallel_tool_calls=True,
                 max_tokens=LLM_MAX_TOKENS,
                 temperature=LLM_TEMPERATURE,
             )
@@ -1045,6 +1129,7 @@ async def _groq_complete(messages, tools, *, stage: str = "initial"):
             print(
                 f"MCP agent LLM ok: {provider}/{model} {stage} "
                 f"attempt {attempt + 1}/{1 + len(delays)} after {elapsed:.1f}s"
+                f"{_usage_suffix(getattr(result, 'usage', None))}"
             )
             return result
         except Exception as exc:
@@ -1064,6 +1149,150 @@ async def _groq_complete(messages, tools, *, stage: str = "initial"):
     print(f"MCP agent LLM retries failed: {type(last_exc).__name__}: {last_exc}")
     total = 1 + len(delays)
     total_elapsed = time.monotonic() - started_all
+    raise RuntimeError(
+        f"LLM request failed at {stage} (attempt {total}/{total}) "
+        f"after {total_elapsed:.1f}s: {last_exc}"
+    ) from last_exc
+
+
+class _StreamedToolCall:
+    """Lightweight stand-in for an SDK tool-call object (streaming path).
+
+    `_passthrough_tool_call` reads id/type/function.{name,arguments} via
+    attribute access, so replicating just those attributes is enough. No
+    provider metadata is available mid-stream (Gemini's thought_signature
+    is not emitted in deltas), so Gemini falls back to the plain shape.
+    """
+
+    def __init__(self, call_id: str, name: str, arguments: str):
+        self.id = call_id
+        self.type = "function"
+        self.function = _StreamedFunction(name, arguments)
+
+
+class _StreamedFunction:
+    def __init__(self, name: str, arguments: str):
+        self.name = name
+        self.arguments = arguments
+
+
+async def _groq_stream(messages, tools, *, stage: str = "initial"):
+    """Streaming variant of _groq_complete.
+
+    Yields {"kind": "delta", "text": str} for assistant content as it
+    arrives, then a final {"kind": "done", "content", "tool_calls"}.
+    Raises RuntimeError on persistent failure (same contract as
+    _groq_complete) so callers can map it to a 502 / error event.
+
+    Tool-call deltas are accumulated per `index` (providers split the
+    name/arguments across chunks); content deltas are forwarded live.
+    """
+    import time
+
+    delays = (2.0, 6.0)
+    client, model, provider = _active_async_client()
+    last_exc: Exception | None = None
+    started_all = time.monotonic()
+    for attempt in range(1 + len(delays)):
+        started = time.monotonic()
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                parallel_tool_calls=True,
+                max_tokens=LLM_MAX_TOKENS,
+                temperature=LLM_TEMPERATURE,
+                stream=True,
+            )
+        except Exception as exc:
+            last_exc = exc
+            elapsed = time.monotonic() - started
+            where = (
+                f"{provider}/{model} {stage} attempt "
+                f"{attempt + 1}/{1 + len(delays)} after {elapsed:.1f}s"
+            )
+            if not _groq_transient(exc):
+                print(
+                    f"MCP agent LLM stream failed (not retrying) at {where}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise RuntimeError(f"LLM request failed at {where}: {exc}") from exc
+            if attempt < len(delays):
+                wait = _retry_after_seconds(exc, delays[attempt])
+                print(
+                    f"MCP agent LLM stream transient failure at {where}, "
+                    f"retrying in {wait}s: {type(exc).__name__}: {exc}"
+                )
+                await asyncio.sleep(wait)
+                continue
+            break
+
+        content_parts: list[str] = []
+        tool_acc: dict = {}
+        usage = None
+        try:
+            async for chunk in stream:
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+                piece = getattr(delta, "content", None)
+                if piece:
+                    content_parts.append(piece)
+                    yield {"kind": "delta", "text": piece}
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    idx = getattr(tc, "index", 0)
+                    if idx is None:
+                        idx = 0
+                    slot = tool_acc.setdefault(idx, {"id": None, "name": "", "args": []})
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            slot["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["args"].append(fn.arguments)
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            print(
+                f"MCP agent LLM stream failed mid-stream at "
+                f"{provider}/{model} {stage} after {elapsed:.1f}s: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise RuntimeError(f"LLM stream failed at {stage}: {exc}") from exc
+
+        tool_calls = [
+            _StreamedToolCall(
+                slot["id"] or f"call_{idx}",
+                slot["name"],
+                "".join(slot["args"]) or "{}",
+            )
+            for idx, slot in sorted(tool_acc.items())
+        ]
+        elapsed = time.monotonic() - started
+        print(
+            f"MCP agent LLM stream ok: {provider}/{model} {stage} "
+            f"attempt {attempt + 1}/{1 + len(delays)} after {elapsed:.1f}s"
+            f"{_usage_suffix(usage)}"
+        )
+        yield {
+            "kind": "done",
+            "content": "".join(content_parts),
+            "tool_calls": tool_calls,
+        }
+        return
+
+    total = 1 + len(delays)
+    total_elapsed = time.monotonic() - started_all
+    print(f"MCP agent LLM stream retries failed: {type(last_exc).__name__}: {last_exc}")
     raise RuntimeError(
         f"LLM request failed at {stage} (attempt {total}/{total}) "
         f"after {total_elapsed:.1f}s: {last_exc}"
@@ -1103,6 +1332,7 @@ def _pending_action_summary(pending_action: dict | None) -> str | None:
 # these — never raw tool internals, never LLM-written URLs.
 MAX_PRODUCT_CARDS = 4
 CARD_TOOLS = {
+    "get_order",
     "get_product",
     "list_products",
     "compare_products",
@@ -1135,6 +1365,14 @@ def _card_candidates(tool_name: str, result: dict) -> list[tuple[dict, object]]:
     """(product-dict, stock) pairs worth showing as chat cards."""
     if not isinstance(result, dict) or result.get("success") is not True:
         return []
+    if tool_name == "get_order":
+        # Order line items resolved to products by the tool (variant ->
+        # product -> slug + first image). Already whitelisted/display-only;
+        # cap is applied by collect_product_cards below.
+        cards = result.get("product_cards")
+        if not isinstance(cards, list):
+            return []
+        return [(c, c.get("stock")) for c in cards if isinstance(c, dict)]
     if tool_name == "get_product":
         product = result.get("product")
         if not isinstance(product, dict):
@@ -1258,10 +1496,56 @@ def _currency_context() -> str:
     )
 
 
-async def run_chat(
-    message: str, *, auth_token: str, mcp_url: str, history=None
-) -> dict:
-    """Run one authenticated agent turn; return {"reply", "tools_used"}.
+_TOOL_STEP_LABELS = {
+    "get_order": "Looking up the order…",
+    "list_orders": "Listing orders…",
+    "cancel_order": "Preparing cancellation…",
+    "issue_refund": "Preparing refund…",
+    "get_product": "Looking up the product…",
+    "list_products": "Searching products…",
+    "compare_products": "Comparing products…",
+    "update_product": "Preparing product update…",
+    "update_product_price": "Preparing price change…",
+    "delete_product": "Preparing deactivation…",
+    "check_stock": "Checking stock…",
+    "check_product_inventory": "Checking inventory…",
+    "list_low_stock_products": "Finding low-stock products…",
+    "sales_summary": "Computing the sales summary…",
+    "sales_trend": "Computing the sales trend…",
+    "product_performance": "Analyzing product performance…",
+    "get_payment_status": "Checking payment status…",
+    "list_refunds": "Listing refunds…",
+    "list_payment_issues": "Checking payment issues…",
+    "get_refund_status": "Checking refund status…",
+    "whoami": "Checking identity…",
+    "check_orders_view": "Checking permissions…",
+}
+
+
+def _tool_step_label(name: str) -> str:
+    """Short human label for a running tool (chat step chip)."""
+    return _TOOL_STEP_LABELS.get(name, "Working…")
+
+
+async def run_chat_events(
+    message: str,
+    *,
+    auth_token: str,
+    mcp_url: str,
+    history=None,
+    stream: bool = False,
+):
+    """Run one authenticated agent turn, yielding progress events.
+
+    Event dicts (each has a "type"):
+      {"type": "step", "tool", "label"}   a tool is about to execute
+      {"type": "token", "text"}           assistant answer delta (stream only)
+      {"type": "final", "reply", "tools_used", "product_cards"?, "pending_action"?}
+      {"type": "error", "message"}        terminal failure (never both kinds)
+
+    `stream=True` streams the answer through the provider's streaming API;
+    `stream=False` (default) uses the proven _groq_complete path unchanged.
+    LLM failures raise RuntimeError (mapped to 502 by the JSON endpoint).
 
     Auth: `auth_token` is sent ONLY as the HTTP Authorization header of
     the MCP transport. Tool calls go out with no token argument, so the
@@ -1290,6 +1574,32 @@ async def run_chat(
         },
         timeout=30.0,
     )
+    # A browser Stop closes this generator mid-yield; without the finally
+    # the pooled sockets would leak on every abandoned streamed turn.
+    try:
+        async for event in _agent_loop(
+            message,
+            user_key=user_key,
+            mcp_url=mcp_url,
+            history=history,
+            stream=stream,
+            http_client=http_client,
+        ):
+            yield event
+    finally:
+        await http_client.aclose()
+
+
+async def _agent_loop(
+    message: str,
+    *,
+    user_key: str,
+    mcp_url: str,
+    history,
+    stream: bool,
+    http_client,
+):
+    """Inner turn loop: owns the MCP session and the LLM/tool exchange."""
     tools_used: list[str] = []
     pending_action: dict | None = None
     product_cards: list[dict] = []
@@ -1299,10 +1609,13 @@ async def run_chat(
         tools = _groq_tool_specs(listed.tools)
         tool_names = {t.name for t in listed.tools}
 
+        # Static, reusable prompt prefix first and dynamic, per-request
+        # lines (today's date, store currency) last, so providers that
+        # cache prompt prefixes can reuse the bulk of every turn.
         messages = [
             {
                 "role": "system",
-                "content": AGENT_SYSTEM_PROMPT + " " + _today_context() + " " + _currency_context() + " " + CURRENCY_GUIDANCE + " " + DATE_GUIDANCE + " " + PAGINATION_GUIDANCE + " " + PRESENTATION_GUIDANCE + " " + STOCK_ROUTING_GUIDANCE + " " + PRICE_GUIDANCE + " " + ANALYTICS_GUIDANCE + " " + ORDER_ITEMS_GUIDANCE,
+                "content": AGENT_SYSTEM_PROMPT + " " + CURRENCY_GUIDANCE + " " + DATE_GUIDANCE + " " + PAGINATION_GUIDANCE + " " + PRESENTATION_GUIDANCE + " " + STOCK_ROUTING_GUIDANCE + " " + PRICE_GUIDANCE + " " + ANALYTICS_GUIDANCE + " " + ORDER_ITEMS_GUIDANCE + " " + PARALLEL_TOOL_GUIDANCE + " " + _today_context() + " " + _currency_context(),
             },
             *_sanitize_history(history, tool_names),
             {"role": "user", "content": _with_pagination_context(user_key, message)},
@@ -1314,16 +1627,43 @@ async def run_chat(
         import time
 
         run_started = time.monotonic()
+
+        async def _turn_events(stage: str):
+            """Yield token deltas, then one private _result with content/calls."""
+            if not stream:
+                completion = await _groq_complete(messages, tools, stage=stage)
+                msg = completion.choices[0].message
+                yield {
+                    "kind": "_result",
+                    "content": msg.content,
+                    "tool_calls": msg.tool_calls,
+                }
+                return
+            async for ev in _groq_stream(messages, tools, stage=stage):
+                if ev["kind"] == "delta":
+                    yield ev
+                elif ev["kind"] == "done":
+                    yield {
+                        "kind": "_result",
+                        "content": ev["content"],
+                        "tool_calls": ev["tool_calls"],
+                    }
+
         for turn in range(1, AGENT_MAX_TURNS + 1):
             turn_started = time.monotonic()
-            completion = await _groq_complete(
-                messages, tools, stage=f"turn {turn}/{AGENT_MAX_TURNS}"
-            )
+            stage = f"turn {turn}/{AGENT_MAX_TURNS}"
+            assistant_content = None
+            assistant_tool_calls = None
+            async for ev in _turn_events(stage):
+                if ev["kind"] == "delta":
+                    yield {"type": "token", "text": ev["text"]}
+                elif ev["kind"] == "_result":
+                    assistant_content = ev["content"]
+                    assistant_tool_calls = ev["tool_calls"]
 
-            assistant_message = completion.choices[0].message
             if (
-                not assistant_message.tool_calls
-                and not (assistant_message.content or "").strip()
+                not assistant_tool_calls
+                and not (assistant_content or "").strip()
                 and not empty_retry_used
             ):
                 # Blank finish (reasoning models can spend the output
@@ -1334,26 +1674,35 @@ async def run_chat(
                 empty_retry_used = True
                 print(f"MCP agent empty reply at turn {turn}, nudging once")
                 messages.append({"role": "user", "content": EMPTY_REPLY_NUDGE})
-                completion = await _groq_complete(
-                    messages, tools, stage="empty-retry"
-                )
-                assistant_message = completion.choices[0].message
-            if not assistant_message.tool_calls:
-                final_text = assistant_message.content or ""
+                assistant_content = None
+                assistant_tool_calls = None
+                async for ev in _turn_events("empty-retry"):
+                    if ev["kind"] == "delta":
+                        yield {"type": "token", "text": ev["text"]}
+                    elif ev["kind"] == "_result":
+                        assistant_content = ev["content"]
+                        assistant_tool_calls = ev["tool_calls"]
+
+            if not assistant_tool_calls:
+                final_text = assistant_content or ""
                 break
 
+            calls = list(assistant_tool_calls)
             messages.append(
                 {
                     "role": "assistant",
-                    "content": assistant_message.content,
+                    "content": assistant_content,
                     "tool_calls": [
                         _passthrough_tool_call(call, _stripped_arguments_json(call))
-                        for call in assistant_message.tool_calls
+                        for call in calls
                     ],
                 }
             )
 
-            for call in assistant_message.tool_calls:
+            # Prepare every call first (parse + strip auth + retry guard)
+            # so independent calls can run concurrently.
+            prepared = []
+            for call in calls:
                 tool_name = call.function.name
                 try:
                     arguments = json.loads(call.function.arguments or "{}")
@@ -1364,9 +1713,41 @@ async def run_chat(
                 # Defense in depth: auth never rides in tool arguments,
                 # even if the model invents the parameter.
                 arguments.pop("token", None)
-
                 retry_key = (tool_name, json.dumps(arguments, sort_keys=True))
-                if retry_counts.get(retry_key, 0) >= MAX_RETRY_ATTEMPTS:
+                prepared.append(
+                    {
+                        "call": call,
+                        "name": tool_name,
+                        "arguments": arguments,
+                        "retry_key": retry_key,
+                        "blocked": retry_counts.get(retry_key, 0) >= MAX_RETRY_ATTEMPTS,
+                    }
+                )
+
+            executable = [p for p in prepared if not p["blocked"]]
+            for p in executable:
+                yield {
+                    "type": "step",
+                    "tool": p["name"],
+                    "label": _tool_step_label(p["name"]),
+                }
+
+            gathered: list = []
+            if executable:
+                # Independent lookups run together (one model round trip).
+                gathered = await asyncio.gather(
+                    *(
+                        mcp_client.call_tool(p["name"], p["arguments"])
+                        for p in executable
+                    ),
+                    return_exceptions=True,
+                )
+            result_by_call = {id(p): g for p, g in zip(executable, gathered)}
+
+            # Append tool messages in the original call order.
+            for p in prepared:
+                call = p["call"]
+                if p["blocked"]:
                     messages.append(
                         {
                             "role": "tool",
@@ -1379,15 +1760,16 @@ async def run_chat(
                     )
                     continue
 
-                try:
-                    tool_result = await mcp_client.call_tool(tool_name, arguments)
-                except Exception as exc:
+                tool_name = p["name"]
+                retry_key = p["retry_key"]
+                tool_result = result_by_call.get(id(p))
+                if isinstance(tool_result, BaseException):
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": call.id,
                             "content": json.dumps(
-                                {"success": False, "error": f"Tool error: {exc}"}
+                                {"success": False, "error": f"Tool error: {tool_result}"}
                             ),
                         }
                     )
@@ -1397,6 +1779,7 @@ async def run_chat(
                 result_text = "\n".join(
                     item.text for item in tool_result.content if hasattr(item, "text")
                 )
+                result_data = None
                 try:
                     result_data = json.loads(result_text)
                     if not isinstance(result_data, dict):
@@ -1413,7 +1796,7 @@ async def run_chat(
                     else:
                         retry_counts.pop(retry_key, None)
                         if tool_name == "list_orders":
-                            _remember_pagination(user_key, arguments, result_data)
+                            _remember_pagination(user_key, p["arguments"], result_data)
                         if result_data.get("requires_confirmation") is True:
                             # Latest pending destructive preview, surfaced to
                             # the caller so the UI can offer explicit buttons.
@@ -1470,18 +1853,26 @@ async def run_chat(
                         collect_product_cards(tool_name, result_data, product_cards, seen_card_ids)
                 except json.JSONDecodeError:
                     pass
+                # Card display rows (e.g. get_order product_cards) are consumed
+                # above by collect_product_cards. Strip them from the
+                # model-facing copy: they are UI-only (image URLs, ids) and
+                # would otherwise ride along in every later history turn.
+                llm_text = result_text
+                if isinstance(result_data, dict) and "product_cards" in result_data:
+                    llm_text = json.dumps(
+                        {k: v for k, v in result_data.items() if k != "product_cards"}
+                    )
                 messages.append(
-                    {"role": "tool", "tool_call_id": call.id, "content": _compact_tool_text(result_text)}
+                    {"role": "tool", "tool_call_id": call.id, "content": _compact_tool_text(llm_text)}
                 )
             turn_elapsed = time.monotonic() - turn_started
             print(
                 f"MCP agent turn {turn}/{AGENT_MAX_TURNS} done after "
                 f"{turn_elapsed:.1f}s "
-                f"(tools this turn: {len(assistant_message.tool_calls or [])})"
+                f"(tools this turn: {len(calls)})"
             )
             # Loop back to the LLM for the next turn.
 
-        await http_client.aclose()
         print(f"MCP agent run done after {time.monotonic() - run_started:.1f}s")
         result: dict = {
             "reply": final_text.strip()
@@ -1493,7 +1884,29 @@ async def run_chat(
             result["pending_action"] = pending_action
         if product_cards:
             result["product_cards"] = product_cards
-        return result
+        yield {"type": "final", **result}
+
+
+async def run_chat(
+    message: str, *, auth_token: str, mcp_url: str, history=None
+) -> dict:
+    """Non-streaming entry point: drain run_chat_events into the final dict.
+
+    Kept stable for existing callers (the JSON endpoint and tests):
+    returns {"reply", "tools_used"} plus optional pending_action/cards, and
+    raises (ValueError/RuntimeError) exactly as before.
+    """
+    result: dict | None = None
+    async for event in run_chat_events(
+        message, auth_token=auth_token, mcp_url=mcp_url, history=history, stream=False
+    ):
+        if event.get("type") == "error":
+            raise RuntimeError(event.get("message") or "Agent failed")
+        if event.get("type") == "final":
+            result = {k: v for k, v in event.items() if k != "type"}
+    if result is None:
+        raise RuntimeError("Agent produced no final response")
+    return result
 
 
 if __name__ == "__main__":

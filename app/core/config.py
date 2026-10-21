@@ -141,6 +141,10 @@ class Settings(BaseSettings):
     SHIPROCKET_PICKUP_LOCATION: str = "Primary"
     SHIPROCKET_PICKUP_PINCODE: str = "110001"
     SHIPROCKET_WEBHOOK_TOKEN: str | None = None
+    # Synthetic COD remittance batches are a development aid only. They are
+    # always allowed outside production and must be explicitly enabled in
+    # production; they never call Shiprocket and are labelled in the UI.
+    COD_REMITTANCE_SIMULATOR_ENABLED: bool = False
 
     # ========== Cloudinary media storage ==========
     CLOUDINARY_CLOUD_NAME: str | None = None

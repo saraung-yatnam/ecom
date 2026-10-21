@@ -12,14 +12,16 @@ app/mcp/agent.py:run_chat. It is never placed in tool arguments and the
 LLM never sees it (the `token` param is stripped from LLM schemas/args).
 """
 
+import json
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, TokenPayload, _assert_admin_audience, oauth2_scheme
 from app.core.config import settings
-from app.mcp.agent import run_chat
+from app.mcp.agent import run_chat, run_chat_events 
 
 router = APIRouter(prefix="/mcp", tags=["MCP Agent"])
 
@@ -149,6 +151,72 @@ async def mcp_chat(
         tools_used=result["tools_used"],
         pending_action=result.get("pending_action"),
         product_cards=result.get("product_cards") or [],
+    )
+
+
+def _sse_frame(event: dict) -> str:
+    """Serialize one agent event as an SSE frame.
+
+    `event:` carries the discriminator so the client can dispatch without
+    parsing JSON twice; `data:` is the full event object.
+    """
+    return (
+        f"event: {event.get('type', 'message')}\n"
+        f"data: {json.dumps(event, default=str)}\n\n"
+    )
+
+
+@router.post("/chat/stream")
+async def mcp_chat_stream(
+    data: McpChatRequest,
+    request: Request,
+    user: CurrentUser,
+    payload: TokenPayload,
+    token: str = Depends(oauth2_scheme),
+) -> StreamingResponse:
+    """Streaming twin of POST /mcp/chat (Server-Sent Events).
+
+    Auth/RBAC identical to the JSON endpoint: the same JWT chain runs
+    before the response starts, so an unauthenticated caller still gets a
+    normal 401/403. Per-tool RBAC stays inside the MCP tools.
+
+    Frames: `step` (tool starting), `token` (answer delta), then exactly
+    one of `final` (reply + optional cards/pending_action) or `error`.
+    Axios-style buffering proxies are disabled via X-Accel-Buffering.
+    """
+    _ = user
+    _assert_admin_audience(payload)
+    mcp_url = resolve_mcp_url(str(request.base_url))
+
+    async def event_stream():
+        try:
+            async for event in run_chat_events(
+                data.message,
+                auth_token=token,
+                mcp_url=mcp_url,
+                history=[item.model_dump() for item in data.history],
+                stream=True,
+            ):
+                yield _sse_frame(event)
+        except ValueError as exc:
+            yield _sse_frame({"type": "error", "message": str(exc)})
+        except RuntimeError as exc:
+            yield _sse_frame({"type": "error", "message": str(exc)})
+        except BaseExceptionGroup as eg:
+            detail = llm_group_detail(eg)
+            print(f"❌ MCP stream failed [{mcp_url}]: {eg}")
+            yield _sse_frame(
+                {"type": "error", "message": detail or "Agent transport failed"}
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

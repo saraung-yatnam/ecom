@@ -9,6 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, status
 from fastapi import UploadFile
+from sqlalchemy import or_
 from sqlmodel import select
 
 import io
@@ -40,8 +41,18 @@ SLOT_IMAGE_SPECS = {
     },
     "home.hero": {
         "max_bytes": 5_000_000,
+        "aspect": 3.0 / 2.0,
+        "label": "1440 × 960 px (3:2), ≤5 MB — split hero",
+    },
+    "home.hero.overlay": {
+        "max_bytes": 5_000_000,
         "aspect": 16.0 / 6.0,
-        "label": "1920 × 720 px (16:6), ≤5 MB",
+        "label": "1920 × 720 px (16:6), ≤5 MB — full image",
+    },
+    "home.hero.mobile": {
+        "max_bytes": 5_000_000,
+        "aspect": 4.0 / 5.0,
+        "label": "900 × 1125 px (4:5), ≤5 MB — mobile",
     },
 }
 DEFAULT_IMAGE_SPEC = {"max_bytes": 5_000_000, "aspect": None, "label": "≤5 MB"}
@@ -130,11 +141,20 @@ def update_block(
     starts = data.get("starts_at", block.starts_at)
     ends = data.get("ends_at", block.ends_at)
     _assert_window(starts, ends)
-    before = {"title": block.title, "is_active": block.is_active, "image_public_id": block.image_public_id}
-    if "image_url" in data and data["image_url"] != block.image_url and "image_public_id" not in data:
-        data["image_public_id"] = None
-    if "image_url" in data and not data["image_url"]:
-        data["image_public_id"] = None
+    before = {
+        "title": block.title,
+        "is_active": block.is_active,
+        "image_public_id": block.image_public_id,
+        "mobile_image_public_id": block.mobile_image_public_id,
+    }
+    for url_field, public_id_field in (
+        ("image_url", "image_public_id"),
+        ("mobile_image_url", "mobile_image_public_id"),
+    ):
+        if url_field in data and data[url_field] != getattr(block, url_field) and public_id_field not in data:
+            data[public_id_field] = None
+        if url_field in data and not data[url_field]:
+            data[public_id_field] = None
     for key, value in data.items():
         setattr(block, key, value)
     from datetime import datetime, timezone
@@ -151,8 +171,9 @@ def update_block(
         after={"title": block.title, "is_active": block.is_active},
         ip_address=audit_repo.client_ip(request),
     )
-    if "image_public_id" in data and data["image_public_id"] != before.get("image_public_id"):
-        _delete_unused_image(session, before.get("image_public_id"))
+    for public_id_field in ("image_public_id", "mobile_image_public_id"):
+        if public_id_field in data and data[public_id_field] != before.get(public_id_field):
+            _delete_unused_image(session, before.get(public_id_field))
     return ContentBlockRead.model_validate(block)
 
 
@@ -169,7 +190,12 @@ def delete_block(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Content block not found"
         )
-    snapshot = {"key": block.key, "title": block.title, "image_public_id": block.image_public_id}
+    snapshot = {
+        "key": block.key,
+        "title": block.title,
+        "image_public_id": block.image_public_id,
+        "mobile_image_public_id": block.mobile_image_public_id,
+    }
     session.delete(block)
     audit_repo.log_and_commit(
         session,
@@ -181,6 +207,7 @@ def delete_block(
         ip_address=audit_repo.client_ip(request),
     )
     _delete_unused_image(session, snapshot.get("image_public_id"))
+    _delete_unused_image(session, snapshot.get("mobile_image_public_id"))
     return None
 
 
@@ -193,7 +220,14 @@ def _assert_window(starts_at, ends_at) -> None:
 
 
 def _delete_unused_image(session, public_id: str | None) -> None:
-    if public_id and session.exec(select(ContentBlock.id).where(ContentBlock.image_public_id == public_id)).first() is None:
+    if public_id and session.exec(
+        select(ContentBlock.id).where(
+            or_(
+                ContentBlock.image_public_id == public_id,
+                ContentBlock.mobile_image_public_id == public_id,
+            )
+        )
+    ).first() is None:
         delete_image(public_id)
 
 

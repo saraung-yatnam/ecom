@@ -359,6 +359,32 @@ def process_tracking_event(session: Session, payload: dict) -> dict:
                 order.delivered_at = datetime.now(timezone.utc)
             enqueue_order_email(session, order, "order_delivered")
 
+            # COD on delivery: when Shiprocket reports DELIVERED for a COD
+            # order, treat the courier's collection as the customer's COD
+            # payment and record it idempotently. Duplicate webhooks cannot
+            # create a second Payment (raise 409 / ignored here).
+            # Imported lazily to avoid a circular import (admin.cod imports the
+            # admin package which imports orders, which imports this webhooks
+            # module).
+            if order.payment_method == "cod" and order.payment_status == "cod_pending":
+                from app.api.v1.admin.cod import record_cod_collection
+
+                try:
+                    record_cod_collection(
+                        session,
+                        order,
+                        actor_id=None,
+                        collected_by_email="shiprocket-webhook",
+                        ip_address=None,
+                    )
+                except HTTPException as exc:
+                    if exc.status_code not in (400, 409):
+                        raise
+                    print(
+                        f"⚠️ Order {order.order_number}: COD collection already "
+                        f"recorded — ignoring duplicate DELIVERED webhook"
+                    )
+
         elif target_status == OrderStatus.RTO:
             # Stock restoration is handled below by the label-based,
             # flag-guarded block (covers INITIATED-then-DELIVERED and

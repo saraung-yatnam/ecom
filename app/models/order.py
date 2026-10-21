@@ -5,7 +5,7 @@ from enum import Enum
 from uuid import UUID, uuid4
 from types import SimpleNamespace
 
-from sqlalchemy import Column, JSON
+from sqlalchemy import Column, DateTime, JSON
 from sqlmodel import Field, Relationship, SQLModel
 
 
@@ -86,6 +86,12 @@ class Order(SQLModel, table=True):
     # Payment
     payment_method: str | None = None  # 'cod' or 'online' (choice made at checkout)
     cod_fee: Decimal = Field(default=0, max_digits=12, decimal_places=2)
+    # Courier remittance (Shiprocket paying the merchant), separate from the
+    # customer-facing collection recorded in ``payments``. Additive only:
+    # ``payment_status`` keeps its existing meaning.
+    cod_remitted_amount: Decimal = Field(default=0, max_digits=12, decimal_places=2)
+    cod_remittance_status: str = Field(default="pending", max_length=20, index=True)
+    cod_remitted_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     
     # Status
     # Status

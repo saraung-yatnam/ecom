@@ -24,8 +24,15 @@ class ContentBlock(SQLModel, table=True):
     key: str = Field(index=True, min_length=1, max_length=80)
     title: str = Field(min_length=1, max_length=120)
     body: str | None = Field(default=None, max_length=2000)
+    # Existing rows are migrated with "overlay" to preserve their rendering;
+    # newly authored homepage heroes default to the editorial split layout.
+    layout_mode: str = Field(default="split", max_length=20)
     image_url: str | None = Field(default=None, max_length=500)
     image_public_id: str | None = Field(default=None, max_length=500)
+    mobile_image_url: str | None = Field(default=None, max_length=500)
+    mobile_image_public_id: str | None = Field(default=None, max_length=500)
+    image_alt: str | None = Field(default=None, max_length=500)
+    image_position: str = Field(default="center", max_length=20)
     link: str | None = Field(default=None, max_length=300)
     link_label: str | None = Field(default=None, max_length=60)
     sort_order: int = Field(default=0)
